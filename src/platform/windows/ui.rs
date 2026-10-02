@@ -1,0 +1,1699 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+use super::{
+    actions, clipboard,
+    dialogs::{self, wide},
+    theme,
+};
+use crate::{
+    engine::Engine,
+    model::*,
+    ui_state::{Lifecycle, UiState},
+};
+use std::{
+    path::Path,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
+use windows::{
+    Win32::{
+        Foundation::*,
+        Graphics::{Gdi::*, Imaging::*},
+        System::{Com::*, DataExchange::*, LibraryLoader::GetModuleHandleW},
+        UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+    },
+    core::{PCWSTR, w},
+};
+const ENGINE_WAKE: u32 = WM_APP + 1;
+const WORK_WAKE: u32 = WM_APP + 2;
+const TRAY: u32 = WM_APP + 3;
+const SEARCH: usize = 100;
+const LIST: usize = 101;
+const ADD: usize = 102;
+const PREVIEW: usize = 103;
+const SETTINGS: usize = 104;
+const OPEN: usize = 200;
+const COPY: usize = 201;
+const PLAIN: usize = 202;
+const PIN: usize = 203;
+const EDIT: usize = 204;
+const RELINK: usize = 205;
+const REVEAL: usize = 206;
+const DELETE: usize = 207;
+const COPY_PATH: usize = 208;
+const OPEN_WITH: usize = 209;
+const EXIT: usize = 220;
+#[derive(Clone, Copy)]
+enum Action {
+    Open(bool),
+    Copy(bool),
+    Pin,
+    Edit,
+    Relink,
+    Reveal,
+    Delete,
+    CopyPath,
+    Preview,
+}
+struct Image {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+enum Work {
+    Capture(u32),
+    Stop,
+}
+enum Done {
+    Captured(Result<Option<ClipboardSnapshot>, String>),
+    Preview(u64, Result<Image, String>),
+}
+struct PreviewQueue {
+    job: Mutex<Option<(u64, StoredItem)>>,
+    wake: Condvar,
+    generation: AtomicU64,
+    stop: AtomicBool,
+}
+impl PreviewQueue {
+    fn replace(&self, id: u64, item: StoredItem) {
+        self.generation.store(id, Ordering::Release);
+        if let Ok(mut job) = self.job.lock() {
+            *job = Some((id, item));
+            self.wake.notify_one();
+        }
+    }
+    fn cancel(&self, id: u64) {
+        self.generation.store(id, Ordering::Release);
+        if let Ok(mut job) = self.job.lock() {
+            *job = None;
+        }
+    }
+}
+struct App {
+    hwnd: HWND,
+    edit: HWND,
+    list: HWND,
+    footer: HWND,
+    preview: HWND,
+    buttons: Vec<HWND>,
+    font: HFONT,
+    brush: HBRUSH,
+    engine: Option<Engine>,
+    state: UiState,
+    settings: Settings,
+    items: Vec<ItemSummary>,
+    scope: Scope,
+    target: HWND,
+    load_id: u64,
+    pending_action: Option<(u64, Action)>,
+    preview_id: u64,
+    preview_open: bool,
+    image: Option<Image>,
+    tx: mpsc::Sender<Work>,
+    rx: mpsc::Receiver<Done>,
+    capture_worker: Option<std::thread::JoinHandle<()>>,
+    preview_queue: Arc<PreviewQueue>,
+    preview_worker: Option<std::thread::JoinHandle<()>>,
+    dpi: u32,
+    dialog_open: bool,
+    suppress_sequence: Option<u32>,
+    last_capture_sequence: u32,
+}
+unsafe fn post(handle: usize, msg: u32) {
+    let _ = PostMessageW(Some(HWND(handle as *mut _)), msg, WPARAM(0), LPARAM(0));
+}
+unsafe fn decode(item: &StoredItem, id: u64, generation: &AtomicU64) -> Result<Image, String> {
+    if generation.load(Ordering::Acquire) != id {
+        return Err("预览已取消".into());
+    }
+    let rep = item
+        .representations
+        .iter()
+        .find(|r| r.format == "PNG")
+        .or_else(|| {
+            item.representations
+                .iter()
+                .find(|r| r.format == "CF_DIBV5" || r.format == "CF_DIB")
+        })
+        .ok_or("该记录没有可解码的图片")?;
+    let mut data = rep.data.clone();
+    if rep.format != "PNG" {
+        if data.len() < 40 {
+            return Err("图片数据不完整".into());
+        }
+        let u32at = |n: usize| u32::from_le_bytes(data[n..n + 4].try_into().unwrap());
+        let header = u32at(0) as usize;
+        let bpp = u16::from_le_bytes(data[14..16].try_into().unwrap());
+        let compression = u32at(16);
+        let colors = u32at(32) as usize;
+        let palette = if bpp <= 8 {
+            if colors == 0 { 1usize << bpp } else { colors }
+        } else {
+            colors
+        };
+        let offset = 14usize
+            .checked_add(header)
+            .and_then(|v| v.checked_add(palette * 4))
+            .and_then(|v| {
+                v.checked_add(if header == 40 && compression == 3 {
+                    12
+                } else {
+                    0
+                })
+            })
+            .ok_or("图片尺寸溢出")?;
+        if offset > data.len() + 14 {
+            return Err("图片头无效".into());
+        }
+        let mut bmp = Vec::with_capacity(data.len() + 14);
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&((data.len() + 14) as u32).to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&(offset as u32).to_le_bytes());
+        bmp.append(&mut data);
+        data = bmp;
+    }
+    let factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| e.to_string())?;
+    let stream = factory.CreateStream().map_err(|e| e.to_string())?;
+    stream
+        .InitializeFromMemory(&mut data)
+        .map_err(|e| e.to_string())?;
+    let decoder = factory
+        .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+        .map_err(|e| e.to_string())?;
+    let frame = decoder.GetFrame(0).map_err(|e| e.to_string())?;
+    let (mut width, mut height) = (0, 0);
+    frame
+        .GetSize(&mut width, &mut height)
+        .map_err(|e| e.to_string())?;
+    let bytes = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or("图片尺寸溢出")?;
+    if bytes > 16 * 1024 * 1024 || width == 0 || height == 0 {
+        return Err("图片解码超过16 MiB预算；仍可复制原图".into());
+    }
+    let converter = factory.CreateFormatConverter().map_err(|e| e.to_string())?;
+    converter
+        .Initialize(
+            &frame,
+            &GUID_WICPixelFormat32bppBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeCustom,
+        )
+        .map_err(|e| e.to_string())?;
+    if generation.load(Ordering::Acquire) != id {
+        return Err("预览已取消".into());
+    }
+    let mut pixels = vec![0; bytes];
+    converter
+        .CopyPixels(std::ptr::null(), width * 4, &mut pixels)
+        .map_err(|e| e.to_string())?;
+    Ok(Image {
+        width,
+        height,
+        pixels,
+    })
+}
+pub fn run() -> Result<(), String> {
+    unsafe {
+        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            .ok()
+            .map_err(|e| e.to_string())?;
+        let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
+        let class = w!("QuickPanelWindow");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance.into(),
+            lpszClassName: class,
+            hCursor: LoadCursorW(None, IDC_ARROW).map_err(|e| e.to_string())?,
+            hIcon: LoadIconW(Some(instance.into()), PCWSTR(101usize as *const u16))
+                .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default()),
+            ..Default::default()
+        };
+        RegisterClassW(&wc);
+        let (tx, work_rx) = mpsc::channel();
+        let (done_tx, rx) = mpsc::channel();
+        let mut app = Box::new(App {
+            hwnd: HWND::default(),
+            edit: HWND::default(),
+            list: HWND::default(),
+            footer: HWND::default(),
+            preview: HWND::default(),
+            buttons: Vec::new(),
+            font: HFONT::default(),
+            brush: HBRUSH::default(),
+            engine: None,
+            state: UiState::default(),
+            settings: Settings::default(),
+            items: Vec::new(),
+            scope: Scope::All,
+            target: HWND::default(),
+            load_id: 0,
+            pending_action: None,
+            preview_id: 0,
+            preview_open: false,
+            image: None,
+            tx,
+            rx,
+            capture_worker: None,
+            preview_queue: Arc::new(PreviewQueue {
+                job: Mutex::new(None),
+                wake: Condvar::new(),
+                generation: AtomicU64::new(0),
+                stop: AtomicBool::new(false),
+            }),
+            preview_worker: None,
+            dpi: 96,
+            dialog_open: false,
+            suppress_sequence: None,
+            last_capture_sequence: 0,
+        });
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            class,
+            w!("快捷面板"),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            680,
+            480,
+            None,
+            None,
+            Some(instance.into()),
+            Some((&mut *app as *mut App).cast()),
+        )
+        .map_err(|e| e.to_string())?;
+        app.hwnd = hwnd;
+        app.dpi = GetDpiForWindow(hwnd).max(96);
+        app.create_controls()?;
+        let handle = hwnd.0 as usize;
+        let notify = Arc::new(move || post(handle, ENGINE_WAKE));
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let dir = base.join("QuickPanel");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        app.engine = Some(Engine::start(
+            EngineOptions::new(dir.join("quick-panel.sqlite3")),
+            notify,
+        )?);
+        let capture_done_tx = done_tx.clone();
+        app.capture_worker = Some(std::thread::spawn(move || {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            while let Ok(work) = work_rx.recv() {
+                let done = match work {
+                    Work::Stop => break,
+                    Work::Capture(expected) => {
+                        let captured = if clipboard::sequence_number() != expected {
+                            Ok(None)
+                        } else {
+                            clipboard::capture(HWND(handle as *mut _), 8 * 1024 * 1024)
+                        };
+                        Done::Captured(if clipboard::sequence_number() == expected {
+                            captured
+                        } else {
+                            Ok(None)
+                        })
+                    }
+                };
+                if capture_done_tx.send(done).is_err() {
+                    break;
+                }
+                post(handle, WORK_WAKE);
+            }
+            CoUninitialize();
+        }));
+        let preview_queue = app.preview_queue.clone();
+        app.preview_worker = Some(std::thread::spawn(move || {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            loop {
+                let mut slot = match preview_queue.job.lock() {
+                    Ok(slot) => slot,
+                    Err(_) => break,
+                };
+                while slot.is_none() && !preview_queue.stop.load(Ordering::Acquire) {
+                    slot = match preview_queue.wake.wait(slot) {
+                        Ok(slot) => slot,
+                        Err(_) => return,
+                    };
+                }
+                if preview_queue.stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some((id, item)) = slot.take() else {
+                    continue;
+                };
+                drop(slot);
+                let result = decode(&item, id, &preview_queue.generation);
+                if id == preview_queue.generation.load(Ordering::Acquire) {
+                    if done_tx.send(Done::Preview(id, result)).is_err() {
+                        break;
+                    }
+                    post(handle, WORK_WAKE);
+                }
+            }
+            CoUninitialize();
+        }));
+        AddClipboardFormatListener(hwnd).map_err(|e| e.to_string())?;
+        app.tray(NIM_ADD);
+        DragAcceptFiles(hwnd, true);
+        app.capture();
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        let _ = app.tx.send(Work::Stop);
+        if let Some(worker) = app.capture_worker.take() {
+            let _ = worker.join();
+        }
+        app.preview_queue.stop.store(true, Ordering::Release);
+        app.preview_queue.wake.notify_all();
+        if let Some(worker) = app.preview_worker.take() {
+            let _ = worker.join();
+        }
+        CoUninitialize();
+        Ok(())
+    }
+}
+impl App {
+    fn send(&self, c: Command) {
+        if let Some(e) = &self.engine {
+            if let Err(error) = e.send(c) {
+                unsafe {
+                    self.status(&error);
+                }
+            }
+        }
+    }
+    fn s(&self, n: i32) -> i32 {
+        n * self.dpi as i32 / 96
+    }
+    unsafe fn control(
+        &self,
+        class: PCWSTR,
+        title: &str,
+        style: WINDOW_STYLE,
+        id: usize,
+    ) -> Result<HWND, String> {
+        let t = wide(title);
+        CreateWindowExW(
+            if id == SEARCH {
+                WS_EX_CLIENTEDGE
+            } else {
+                WINDOW_EX_STYLE::default()
+            },
+            class,
+            PCWSTR(t.as_ptr()),
+            WS_CHILD | WS_VISIBLE | style,
+            0,
+            0,
+            10,
+            10,
+            Some(self.hwnd),
+            Some(HMENU(id as *mut _)),
+            None,
+            None,
+        )
+        .map_err(|e| e.to_string())
+    }
+    unsafe fn create_controls(&mut self) -> Result<(), String> {
+        self.edit = self.control(
+            w!("EDIT"),
+            "",
+            WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+            SEARCH,
+        )?;
+        let _ = SendMessageW(
+            self.edit,
+            EM_SETCUEBANNER,
+            Some(WPARAM(0)),
+            Some(LPARAM(w!("搜索历史、文件夹、文档…").0 as isize)),
+        );
+        self.list = self.control(
+            w!("LISTBOX"),
+            "",
+            WS_TABSTOP
+                | WS_VSCROLL
+                | WINDOW_STYLE(
+                    (LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT)
+                        as u32,
+                ),
+            LIST,
+        )?;
+        self.footer = self.control(
+            w!("STATIC"),
+            "↑↓ 选择  Enter 打开/粘贴  Ctrl+K 更多",
+            WINDOW_STYLE::default(),
+            109,
+        )?;
+        self.preview = self.control(w!("STATIC"), "", WINDOW_STYLE(0), 110)?;
+        let _ = ShowWindow(self.preview, SW_HIDE);
+        for (id, title) in [
+            (ADD, "添加 ＋"),
+            (PREVIEW, "预览 ›"),
+            (SETTINGS, "设置"),
+            (300, "全部"),
+            (301, "剪贴板"),
+            (302, "文件夹"),
+            (303, "文档"),
+        ] {
+            self.buttons.push(self.control(
+                w!("BUTTON"),
+                title,
+                WS_TABSTOP
+                    | if (300..=303).contains(&id) {
+                        WINDOW_STYLE((BS_AUTORADIOBUTTON | BS_PUSHLIKE) as u32)
+                            | if id == 300 {
+                                WS_GROUP
+                            } else {
+                                WINDOW_STYLE::default()
+                            }
+                    } else {
+                        WINDOW_STYLE::default()
+                    },
+                id,
+            )?);
+        }
+        let _ = SetWindowSubclass(self.edit, Some(edit_proc), 1, self as *mut _ as usize);
+        let _ = SetWindowSubclass(self.list, Some(edit_proc), 2, self as *mut _ as usize);
+        let _ = SetWindowSubclass(self.preview, Some(preview_proc), 3, self as *mut _ as usize);
+        self.retheme();
+        self.layout();
+        Ok(())
+    }
+    unsafe fn retheme(&mut self) {
+        if !self.font.is_invalid() {
+            let _ = DeleteObject(self.font.into());
+        }
+        if !self.brush.is_invalid() {
+            let _ = DeleteObject(self.brush.into());
+        }
+        self.font = theme::font(self.dpi);
+        self.brush = CreateSolidBrush(theme::palette(self.settings.theme).background);
+        theme::apply(self.hwnd, self.settings.theme);
+        for h in [self.edit, self.list, self.footer, self.preview]
+            .into_iter()
+            .chain(self.buttons.iter().copied())
+        {
+            SendMessageW(
+                h,
+                WM_SETFONT,
+                Some(WPARAM(self.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
+        SendMessageW(
+            self.list,
+            LB_SETITEMHEIGHT,
+            Some(WPARAM(0)),
+            Some(LPARAM(self.s(62) as isize)),
+        );
+        let _ = InvalidateRect(Some(self.hwnd), None, true);
+    }
+    unsafe fn layout(&self) {
+        let mut r = RECT::default();
+        let _ = GetClientRect(self.hwnd, &mut r);
+        let w = r.right;
+        let h = r.bottom;
+        let edge = self.s(18);
+        let preview_width = if self.preview_open { self.s(250) } else { 0 };
+        let list_width = w - 2 * edge - preview_width;
+        let mov = |hwnd: HWND, x, y, width, height| {
+            let _ = MoveWindow(hwnd, x, y, width, height, true);
+        };
+        mov(self.edit, edge, self.s(18), w - self.s(126), self.s(36));
+        mov(
+            self.buttons[0],
+            w - self.s(98),
+            self.s(18),
+            self.s(80),
+            self.s(36),
+        );
+        for i in 0..4 {
+            mov(
+                self.buttons[3 + i],
+                edge + self.s(i as i32 * 95),
+                self.s(66),
+                self.s(89),
+                self.s(30),
+            );
+        }
+        mov(
+            self.buttons[2],
+            w - self.s(80),
+            self.s(66),
+            self.s(62),
+            self.s(30),
+        );
+        mov(self.list, edge, self.s(110), list_width, h - self.s(165));
+        mov(
+            self.footer,
+            edge,
+            h - self.s(42),
+            w - self.s(120),
+            self.s(30),
+        );
+        mov(
+            self.buttons[1],
+            w - self.s(94),
+            h - self.s(44),
+            self.s(76),
+            self.s(30),
+        );
+        mov(
+            self.preview,
+            w - preview_width,
+            self.s(114),
+            preview_width - edge,
+            h - self.s(180),
+        );
+    }
+    unsafe fn status(&self, message: &str) {
+        let text = wide(message);
+        let _ = SetWindowTextW(self.footer, PCWSTR(text.as_ptr()));
+    }
+    unsafe fn tray(&self, operation: NOTIFY_ICON_MESSAGE) {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: self.hwnd,
+            uID: 1,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uCallbackMessage: TRAY,
+            hIcon: LoadIconW(
+                GetModuleHandleW(None).ok().map(Into::into),
+                PCWSTR(101usize as *const u16),
+            )
+            .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default()),
+            ..Default::default()
+        };
+        let title = wide("快捷面板 · Ctrl+Alt+Space");
+        data.szTip[..title.len()].copy_from_slice(&title);
+        let _ = Shell_NotifyIconW(operation, &data);
+    }
+    unsafe fn hotkeys(&mut self) {
+        let _ = UnregisterHotKey(Some(self.hwnd), 1);
+        let _ = UnregisterHotKey(Some(self.hwnd), 2);
+        let mut failed = false;
+        for (id, mods, key) in [
+            (1, self.settings.hotkey_modifiers, self.settings.hotkey_key),
+            (
+                2,
+                self.settings.clipboard_hotkey_modifiers,
+                self.settings.clipboard_hotkey_key,
+            ),
+        ] {
+            if RegisterHotKey(
+                Some(self.hwnd),
+                id,
+                HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT,
+                key,
+            )
+            .is_err()
+            {
+                failed = true;
+            }
+        }
+        if failed {
+            self.show(None);
+            self.status("快捷键冲突；请在设置中修改。托盘仍可呼出。");
+        }
+    }
+    unsafe fn show(&mut self, scope: Option<Scope>) {
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        let foreground = GetForegroundWindow();
+        if foreground != self.hwnd && !foreground.is_invalid() {
+            self.target = foreground;
+        }
+        if let Some(s) = scope {
+            self.scope = s;
+        }
+        self.state.visible = true;
+        let monitor = MonitorFromWindow(self.target, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(monitor, &mut info);
+        let mut r = RECT::default();
+        let _ = GetWindowRect(self.hwnd, &mut r);
+        let work = info.rcWork;
+        let width = self
+            .s(if self.preview_open { 930 } else { 680 })
+            .min(work.right - work.left);
+        let height = self.s(480).min(work.bottom - work.top);
+        let _ = SetWindowPos(
+            self.hwnd,
+            Some(HWND_TOP),
+            work.left + (work.right - work.left - width) / 2,
+            work.top + (work.bottom - work.top - height) / 3,
+            width,
+            height,
+            SWP_SHOWWINDOW,
+        );
+        let _ = SetForegroundWindow(self.hwnd);
+        let _ = SetFocus(Some(self.edit));
+        self.search();
+    }
+    unsafe fn hide(&mut self) {
+        self.image = None;
+        self.preview_queue.cancel(self.load_id.wrapping_add(1));
+        self.state.hide();
+        let _ = ShowWindow(self.hwnd, SW_HIDE);
+    }
+    unsafe fn search(&mut self) {
+        let current = match self.scope {
+            Scope::All => 0,
+            Scope::Clipboard => 1,
+            Scope::Folder => 2,
+            Scope::Document => 3,
+        };
+        for (i, button) in self.buttons.iter().skip(3).enumerate() {
+            SendMessageW(
+                *button,
+                BM_SETCHECK,
+                Some(WPARAM(usize::from(i == current))),
+                None,
+            );
+        }
+        let id = self.state.next_request();
+        self.send(Command::Search(SearchQuery {
+            text: dialogs::text(self.edit),
+            scope: self.scope,
+            request_id: id,
+        }));
+    }
+    unsafe fn capture(&mut self) {
+        let sequence = clipboard::sequence_number();
+        if self.suppress_sequence == Some(sequence) || sequence == self.last_capture_sequence {
+            return;
+        }
+        self.last_capture_sequence = sequence;
+        if self.settings.capture_paused || !self.state.accept_capture() {
+            return;
+        }
+        if self.tx.send(Work::Capture(sequence)).is_err() {
+            if self.state.capture_completed() {
+                self.send(Command::Shutdown);
+            }
+        }
+    }
+    unsafe fn work_done(&mut self) {
+        while let Ok(done) = self.rx.try_recv() {
+            match done {
+                Done::Captured(result) => {
+                    match result {
+                        Ok(Some(snapshot)) => self.send(Command::Capture(snapshot)),
+                        Ok(None) => {}
+                        Err(e) => self.status(&e),
+                    }
+                    if self.state.capture_completed() {
+                        self.send(Command::Shutdown);
+                    }
+                }
+                Done::Preview(id, result) => {
+                    if id == self.preview_id && self.preview_open && self.state.visible {
+                        match result {
+                            Ok(image) => {
+                                self.image = Some(image);
+                                let _ = SetWindowTextW(self.preview, w!(""));
+                            }
+                            Err(e) => {
+                                let text = wide(&e);
+                                let _ = SetWindowTextW(self.preview, PCWSTR(text.as_ptr()));
+                            }
+                        }
+                        let _ = InvalidateRect(Some(self.preview), None, true);
+                    }
+                }
+            }
+        }
+    }
+    unsafe fn events(&mut self) {
+        loop {
+            let event = match self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
+                Some(e) => e,
+                None => break,
+            };
+            match event {
+                Event::Ready(settings) => {
+                    self.settings = settings;
+                    self.retheme();
+                    self.hotkeys();
+                    self.search();
+                }
+                Event::Results { request_id, items } => {
+                    if self.state.is_current(request_id) {
+                        self.state
+                            .replace_ids(items.iter().map(|x| x.id.clone()).collect());
+                        self.items = items;
+                        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
+                        SendMessageW(self.list, LB_RESETCONTENT, None, None);
+                        for item in &self.items {
+                            let t = wide(&item.title);
+                            SendMessageW(
+                                self.list,
+                                LB_ADDSTRING,
+                                None,
+                                Some(LPARAM(t.as_ptr() as isize)),
+                            );
+                        }
+                        if let Some(i) = self.state.selected_index() {
+                            SendMessageW(self.list, LB_SETCURSEL, Some(WPARAM(i)), None);
+                        }
+                        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
+                        let _ = InvalidateRect(Some(self.list), None, true);
+                        self.selection();
+                    }
+                }
+                Event::Loaded { request_id, item } => {
+                    if let Some(item) = item {
+                        if self
+                            .pending_action
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == request_id)
+                        {
+                            if let Some((_, action)) = self.pending_action.take() {
+                                self.perform(item, action);
+                            }
+                        } else if self.preview_open && request_id == self.preview_id {
+                            self.perform(item, Action::Preview);
+                        }
+                    }
+                }
+                Event::Changed => {
+                    if self.state.visible {
+                        self.search();
+                    }
+                }
+                Event::Saved(_) => {
+                    if self.state.lifecycle == Lifecycle::Running {
+                        self.status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
+                    }
+                }
+                Event::Error { message, exiting } => {
+                    if exiting {
+                        self.state.exit_failed();
+                        self.dialog_open = true;
+                        let msg = wide(&format!(
+                            "保存失败，数据仍保留在内存中。\n{message}\n\n重试保存，或取消退出？"
+                        ));
+                        let answer = MessageBoxW(
+                            Some(self.hwnd),
+                            PCWSTR(msg.as_ptr()),
+                            w!("保存后退出"),
+                            MB_RETRYCANCEL | MB_ICONERROR,
+                        );
+                        self.dialog_open = false;
+                        if answer == IDRETRY {
+                            self.state.retry_exit();
+                            self.send(Command::Shutdown);
+                        } else {
+                            self.send(Command::CancelShutdown);
+                            self.state.cancel_exit();
+                            self.last_capture_sequence = 0;
+                            self.capture();
+                            self.show(None);
+                        }
+                    } else {
+                        self.status(&message);
+                    }
+                }
+                Event::ExitReady => {
+                    let _ = DestroyWindow(self.hwnd);
+                }
+            }
+        }
+    }
+    unsafe fn selection(&mut self) {
+        let i = SendMessageW(self.list, LB_GETCURSEL, None, None).0;
+        if i >= 0 {
+            self.state.select(i as usize);
+        }
+        let clipboard = self
+            .items
+            .get(i.max(0) as usize)
+            .is_some_and(|i| i.kind == ItemKind::Clipboard);
+        self.status(if clipboard {
+            "Enter 粘贴 · Shift+Enter 纯文本 · Ctrl+C 复制 · Ctrl+K 更多"
+        } else {
+            "Enter 打开 · Ctrl+C 复制路径 · Ctrl+K 更多"
+        });
+        if self.preview_open {
+            self.request(Action::Preview);
+        }
+    }
+    unsafe fn request(&mut self, action: Action) {
+        if matches!(action, Action::Preview) && !self.state.visible {
+            return;
+        }
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        if let Some(id) = self.state.selected_id() {
+            self.load_id = self.load_id.wrapping_add(1);
+            if matches!(action, Action::Preview) {
+                self.preview_id = self.load_id;
+                self.image = None;
+                self.preview_queue.cancel(self.preview_id);
+            } else {
+                self.pending_action = Some((self.load_id, action));
+            }
+            self.send(Command::Load {
+                id: id.to_owned(),
+                request_id: self.load_id,
+            });
+        }
+    }
+    unsafe fn perform(&mut self, item: StoredItem, action: Action) {
+        match action {
+            Action::Open(plain) => {
+                if item.summary.kind == ItemKind::Clipboard {
+                    let result = clipboard::restore(self.hwnd, &item, plain);
+                    self.suppress_sequence = Some(clipboard::sequence_number());
+                    match result {
+                        Ok(()) => {
+                            self.hide();
+                            if let Err(e) = clipboard::paste_to(self.target) {
+                                self.show(None);
+                                self.status(&e);
+                            }
+                        }
+                        Err(e) => self.status(&e),
+                    }
+                } else if let Err(e) = actions::open_target(&item) {
+                    self.status(&e);
+                    if item.target.as_ref().is_some_and(|p| !Path::new(p).exists()) {
+                        self.perform(item, Action::Relink);
+                    }
+                    return;
+                }
+                self.send(Command::Used(item.summary.id));
+            }
+            Action::Copy(plain) => {
+                if item.summary.kind != ItemKind::Clipboard {
+                    self.perform(item, Action::CopyPath);
+                    return;
+                }
+                let result = clipboard::restore(self.hwnd, &item, plain);
+                self.suppress_sequence = Some(clipboard::sequence_number());
+                match result {
+                    Ok(()) => self.status("已复制"),
+                    Err(e) => self.status(&e),
+                }
+            }
+            Action::Pin => self.send(Command::Pin {
+                id: item.summary.id,
+                pinned: !item.summary.pinned,
+            }),
+            Action::Delete => self.send(Command::Delete(item.summary.id)),
+            Action::Reveal => {
+                if let Err(e) = actions::reveal_target(&item) {
+                    self.status(&e);
+                }
+            }
+            Action::CopyPath => {
+                let path = item.target.clone().unwrap_or_default();
+                let mut copied = item;
+                copied.text = path;
+                copied.representations.clear();
+                if let Err(e) = clipboard::restore(self.hwnd, &copied, true) {
+                    self.status(&e);
+                }
+                self.suppress_sequence = Some(clipboard::sequence_number());
+            }
+            Action::Edit => {
+                self.edit_favorite(Some(item), None);
+            }
+            Action::Relink => {
+                self.dialog_open = true;
+                let picked = dialogs::pick(self.hwnd, item.summary.kind == ItemKind::Folder);
+                self.dialog_open = false;
+                match picked {
+                    Ok(Some(path)) => self.edit_favorite(Some(item), Some(path)),
+                    Ok(None) => {}
+                    Err(e) => self.status(&e),
+                }
+            }
+            Action::Preview => {
+                self.image = None;
+                let text = if item.summary.kind == ItemKind::Clipboard {
+                    item.text.chars().take(6000).collect::<String>()
+                } else {
+                    let path = item.target.clone().unwrap_or_default();
+                    let metadata = std::fs::metadata(&path);
+                    format!(
+                        "{}\n\n{}\n\n{}",
+                        item.summary.title,
+                        path,
+                        match metadata {
+                            Ok(m) => format!(
+                                "大小：{} 字节\n标签：{}",
+                                m.len(),
+                                item.summary.tags.join("、")
+                            ),
+                            Err(_) => "目标已失效 · Ctrl+K → 重新定位".into(),
+                        }
+                    )
+                };
+                let t = wide(&text);
+                let _ = SetWindowTextW(self.preview, PCWSTR(t.as_ptr()));
+                if item
+                    .representations
+                    .iter()
+                    .any(|r| r.format == "PNG" || r.format == "CF_DIB" || r.format == "CF_DIBV5")
+                {
+                    self.status("正在生成图片预览…");
+                    self.preview_queue.replace(self.preview_id, item);
+                }
+            }
+        }
+    }
+    unsafe fn edit_favorite(&mut self, item: Option<StoredItem>, target: Option<String>) {
+        let kind = item.as_ref().map(|i| i.summary.kind).unwrap_or_else(|| {
+            if target.as_ref().is_some_and(|p| Path::new(p).is_dir()) {
+                ItemKind::Folder
+            } else {
+                ItemKind::Document
+            }
+        });
+        if kind == ItemKind::Clipboard {
+            self.status("剪贴板记录可固定；文件与文件夹可编辑收藏信息。");
+            return;
+        }
+        let path = target
+            .or_else(|| item.as_ref().and_then(|i| i.target.clone()))
+            .unwrap_or_default();
+        let name = item
+            .as_ref()
+            .map(|i| i.summary.title.clone())
+            .unwrap_or_else(|| {
+                Path::new(&path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            });
+        self.dialog_open = true;
+        let result = dialogs::form(
+            self.hwnd,
+            "编辑收藏",
+            &[
+                ("名称", name),
+                ("目标路径", path),
+                (
+                    "别名",
+                    item.as_ref()
+                        .map(|i| i.summary.alias.clone())
+                        .unwrap_or_default(),
+                ),
+                (
+                    "标签（逗号分隔）",
+                    item.as_ref()
+                        .map(|i| i.summary.tags.join(", "))
+                        .unwrap_or_default(),
+                ),
+                (
+                    "打开方式（程序完整路径，可留空）",
+                    item.as_ref()
+                        .and_then(|i| i.open_with.clone())
+                        .unwrap_or_default(),
+                ),
+            ],
+        );
+        self.dialog_open = false;
+        if let Some(v) = result {
+            if v[0].trim().is_empty() || v[1].trim().is_empty() {
+                self.status("名称和路径不能为空");
+                return;
+            }
+            self.send(Command::SaveFavorite(FavoriteInput {
+                id: item.map(|i| i.summary.id),
+                kind,
+                title: v[0].trim().into(),
+                target: v[1].trim().into(),
+                alias: v[2].trim().into(),
+                tags: v[3]
+                    .split([',', '，'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+                open_with: (!v[4].trim().is_empty()).then(|| v[4].trim().into()),
+            }));
+        }
+    }
+    unsafe fn add(&mut self, folder: bool) {
+        self.dialog_open = true;
+        let result = dialogs::pick(self.hwnd, folder);
+        self.dialog_open = false;
+        match result {
+            Ok(Some(path)) => self.edit_favorite(None, Some(path)),
+            Ok(None) => {}
+            Err(e) => self.status(&e),
+        }
+    }
+    unsafe fn settings(&mut self) {
+        self.dialog_open = true;
+        let result = dialogs::settings_form(
+            self.hwnd,
+            match self.settings.theme {
+                Theme::System => 0,
+                Theme::Light => 1,
+                Theme::Dark => 2,
+            },
+            format_hotkey(self.settings.hotkey_modifiers, self.settings.hotkey_key),
+            format_hotkey(
+                self.settings.clipboard_hotkey_modifiers,
+                self.settings.clipboard_hotkey_key,
+            ),
+            self.settings.capture_paused,
+            self.settings.excluded_apps.join(", "),
+        );
+        self.dialog_open = false;
+        if let Some(v) = result {
+            let mut settings = self.settings.clone();
+            settings.theme = match v[0].as_str() {
+                "1" => Theme::Light,
+                "2" => Theme::Dark,
+                _ => Theme::System,
+            };
+            let keys = parse_hotkey(&v[1]).zip(parse_hotkey(&v[2]));
+            let Some(((m, k), (cm, ck))) = keys else {
+                self.status("快捷键无效；请输入 Ctrl/Alt/Shift/Win + 字母、数字、Space 或 F1–F24");
+                return;
+            };
+            if (m, k) == (cm, ck) || (m == 8 && k == 86) || (cm == 8 && ck == 86) {
+                self.status("两组快捷键须不同；Win+V 留给系统剪贴板");
+                return;
+            }
+            settings.hotkey_modifiers = m;
+            settings.hotkey_key = k;
+            settings.clipboard_hotkey_modifiers = cm;
+            settings.clipboard_hotkey_key = ck;
+            settings.capture_paused = v[3] == "1";
+            settings.excluded_apps = v[4]
+                .split([',', '，'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            self.settings = settings.clone();
+            self.retheme();
+            self.hotkeys();
+            self.send(Command::SaveSettings(settings));
+        }
+    }
+    unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        let entries: Vec<(usize, &str)> = if tray {
+            vec![
+                (221, "打开面板"),
+                (SETTINGS, "设置"),
+                (222, "暂停 / 恢复记录"),
+                (EXIT, "保存后退出"),
+            ]
+        } else if add {
+            vec![(223, "添加文件夹…"), (224, "添加文档…")]
+        } else if self
+            .state
+            .selected_index()
+            .and_then(|i| self.items.get(i))
+            .is_some_and(|i| i.kind == ItemKind::Clipboard)
+        {
+            vec![
+                (OPEN, "粘贴"),
+                (COPY, "复制"),
+                (PLAIN, "纯文本粘贴"),
+                (PIN, "固定 / 取消固定"),
+                (DELETE, "删除"),
+            ]
+        } else {
+            vec![
+                (OPEN, "打开"),
+                (COPY_PATH, "复制路径"),
+                (PIN, "固定 / 取消固定"),
+                (EDIT, "编辑收藏…"),
+                (OPEN_WITH, "设置打开方式…"),
+                (RELINK, "重新定位…"),
+                (REVEAL, "打开所在目录"),
+                (DELETE, "删除"),
+            ]
+        };
+        for (id, title) in entries {
+            let t = wide(title);
+            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(t.as_ptr()));
+        }
+        let _ = SetForegroundWindow(self.hwnd);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            x,
+            y,
+            None,
+            self.hwnd,
+            None,
+        )
+        .0 as usize;
+        let _ = DestroyMenu(menu);
+        self.command(command);
+    }
+    unsafe fn command(&mut self, id: usize) {
+        if self.state.lifecycle != Lifecycle::Running && id != EXIT {
+            return;
+        }
+        match id {
+            ADD => {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                self.context(p.x, p.y, false, true);
+            }
+            PREVIEW => {
+                self.preview_open = !self.preview_open;
+                self.preview_queue.cancel(self.load_id.wrapping_add(1));
+                self.image = None;
+                let _ = ShowWindow(
+                    self.preview,
+                    if self.preview_open { SW_SHOW } else { SW_HIDE },
+                );
+                let label = wide(if self.preview_open {
+                    "收起 ‹"
+                } else {
+                    "预览 ›"
+                });
+                let _ = SetWindowTextW(self.buttons[1], PCWSTR(label.as_ptr()));
+                self.show(None);
+                if self.preview_open {
+                    self.request(Action::Preview);
+                }
+            }
+            SETTINGS => self.settings(),
+            300..=303 => {
+                self.scope = match id {
+                    301 => Scope::Clipboard,
+                    302 => Scope::Folder,
+                    303 => Scope::Document,
+                    _ => Scope::All,
+                };
+                self.search();
+            }
+            OPEN => self.request(Action::Open(false)),
+            COPY => self.request(Action::Copy(false)),
+            PLAIN => self.request(Action::Open(true)),
+            PIN => self.request(Action::Pin),
+            EDIT | OPEN_WITH => self.request(Action::Edit),
+            RELINK => self.request(Action::Relink),
+            REVEAL => self.request(Action::Reveal),
+            DELETE => self.request(Action::Delete),
+            COPY_PATH => self.request(Action::CopyPath),
+            221 => self.show(None),
+            222 => {
+                self.settings.capture_paused = !self.settings.capture_paused;
+                self.send(Command::SaveSettings(self.settings.clone()));
+                self.status(if self.settings.capture_paused {
+                    "已暂停剪贴板记录"
+                } else {
+                    "已恢复剪贴板记录"
+                });
+            }
+            223 => self.add(true),
+            224 => self.add(false),
+            EXIT => {
+                if self.state.lifecycle == Lifecycle::Running {
+                    self.state.visible = true;
+                    let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                    self.status("正在保存后退出…");
+                    if self.state.begin_exit() {
+                        self.send(Command::Shutdown);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+fn parse_hotkey(value: &str) -> Option<(u32, u32)> {
+    let mut mods = 0;
+    let mut key = None;
+    for part in value.split('+').map(str::trim) {
+        match part.to_ascii_uppercase().as_str() {
+            "CTRL" => mods |= 2,
+            "ALT" => mods |= 1,
+            "SHIFT" => mods |= 4,
+            "WIN" => mods |= 8,
+            "SPACE" => {
+                if key.replace(32).is_some() {
+                    return None;
+                }
+            }
+            s => {
+                let k = if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() {
+                    s.as_bytes()[0] as u32
+                } else if let Some(f) = s
+                    .strip_prefix('F')
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .filter(|n| (1..=24).contains(n))
+                {
+                    111 + f
+                } else {
+                    return None;
+                };
+                if key.replace(k).is_some() {
+                    return None;
+                }
+            }
+        }
+    }
+    if mods == 0 {
+        return None;
+    }
+    key.map(|k| (mods, k))
+}
+fn format_hotkey(mods: u32, key: u32) -> String {
+    let mut p = Vec::new();
+    for (bit, name) in [(2, "Ctrl"), (1, "Alt"), (4, "Shift"), (8, "Win")] {
+        if mods & bit != 0 {
+            p.push(name.to_owned());
+        }
+    }
+    p.push(if key == 32 {
+        "Space".into()
+    } else if (112..=135).contains(&key) {
+        format!("F{}", key - 111)
+    } else {
+        char::from_u32(key).unwrap_or('?').to_string()
+    });
+    p.join("+")
+}
+unsafe extern "system" fn edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    let app = &mut *(data as *mut App);
+    match msg {
+        WM_IME_STARTCOMPOSITION => app.state.composing = true,
+        WM_IME_ENDCOMPOSITION => app.state.composing = false,
+        WM_KEYDOWN if !app.state.composing => {
+            let key = wp.0 as u32;
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            if key == VK_ESCAPE.0 as u32 {
+                app.hide();
+                return LRESULT(0);
+            }
+            if key == VK_RETURN.0 as u32 {
+                app.request(Action::Open(shift));
+                return LRESULT(0);
+            }
+            if key == VK_UP.0 as u32 || key == VK_DOWN.0 as u32 {
+                let old = app.state.selected_index().unwrap_or(0);
+                let index = if key == VK_UP.0 as u32 {
+                    old.saturating_sub(1)
+                } else {
+                    (old + 1).min(app.items.len().saturating_sub(1))
+                };
+                SendMessageW(app.list, LB_SETCURSEL, Some(WPARAM(index)), None);
+                app.selection();
+                return LRESULT(0);
+            }
+            if ctrl && key == 67 {
+                let (mut start, mut end) = (0u32, 0u32);
+                SendMessageW(
+                    app.edit,
+                    EM_GETSEL,
+                    Some(WPARAM((&mut start as *mut u32) as usize)),
+                    Some(LPARAM((&mut end as *mut u32) as isize)),
+                );
+                if hwnd != app.edit || start == end {
+                    app.request(Action::Copy(false));
+                    return LRESULT(0);
+                }
+            }
+            if ctrl && key == 75 {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                app.context(p.x, p.y, false, false);
+                return LRESULT(0);
+            }
+            if ctrl && (49..=52).contains(&key) {
+                app.command(300 + (key - 49) as usize);
+                return LRESULT(0);
+            }
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let cs = &*(lp.0 as *const CREATESTRUCTW);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+    }
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let app = &mut *ptr;
+    match msg {
+        ENGINE_WAKE => {
+            app.events();
+            return LRESULT(0);
+        }
+        WORK_WAKE => {
+            app.work_done();
+            return LRESULT(0);
+        }
+        WM_CLIPBOARDUPDATE => {
+            app.capture();
+            return LRESULT(0);
+        }
+        WM_HOTKEY => {
+            app.show((wp.0 == 2).then_some(Scope::Clipboard));
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            app.hide();
+            return LRESULT(0);
+        }
+        WM_ACTIVATE if (wp.0 & 0xffff) == WA_INACTIVE as usize && !app.dialog_open => {
+            app.hide();
+            return LRESULT(0);
+        }
+        WM_GETMINMAXINFO => {
+            let info = &mut *(lp.0 as *mut MINMAXINFO);
+            info.ptMinTrackSize = POINT {
+                x: app.s(480),
+                y: app.s(340),
+            };
+            return LRESULT(0);
+        }
+        WM_SIZE => {
+            app.layout();
+            return LRESULT(0);
+        }
+        WM_DPICHANGED => {
+            app.dpi = (wp.0 & 0xffff) as u32;
+            let rect = &*(lp.0 as *const RECT);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            app.retheme();
+            app.layout();
+            return LRESULT(0);
+        }
+        WM_SETTINGCHANGE => {
+            app.retheme();
+            return LRESULT(0);
+        }
+        WM_COMMAND => {
+            let id = wp.0 & 0xffff;
+            let notification = (wp.0 >> 16) & 0xffff;
+            if id == SEARCH && notification == EN_CHANGE as usize {
+                app.search();
+            } else if id == LIST && notification == LBN_SELCHANGE as usize {
+                app.selection();
+            } else if id == LIST && notification == LBN_DBLCLK as usize {
+                app.request(Action::Open(false));
+            } else if notification == BN_CLICKED as usize {
+                app.command(id);
+            }
+            return LRESULT(0);
+        }
+        WM_CONTEXTMENU => {
+            let (x, y) = if lp.0 == -1 {
+                let mut r = RECT::default();
+                let _ = GetWindowRect(app.list, &mut r);
+                (r.left + 20, r.top + 20)
+            } else {
+                (
+                    (lp.0 & 0xffff) as i16 as i32,
+                    ((lp.0 >> 16) & 0xffff) as i16 as i32,
+                )
+            };
+            if lp.0 != -1 {
+                let mut point = POINT { x, y };
+                let _ = ScreenToClient(app.list, &mut point);
+                let result = SendMessageW(
+                    app.list,
+                    LB_ITEMFROMPOINT,
+                    None,
+                    Some(LPARAM(
+                        ((point.y as u32) << 16 | point.x as u32 & 0xffff) as isize,
+                    )),
+                );
+                if result.0 >> 16 == 0 {
+                    SendMessageW(
+                        app.list,
+                        LB_SETCURSEL,
+                        Some(WPARAM((result.0 & 0xffff) as usize)),
+                        None,
+                    );
+                    app.selection();
+                }
+            }
+            app.context(x, y, false, false);
+            return LRESULT(0);
+        }
+        TRAY => {
+            match lp.0 as u32 {
+                WM_LBUTTONUP | WM_LBUTTONDBLCLK => app.show(None),
+                WM_RBUTTONUP => {
+                    let mut p = POINT::default();
+                    let _ = GetCursorPos(&mut p);
+                    app.context(p.x, p.y, true, false);
+                }
+                _ => {}
+            }
+            return LRESULT(0);
+        }
+        WM_DROPFILES => {
+            let drop = HDROP(wp.0 as *mut _);
+            let count = DragQueryFileW(drop, u32::MAX, None);
+            let mut paths = Vec::new();
+            for i in 0..count.min(100) {
+                let len = DragQueryFileW(drop, i, None);
+                let mut b = vec![0; len as usize + 1];
+                DragQueryFileW(drop, i, Some(&mut b));
+                paths.push(String::from_utf16_lossy(&b[..len as usize]));
+            }
+            DragFinish(drop);
+            for path in paths {
+                app.edit_favorite(None, Some(path));
+            }
+            return LRESULT(0);
+        }
+        WM_DRAWITEM => {
+            let draw = &*(lp.0 as *const DRAWITEMSTRUCT);
+            if draw.CtlID == LIST as u32 && draw.itemID != u32::MAX {
+                if let Some(item) = app.items.get(draw.itemID as usize) {
+                    let p = theme::palette(app.settings.theme);
+                    let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+                    let brush = CreateSolidBrush(if selected { p.selected } else { p.surface });
+                    FillRect(draw.hDC, &draw.rcItem, brush);
+                    let _ = DeleteObject(brush.into());
+                    let _ = SetBkMode(draw.hDC, TRANSPARENT);
+                    let _ = SelectObject(draw.hDC, app.font.into());
+                    let kind = match item.kind {
+                        ItemKind::Clipboard => "▤ 剪贴板",
+                        ItemKind::Folder => "▣ 文件夹",
+                        ItemKind::Document => "▧ 文档",
+                    };
+                    let mut title = wide(&format!(
+                        "{}{}",
+                        if item.pinned { "★ " } else { "" },
+                        item.title
+                    ));
+                    let mut rect = draw.rcItem;
+                    rect.left += app.s(14);
+                    rect.right -= app.s(105);
+                    rect.top += app.s(8);
+                    rect.bottom = rect.top + app.s(25);
+                    SetTextColor(draw.hDC, p.text);
+                    DrawTextW(
+                        draw.hDC,
+                        &mut title,
+                        &mut rect,
+                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                    let mut typ = wide(kind);
+                    let mut type_rect = draw.rcItem;
+                    type_rect.left = type_rect.right - app.s(98);
+                    type_rect.top += app.s(9);
+                    type_rect.bottom = type_rect.top + app.s(24);
+                    SetTextColor(draw.hDC, p.muted);
+                    DrawTextW(
+                        draw.hDC,
+                        &mut typ,
+                        &mut type_rect,
+                        DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                    let subtitle = if item.alias.is_empty() {
+                        item.subtitle.clone()
+                    } else {
+                        format!("{} · {}", item.alias, item.subtitle)
+                    };
+                    let mut subtitle = wide(&subtitle);
+                    rect.top += app.s(26);
+                    rect.bottom = rect.top + app.s(22);
+                    rect.right = draw.rcItem.right - app.s(14);
+                    DrawTextW(
+                        draw.hDC,
+                        &mut subtitle,
+                        &mut rect,
+                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                    if selected {
+                        let border = CreateSolidBrush(p.accent);
+                        FrameRect(draw.hDC, &draw.rcItem, border);
+                        let _ = DeleteObject(border.into());
+                    }
+                    if draw.itemState.0 & ODS_FOCUS.0 != 0 {
+                        let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
+                    }
+                }
+            }
+            return LRESULT(1);
+        }
+        WM_MEASUREITEM => {
+            let m = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
+            if m.CtlID == LIST as u32 {
+                m.itemHeight = app.s(62) as u32;
+                return LRESULT(1);
+            }
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
+            let dc = HDC(wp.0 as *mut _);
+            let p = theme::palette(app.settings.theme);
+            SetTextColor(dc, p.text);
+            SetBkColor(dc, p.background);
+            return LRESULT(app.brush.0 as isize);
+        }
+        WM_ERASEBKGND => {
+            let dc = HDC(wp.0 as *mut _);
+            let mut r = RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            FillRect(dc, &r, app.brush);
+            return LRESULT(1);
+        }
+        WM_QUERYENDSESSION => return LRESULT(1),
+        WM_ENDSESSION => {
+            if wp.0 != 0 {
+                if app.state.begin_exit() {
+                    app.send(Command::Shutdown);
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while Instant::now() < deadline {
+                    app.work_done();
+                    let event = app.engine.as_ref().and_then(|e| e.try_recv().ok());
+                    match event {
+                        Some(Event::ExitReady) => break,
+                        Some(Event::Error { .. }) => break,
+                        _ => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                let _ = DestroyWindow(hwnd);
+                std::process::exit(0);
+            }
+            return LRESULT(0);
+        }
+        WM_DESTROY => {
+            let _ = RemoveClipboardFormatListener(hwnd);
+            let _ = UnregisterHotKey(Some(hwnd), 1);
+            let _ = UnregisterHotKey(Some(hwnd), 2);
+            app.tray(NIM_DELETE);
+            let _ = RemoveWindowSubclass(app.preview, Some(preview_proc), 3);
+            let _ = RemoveWindowSubclass(app.edit, Some(edit_proc), 1);
+            let _ = RemoveWindowSubclass(app.list, Some(edit_proc), 2);
+            if !app.font.is_invalid() {
+                let _ = DeleteObject(app.font.into());
+            }
+            if !app.brush.is_invalid() {
+                let _ = DeleteObject(app.brush.into());
+            }
+            PostQuitMessage(0);
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+unsafe extern "system" fn preview_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    let app = &mut *(data as *mut App);
+    if msg == WM_PAINT && app.image.is_some() {
+        let mut ps = PAINTSTRUCT::default();
+        let dc = BeginPaint(hwnd, &mut ps);
+        let mut r = RECT::default();
+        let _ = GetClientRect(hwnd, &mut r);
+        FillRect(dc, &r, app.brush);
+        let image = app.image.as_ref().unwrap();
+        let ratio = (r.right as f64 / image.width as f64)
+            .min(r.bottom as f64 / image.height as f64)
+            .min(1.0);
+        let width = (image.width as f64 * ratio) as i32;
+        let height = (image.height as f64 * ratio) as i32;
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: image.width as i32,
+                biHeight: -(image.height as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        SetStretchBltMode(dc, HALFTONE);
+        StretchDIBits(
+            dc,
+            (r.right - width) / 2,
+            (r.bottom - height) / 2,
+            width,
+            height,
+            0,
+            0,
+            image.width as i32,
+            image.height as i32,
+            Some(image.pixels.as_ptr().cast()),
+            &info,
+            DIB_RGB_COLORS,
+            SRCCOPY,
+        );
+        let _ = EndPaint(hwnd, &ps);
+        return LRESULT(0);
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
