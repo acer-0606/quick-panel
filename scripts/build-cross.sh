@@ -5,5 +5,6 @@ cargo build --release --locked --target x86_64-pc-windows-gnu
 mkdir -p dist/QuickPanel-Windows-x64
 cp target/x86_64-pc-windows-gnu/release/quick-panel.exe dist/QuickPanel-Windows-x64/QuickPanel.exe
 cp README.md LICENSE THIRD_PARTY_NOTICES.txt dist/QuickPanel-Windows-x64/
+cp -R docs dist/QuickPanel-Windows-x64/
 cd dist/QuickPanel-Windows-x64
-zip -q -r ../QuickPanel-Windows-x64.zip QuickPanel.exe README.md LICENSE THIRD_PARTY_NOTICES.txt
+zip -q -r ../QuickPanel-Windows-x64.zip QuickPanel.exe README.md LICENSE THIRD_PARTY_NOTICES.txt docs
