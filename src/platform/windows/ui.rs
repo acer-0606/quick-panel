@@ -2147,9 +2147,27 @@ impl Host {
                         )
                         .0 as usize;
                         let _ = DestroyMenu(menu);
+                        {
+                            self.app.borrow_mut().state.modal_open = false;
+                        }
+                        // Cancellation may have consumed WA_INACTIVE inside the menu pump.
+                        // Read Win32 focus/ownership without retaining any App borrow.
+                        let foreground = GetForegroundWindow();
+                        let in_panel = self.is_panel_surface(foreground);
+                        let mut process = 0u32;
+                        GetWindowThreadProcessId(foreground, Some(&mut process));
+                        let in_owned_modal = !foreground.is_invalid()
+                            && process == windows::Win32::System::Threading::GetCurrentProcessId()
+                            && GetAncestor(foreground, GA_ROOTOWNER) == owner;
                         let mut app = self.app.borrow_mut();
-                        app.state.modal_open = false;
-                        app.command(command);
+                        if app
+                            .state
+                            .menu_cancel_should_hide(command != 0, in_panel, in_owned_modal)
+                        {
+                            app.hide();
+                        } else if command != 0 {
+                            app.command(command);
+                        }
                     } else {
                         self.app.borrow_mut().state.modal_open = false;
                     }

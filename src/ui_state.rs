@@ -101,6 +101,14 @@ impl UiState {
         self.interaction_epoch = self.interaction_epoch.wrapping_add(1);
         self.pending_action = None;
     }
+    pub fn menu_cancel_should_hide(
+        &self,
+        command_selected: bool,
+        foreground_in_panel: bool,
+        foreground_in_owned_modal: bool,
+    ) -> bool {
+        self.visible && !command_selected && !foreground_in_panel && !foreground_in_owned_modal
+    }
     pub fn may_update_target(&self, own_window: bool) -> bool {
         self.lifecycle == Lifecycle::Running && !self.modal_open && !own_window
     }

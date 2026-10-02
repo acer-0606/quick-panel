@@ -101,3 +101,35 @@ fn latest_action_runs_once_only_while_visible_and_running() {
     assert!(ui.finish_action(2));
     assert!(!ui.finish_action(2));
 }
+
+#[test]
+fn cancelled_menu_losing_focus_hides_and_invalidates_pending_action() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(ui.begin_action(44));
+    assert!(ui.menu_cancel_should_hide(false, false, false));
+    if ui.menu_cancel_should_hide(false, false, false) {
+        ui.hide();
+    }
+    assert!(!ui.visible);
+    ui.visible = true;
+    assert!(!ui.finish_action(44));
+}
+#[test]
+fn cancelled_menu_keeps_panel_when_foreground_is_panel_or_owned_modal() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(!ui.menu_cancel_should_hide(false, true, false));
+    assert!(!ui.menu_cancel_should_hide(false, false, true));
+}
+#[test]
+fn menu_command_and_hidden_tray_do_not_trigger_cancellation_hide() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(ui.begin_action(55));
+    assert!(!ui.menu_cancel_should_hide(true, false, false));
+    assert!(ui.finish_action(55));
+    ui.hide();
+    assert!(!ui.menu_cancel_should_hide(false, false, false));
+    assert!(!ui.visible);
+}
