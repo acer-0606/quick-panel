@@ -7,7 +7,7 @@ try {
     $bundle = Join-Path (Get-Location) "dist/QuickPanel-Windows-x64"
     New-Item -ItemType Directory -Force $bundle | Out-Null
     Copy-Item "target/$Target/release/quick-panel.exe" "$bundle/QuickPanel.exe"
-    Copy-Item "README.md", "LICENSE" $bundle
+    Copy-Item "README.md", "LICENSE", "THIRD_PARTY_NOTICES.txt" $bundle
     Compress-Archive -Path "$bundle/*" -DestinationPath "dist/QuickPanel-Windows-x64.zip" -Force
     Write-Output "Created dist/QuickPanel-Windows-x64.zip"
 } finally { Pop-Location }

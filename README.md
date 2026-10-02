@@ -68,4 +68,4 @@ core-check 使用临时数据库验证保存前可检索、保存前磁盘没有
 - [设计文档](docs/superpowers/specs/2026-10-02-windows-quick-panel-design.md)
 - [实施计划](docs/superpowers/plans/2026-10-02-windows-quick-panel.md)
 
-MIT 许可证见 LICENSE。依赖库遵循各自许可证。
+MIT 许可证见 LICENSE。依赖库的许可与版权声明见 THIRD_PARTY_NOTICES.txt。
