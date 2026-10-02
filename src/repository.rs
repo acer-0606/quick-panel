@@ -4,8 +4,30 @@ use rusqlite::{Connection, OptionalExtension, params};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
+#[derive(Default)]
+struct WalProgress {
+    frames: AtomicUsize,
+    checkpointed: AtomicUsize,
+}
+unsafe extern "C" fn observe_wal(
+    context: *mut std::ffi::c_void,
+    _database: *mut rusqlite::ffi::sqlite3,
+    _name: *const std::ffi::c_char,
+    frames: std::ffi::c_int,
+) -> std::ffi::c_int {
+    // SQLite invokes this on the connection's writer thread. The context is a
+    // stable Box owned by Repository, alive until after Connection is dropped.
+    let progress = unsafe { &*context.cast::<WalProgress>() };
+    let frames = frames.max(0) as usize;
+    let previous = progress.frames.swap(frames, Ordering::Relaxed);
+    if frames <= previous {
+        progress.checkpointed.store(0, Ordering::Relaxed);
+    }
+    rusqlite::ffi::SQLITE_OK
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mutation {
@@ -19,6 +41,9 @@ pub(crate) struct PendingItem {
 pub(crate) struct Repository {
     connection: Connection,
     wal_path: std::path::PathBuf,
+    page_size: u64,
+    // Field drop order keeps this Box alive until after Connection closes.
+    wal_progress: Box<WalProgress>,
 }
 
 impl Repository {
@@ -41,6 +66,13 @@ impl Repository {
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS item_search USING fts5(content);
             PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+        connection.execute_batch("CREATE INDEX IF NOT EXISTS items_alias_search ON items(lower(json_extract(summary,'$.alias')));
+            CREATE INDEX IF NOT EXISTS items_title_search ON items(lower(title));
+            CREATE INDEX IF NOT EXISTS items_active ON items(last_used_ms DESC);
+            CREATE INDEX IF NOT EXISTS items_kind_active ON items(kind,last_used_ms DESC);
+            CREATE INDEX IF NOT EXISTS items_pinned_active ON items(last_used_ms DESC) WHERE pinned=1;
+            CREATE INDEX IF NOT EXISTS items_favorite_active ON items(last_used_ms DESC) WHERE kind<>0;
+            CREATE INDEX IF NOT EXISTS items_used_active ON items(last_used_ms DESC) WHERE use_count>0;").map_err(|e|e.to_string())?;
         let version: Option<String> = connection
             .query_row(
                 "SELECT value FROM settings WHERE key='index_version'",
@@ -82,10 +114,31 @@ impl Repository {
         }
         let mut wal_path = path.as_os_str().to_os_string();
         wal_path.push("-wal");
-        Ok(Self {
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| {
+                row.get::<_, u32>(0).map(u64::from)
+            })
+            .map_err(|e| e.to_string())?;
+        let wal_progress = Box::<WalProgress>::default();
+        // Install after wal_autocheckpoint=0, which itself replaces SQLite's WAL hook.
+        // Callback only observes frame counts; it never enters SQLite recursively.
+        unsafe {
+            rusqlite::ffi::sqlite3_wal_hook(
+                connection.handle(),
+                Some(observe_wal),
+                (&*wal_progress as *const WalProgress).cast_mut().cast(),
+            );
+        }
+        let repo = Self {
             connection,
             wal_path: wal_path.into(),
-        })
+            page_size,
+            wal_progress,
+        };
+        if repo.wal_bytes() >= 64 * 1024 * 1024 {
+            repo.checkpoint();
+        }
+        Ok(repo)
     }
     pub fn settings(&self) -> Result<Settings, String> {
         let json: Option<String> = self
@@ -157,59 +210,186 @@ impl Repository {
         }
         Ok(Some(item))
     }
+    fn candidate_ids(
+        &self,
+        sql: &str,
+        arguments: &[&dyn rusqlite::ToSql],
+        ids: &mut HashSet<i64>,
+    ) -> Result<(), String> {
+        let mut statement = self
+            .connection
+            .prepare_cached(sql)
+            .map_err(|e| e.to_string())?;
+        let mut rows = statement.query(arguments).map_err(|e| e.to_string())?;
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            ids.insert(row.get(0).map_err(|e| e.to_string())?);
+        }
+        Ok(())
+    }
+    fn auxiliary_fts_ids(
+        &self,
+        expression: &str,
+        mut ids: Vec<i64>,
+    ) -> Result<HashSet<i64>, String> {
+        ids.sort_unstable();
+        let mut matches = HashSet::new();
+        let mut start = 0;
+        while start < ids.len() {
+            let mut end = start + 1;
+            while end < ids.len()
+                && end - start < 128
+                && ids[end].saturating_sub(ids[start]) <= 2048
+            {
+                end += 1;
+            }
+            let chunk = &ids[start..end];
+            let placeholders = (4..4 + chunk.len())
+                .map(|number| format!("?{number}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            // Unary + keeps the IN list out of FTS's rowid-equality strategy,
+            // otherwise SQLite invokes MATCH once for every auxiliary rowid.
+            // A bounded range also prevents an old pinned row from making this
+            // scan the whole posting list just to check a nearby recent group.
+            let sql = format!(
+                "SELECT rowid FROM item_search WHERE item_search MATCH ?1 AND rowid>=?2 AND rowid<=?3 AND +rowid IN ({placeholders})"
+            );
+            let mut args = vec![
+                rusqlite::types::Value::Text(expression.into()),
+                rusqlite::types::Value::Integer(chunk[0]),
+                rusqlite::types::Value::Integer(*chunk.last().unwrap()),
+            ];
+            args.extend(chunk.iter().copied().map(rusqlite::types::Value::Integer));
+            let mut statement = self
+                .connection
+                .prepare_cached(&sql)
+                .map_err(|e| e.to_string())?;
+            let mut rows = statement
+                .query(rusqlite::params_from_iter(args))
+                .map_err(|e| e.to_string())?;
+            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                matches.insert(row.get(0).map_err(|e| e.to_string())?);
+            }
+            start = end;
+        }
+        Ok(matches)
+    }
     pub fn summaries(&self, query: &SearchQuery) -> Result<Vec<ItemSummary>, String> {
-        let scope = match query.scope {
-            Scope::All => -1,
-            Scope::Clipboard => 0,
-            Scope::Folder => 1,
-            Scope::Document => 2,
-        };
         let expression = search::query_expression(&query.text);
         let nonempty = !query.text.trim().is_empty();
-        let columns = "i.summary,i.target,i.open_with";
-        // Relevance must influence recall before LIMIT: recent broad-prefix matches
-        // must not evict an older exact alias or title from the candidate set.
-        let order = "CASE WHEN ?3='' THEN 0 WHEN lower(json_extract(i.summary,'$.alias'))=lower(?3) THEN 0 WHEN lower(i.title)=lower(?3) THEN 1 WHEN substr(lower(json_extract(i.summary,'$.alias')),1,length(?3))=lower(?3) THEN 2 WHEN substr(lower(i.title),1,length(?3))=lower(?3) THEN 3 ELSE 4 END, i.pinned DESC, (i.kind<>0) DESC, i.last_used_ms DESC";
-        let sql = if expression.is_some() {
-            format!(
-                "SELECT {columns} FROM item_search JOIN items i ON i.rowid=item_search.rowid WHERE item_search MATCH ?1 AND (?2=-1 OR i.kind=?2) ORDER BY {order} LIMIT 500"
-            )
-        } else {
-            format!(
-                "SELECT {columns} FROM items i WHERE (?2=-1 OR i.kind=?2) ORDER BY {order} LIMIT 500"
-            )
+        let scope = match query.scope {
+            Scope::All => "1",
+            Scope::Clipboard => "kind=0",
+            Scope::Folder => "kind=1",
+            Scope::Document => "kind=2",
         };
-        let mut stmt = self.connection.prepare(&sql).map_err(|e| e.to_string())?;
-        let mut rows = stmt
-            .query(params![
-                expression.unwrap_or_default(),
-                scope,
-                query.text.trim()
-            ])
-            .map_err(|e| e.to_string())?;
+        let mut ids = HashSet::new();
+        let mut fts_ids = HashSet::new();
+        if let Some(expression) = expression.as_ref() {
+            // FTS supplies rowid order itself. Applying metadata relevance before LIMIT
+            // would sort every hit; retrieve a bounded recent pool before table lookup.
+            let fts_sql = if query.scope == Scope::All {
+                "SELECT rowid FROM item_search WHERE item_search MATCH ?1 ORDER BY rowid DESC LIMIT 512".to_string()
+            } else {
+                format!(
+                    "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND {scope} ORDER BY item_search.rowid DESC LIMIT 512"
+                )
+            };
+            self.candidate_ids(&fts_sql, &[expression], &mut fts_ids)?;
+            ids.extend(fts_ids.iter().copied());
+        } else {
+            self.candidate_ids(
+                &format!(
+                    "SELECT rowid FROM items WHERE {scope} ORDER BY last_used_ms DESC LIMIT 512"
+                ),
+                &[],
+                &mut ids,
+            )?;
+        }
+        if nonempty {
+            let needle = query.text.trim().to_lowercase();
+            let ceiling = format!("{needle}\u{10ffff}");
+            for field in ["lower(json_extract(summary,'$.alias'))", "lower(title)"] {
+                self.candidate_ids(
+                    &format!("SELECT rowid FROM items WHERE {scope} AND {field}=?1 LIMIT 128"),
+                    &[&needle],
+                    &mut ids,
+                )?;
+                self.candidate_ids(&format!("SELECT rowid FROM items WHERE {scope} AND {field}>=?1 AND {field}<?2 LIMIT 128"),&[&needle,&ceiling],&mut ids)?;
+            }
+        }
+        // Indexed auxiliary pools preserve old pinned/favorite/recently-used entries
+        // that fall outside the newest FTS rows. Recent captures have their own pool
+        // too: deduplicated captures update recency without changing rowid.
+        // Each category has its own quota.
+        for predicate in ["pinned=1", "kind<>0", "use_count>0", "1"] {
+            self.candidate_ids(&format!("SELECT rowid FROM items WHERE {scope} AND {predicate} ORDER BY last_used_ms DESC LIMIT 128"),&[],&mut ids)?;
+        }
         let mut summaries = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let summary: ItemSummary =
-                serde_json::from_str(&row.get::<_, String>(0).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            if nonempty {
-                // Inspect one candidate's text at a time, never its representations or all database payloads.
-                let item = StoredItem {
-                    summary,
-                    text: String::new(),
-                    representations: vec![],
-                    target: row.get(1).map_err(|e| e.to_string())?,
-                    open_with: row.get(2).map_err(|e| e.to_string())?,
-                };
+        let mut body_candidates = Vec::new();
+        for rowid in ids {
+            let raw: Option<(String, Option<String>, Option<String>)> = self
+                .connection
+                .prepare_cached("SELECT summary,target,open_with FROM items WHERE rowid=?1")
+                .map_err(|e| e.to_string())?
+                .query_row([rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let Some((summary, target, open_with)) = raw else {
+                continue;
+            };
+            let item = StoredItem {
+                summary: serde_json::from_str(&summary).map_err(|e| e.to_string())?,
+                text: String::new(),
+                representations: vec![],
+                target,
+                open_with,
+            };
+            if !matches!(
+                (item.summary.kind, query.scope),
+                (_, Scope::All)
+                    | (ItemKind::Clipboard, Scope::Clipboard)
+                    | (ItemKind::Folder, Scope::Folder)
+                    | (ItemKind::Document, Scope::Document)
+            ) {
+                continue;
+            }
+            if !nonempty || search::matches(&item, &query.text) {
+                summaries.push(item.summary);
+                continue;
+            }
+            body_candidates.push((rowid, item));
+        }
+        let auxiliary = if let Some(expression) = expression.as_ref() {
+            self.auxiliary_fts_ids(
+                expression,
+                body_candidates
+                    .iter()
+                    .filter(|(id, _)| !fts_ids.contains(id))
+                    .map(|(id, _)| *id)
+                    .collect(),
+            )?
+        } else {
+            HashSet::new()
+        };
+        for (rowid, mut item) in body_candidates {
+            if expression.is_some() && !fts_ids.contains(&rowid) && !auxiliary.contains(&rowid) {
+                continue;
+            }
+            let text: Option<String> = self
+                .connection
+                .prepare_cached("SELECT text FROM items WHERE rowid=?1")
+                .map_err(|e| e.to_string())?
+                .query_row([rowid], |row| row.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            if let Some(text) = text {
+                // Metadata was already loaded above. Avoid another statement prepare,
+                // a string-ID lookup and duplicate summary JSON parsing for FTS collisions.
+                item.text = text;
                 if search::matches(&item, &query.text) {
                     summaries.push(item.summary);
-                } else if let Some(body) = self.load(&item.summary.id, false)?
-                    && search::matches(&body, &query.text)
-                {
-                    summaries.push(item.summary);
                 }
-            } else {
-                summaries.push(summary);
             }
         }
         Ok(summaries)
@@ -287,9 +467,31 @@ impl Repository {
     pub fn wal_bytes(&self) -> u64 {
         std::fs::metadata(&self.wal_path).map_or(0, |metadata| metadata.len())
     }
-    pub fn checkpoint(&self) {
-        let _ = self
+    pub fn wal_backlog_bytes(&self) -> u64 {
+        let frames = self.wal_progress.frames.load(Ordering::Relaxed);
+        let completed = self.wal_progress.checkpointed.load(Ordering::Relaxed);
+        (frames.saturating_sub(completed) as u64).saturating_mul(self.page_size + 24)
+    }
+    pub fn checkpoint(&self) -> bool {
+        match self
             .connection
-            .execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            }) {
+            Ok((busy, frames, completed)) if frames >= 0 && completed >= 0 => {
+                self.wal_progress
+                    .frames
+                    .store(frames as usize, Ordering::Relaxed);
+                self.wal_progress
+                    .checkpointed
+                    .store(completed as usize, Ordering::Relaxed);
+                busy == 0 && completed == frames
+            }
+            _ => false,
+        }
     }
 }

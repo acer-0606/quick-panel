@@ -109,6 +109,12 @@ impl UiState {
     ) -> bool {
         self.visible && !command_selected && !foreground_in_panel && !foreground_in_owned_modal
     }
+    pub fn instance_show_updates_target(&self) -> bool {
+        !self.visible && self.can_show_panel()
+    }
+    pub fn can_show_panel(&self) -> bool {
+        self.lifecycle == Lifecycle::Running && !self.modal_open
+    }
     pub fn may_update_target(&self, own_window: bool) -> bool {
         self.lifecycle == Lifecycle::Running && !self.modal_open && !own_window
     }

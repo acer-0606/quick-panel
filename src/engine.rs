@@ -57,6 +57,7 @@ impl Engine {
                     settings_dirty: false,
                     deadline: None,
                     checkpoint_at: None,
+                    emergency_checkpoint_retry: None,
                     commits: 0,
                     retry_delay_ms: 1_000,
                     retry_not_before: None,
@@ -181,6 +182,7 @@ struct Actor {
     settings_dirty: bool,
     deadline: Option<Instant>,
     checkpoint_at: Option<Instant>,
+    emergency_checkpoint_retry: Option<Instant>,
     commits: u64,
     retry_delay_ms: u64,
     retry_not_before: Option<Instant>,
@@ -220,8 +222,12 @@ fn content_id(snapshot: &ClipboardSnapshot) -> String {
 }
 fn result_rank(summary: &ItemSummary, query: &str) -> i64 {
     search::rank(summary, query)
-        + if query.trim().is_empty() && summary.kind != ItemKind::Clipboard {
-            5_000
+        + if summary.kind != ItemKind::Clipboard {
+            if query.trim().is_empty() {
+                5_000
+            } else {
+                2_000
+            }
         } else {
             0
         }
@@ -311,9 +317,26 @@ impl Actor {
                 self.retry_not_before = None;
                 self.checkpoint_at
                     .get_or_insert(Instant::now() + Duration::from_secs(300));
-                if self.repo.wal_bytes() >= 16 * 1024 * 1024 {
+                if self.repo.wal_backlog_bytes() >= 16 * 1024 * 1024 {
                     let pressure = Instant::now() + Duration::from_secs(30);
                     self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(pressure));
+                }
+                if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024
+                    && self
+                        .emergency_checkpoint_retry
+                        .is_none_or(|when| Instant::now() >= when)
+                {
+                    let complete = self.repo.checkpoint();
+                    if !complete {
+                        // A long reader may prevent PASSIVE progress. Do not spin
+                        // a checkpoint for every tiny subsequent dirty batch.
+                        let retry = Instant::now() + Duration::from_secs(1);
+                        self.emergency_checkpoint_retry = Some(retry);
+                        self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(retry));
+                    } else {
+                        self.emergency_checkpoint_retry = None;
+                        self.checkpoint_at = None;
+                    }
                 }
                 self.emit(Event::Saved(SaveStats {
                     pending_items: 0,
@@ -558,6 +581,25 @@ impl Actor {
             {
                 self.flush();
             }
+            // No SQLite transaction is held between commands, even when RAM is
+            // dirty. Service due maintenance here so continuous input cannot starve it.
+            if self
+                .checkpoint_at
+                .is_some_and(|when| when <= Instant::now())
+            {
+                let complete = self.repo.checkpoint();
+                if !complete {
+                    let seconds = if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024 {
+                        1
+                    } else {
+                        5
+                    };
+                    self.checkpoint_at = Some(Instant::now() + Duration::from_secs(seconds));
+                } else {
+                    self.checkpoint_at = None;
+                    self.emergency_checkpoint_retry = None;
+                }
+            }
             let next = match (self.deadline, self.checkpoint_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -581,14 +623,6 @@ impl Actor {
                 Err(RecvTimeoutError::Timeout) => {
                     if self.deadline.is_some_and(|d| d <= Instant::now()) {
                         self.flush();
-                    }
-                    if !self.dirty() && self.checkpoint_at.is_some_and(|d| d <= Instant::now()) {
-                        self.repo.checkpoint();
-                        self.checkpoint_at = None;
-                    }
-                    // Defer maintenance during a failed dirty batch to avoid a zero-timeout loop.
-                    if self.dirty() && self.checkpoint_at.is_some_and(|d| d <= Instant::now()) {
-                        self.checkpoint_at = None;
                     }
                     continue;
                 }

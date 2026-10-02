@@ -187,6 +187,13 @@ impl SingleInstance {
         // its window. Never open its database or become another writer in this case.
         for _ in 0..30 {
             if let Ok(hwnd) = FindWindowW(w!("QuickPanelWindow"), PCWSTR::null()) {
+                // A user-launched process can grant the existing process permission
+                // to take foreground; failure retains the normal Win32 fallback.
+                let mut process = 0u32;
+                GetWindowThreadProcessId(hwnd, Some(&mut process));
+                if process != 0 {
+                    let _ = AllowSetForegroundWindow(process);
+                }
                 if let Err(error) = PostMessageW(Some(hwnd), SHOW_EXISTING, WPARAM(0), LPARAM(0)) {
                     let text = wide(&format!(
                         "快捷面板已经运行，但无法唤起现有窗口。请从托盘打开。\n{error}"
@@ -1613,7 +1620,8 @@ unsafe fn app_message(
                     let _ = SetForegroundWindow(popup);
                 }
             } else {
-                app.show_panel(None, false);
+                let update_target = app.state.instance_show_updates_target();
+                app.show_panel(None, update_target);
             }
             return Some(LRESULT(0));
         }

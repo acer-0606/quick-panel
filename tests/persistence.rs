@@ -38,7 +38,10 @@ fn start(interval: u64, budget: usize) -> (TempDir, Engine, std::path::PathBuf) 
     (temp, engine, path)
 }
 fn wait(engine: &Engine, accept: impl Fn(&Event) -> bool) -> Event {
-    let until = Instant::now() + Duration::from_secs(5);
+    wait_with_budget(engine, accept, Duration::from_secs(5))
+}
+fn wait_with_budget(engine: &Engine, accept: impl Fn(&Event) -> bool, budget: Duration) -> Event {
+    let until = Instant::now() + budget;
     loop {
         match engine.try_recv() {
             Ok(e) if accept(&e) => return e,
@@ -397,7 +400,14 @@ fn first_dirty_deadline_fires_even_when_command_queue_is_busy() {
         thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(count(&path), 1, "queued reads postponed the save deadline");
-    shutdown(&engine);
+    engine.send(Command::Shutdown).unwrap();
+    // Drain all 20k accepted queries; this lifecycle wait is separate from the
+    // unchanged 150ms assertion on the first dirty disk deadline above.
+    wait_with_budget(
+        &engine,
+        |e| matches!(e, Event::ExitReady),
+        Duration::from_secs(30),
+    );
 }
 
 #[test]
@@ -715,7 +725,19 @@ fn persisted_body_search_uses_bounded_sqlite_memory() {
         );
     }
     let baseline = current;
-    assert_eq!(search(&engine, "needle").len(), 50);
+    engine
+        .send(Command::Search(SearchQuery {
+            text: "needle".into(),
+            scope: Scope::All,
+            request_id: 55,
+        }))
+        .unwrap();
+    let results = wait_with_budget(
+        &engine,
+        |e| matches!(e, Event::Results { request_id: 55, .. }),
+        Duration::from_secs(30),
+    );
+    assert!(matches!(results,Event::Results{items,..} if items.len()==50));
     unsafe {
         rusqlite::ffi::sqlite3_status64(
             rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
@@ -782,4 +804,338 @@ fn old_fts_index_is_migrated_once_without_changing_original_representations() {
             .unwrap()
             .ends_with(" migrationpreserved")
     );
+}
+
+#[test]
+#[ignore = "真实100k Release性能与特殊候选回归"]
+fn hundred_thousand_search_preserves_special_candidates_under_sixty_ms() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let mut db = Connection::open(&path).unwrap();
+    let now = 1_791_000_000_000i64;
+    let tx = db.transaction().unwrap();
+    for i in 0..100_000 {
+        let summary = ItemSummary {
+            id: format!("perf:{i}"),
+            kind: if i == 3 {
+                ItemKind::Folder
+            } else {
+                ItemKind::Clipboard
+            },
+            title: if i == 1 {
+                "needle".into()
+            } else {
+                format!("needle common {i}")
+            },
+            subtitle: String::new(),
+            alias: if i == 0 {
+                "needle".into()
+            } else {
+                String::new()
+            },
+            tags: vec![],
+            pinned: i == 2,
+            created_at_ms: now + i,
+            last_used_ms: if i == 4 { now + 2_000_000 } else { now + i },
+            use_count: if i == 4 { 50 } else { 0 },
+        };
+        tx.execute(
+            "INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?3,NULL,NULL)",
+            rusqlite::params![
+                summary.id,
+                if i == 3 { 1 } else { 0 },
+                summary.title,
+                summary.pinned,
+                summary.created_at_ms,
+                summary.last_used_ms,
+                summary.use_count as i64,
+                serde_json::to_string(&summary).unwrap()
+            ],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO item_search(rowid,content) SELECT rowid,'n e d l ne ee ed dl le nee eed edl dle' FROM items WHERE id=?1",[summary.id]).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(count(&path), 100_000);
+    let mut elapsed = vec![];
+    for _ in 0..11 {
+        let start = Instant::now();
+        let items = search(&engine, "needle");
+        elapsed.push(start.elapsed().as_secs_f64() * 1000.);
+        for id in ["perf:0", "perf:1", "perf:2", "perf:3", "perf:4"] {
+            assert!(
+                items.iter().any(|item| item.id == id),
+                "old exact/pin/favorite/Used candidate disappeared: {id}"
+            );
+        }
+    }
+    elapsed.remove(0);
+    elapsed.sort_by(f64::total_cmp);
+    println!(
+        "actual_items=100000 queries=10 p50_ms={:.3} p95_ms={:.3}",
+        elapsed[4], elapsed[9]
+    );
+    assert!(
+        elapsed[9] <= 60.,
+        "100k query exceeded target: {:.3}ms",
+        elapsed[9]
+    );
+    shutdown(&engine);
+}
+
+#[test]
+fn scoped_search_keeps_older_favorites_after_many_new_clipboard_hits() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let mut db = Connection::open(path).unwrap();
+    let tx = db.transaction().unwrap();
+    for index in 0..801 {
+        let kind = if index <= 200 {
+            ItemKind::Folder
+        } else {
+            ItemKind::Clipboard
+        };
+        let summary = ItemSummary {
+            id: format!("scope:{index}"),
+            kind,
+            title: if index == 0 {
+                "archive".into()
+            } else if kind == ItemKind::Folder {
+                format!("distractor {index}")
+            } else {
+                format!("needle clip {index}")
+            },
+            subtitle: String::new(),
+            alias: String::new(),
+            tags: vec![],
+            pinned: false,
+            created_at_ms: 1_791_000_000_000 + index,
+            last_used_ms: 1_791_000_000_000 + index,
+            use_count: 0,
+        };
+        let target = if index == 0 {
+            Some("C:/needle/archive".to_string())
+        } else {
+            None
+        };
+        tx.execute(
+            "INSERT INTO items VALUES(?1,?2,?3,0,?4,?4,0,?5,'',?6,NULL)",
+            rusqlite::params![
+                summary.id,
+                if kind == ItemKind::Folder { 1 } else { 0 },
+                summary.title,
+                summary.created_at_ms,
+                serde_json::to_string(&summary).unwrap(),
+                target
+            ],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO item_search(rowid,content) SELECT rowid,?2 FROM items WHERE id=?1",
+            rusqlite::params![
+                summary.id,
+                if index == 0 || kind == ItemKind::Clipboard {
+                    "nee eed edl dle"
+                } else {
+                    "zzz"
+                }
+            ],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    engine
+        .send(Command::Search(SearchQuery {
+            text: "needle".into(),
+            scope: Scope::Folder,
+            request_id: 33,
+        }))
+        .unwrap();
+    match wait(&engine, |e| {
+        matches!(e, Event::Results { request_id: 33, .. })
+    }) {
+        Event::Results { items, .. } => assert_eq!(
+            items.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["scope:0"]
+        ),
+        _ => unreachable!(),
+    };
+    shutdown(&engine);
+}
+
+#[test]
+#[ignore = "真实bulk WAL空间边界Release回归"]
+fn continuous_bulk_saving_keeps_wal_under_emergency_pressure() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::SaveSettings(Settings {
+            max_history: 100_000,
+            ..Settings::default()
+        }))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    let wal_path = std::path::PathBuf::from(wal_path);
+    let mut peak = 0;
+    let mut previous = 0;
+    let mut reuse_cycles = 0;
+    for batch in 0..100 {
+        for index in batch * 1000..(batch + 1) * 1000 {
+            engine
+                .send(Command::Capture(ClipboardSnapshot {
+                    text: format!(
+                        "项目{index} 接口说明 周报第{index}期 C:/Projects/project-{index}/readme.md"
+                    ),
+                    representations: vec![],
+                    source_app: "core-check".into(),
+                    captured_at_ms: 1_791_000_000_000,
+                }))
+                .unwrap();
+        }
+        engine.send(Command::Flush).unwrap();
+        wait(&engine, |e| matches!(e, Event::Saved(_)));
+        let size = std::fs::metadata(&wal_path).unwrap().len();
+        peak = peak.max(size);
+        if size < previous {
+            reuse_cycles += 1;
+        }
+        previous = size;
+        println!(
+            "bulk_items={} wal_bytes={size} peak_bytes={peak}",
+            (batch + 1) * 1000
+        );
+        assert!(
+            size <= 80 * 1024 * 1024,
+            "bulk WAL exceeded emergency bound: {size}"
+        );
+    }
+    assert_eq!(count(&path), 100_000);
+    println!("actual_items=100000 wal_peak_bytes={peak} wal_reuse_cycles={reuse_cycles}");
+    assert!(reuse_cycles > 0);
+    shutdown(&engine);
+}
+
+#[test]
+fn repeated_capture_of_an_old_row_preserves_recent_search_position() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let original = snapshot("archive needle item");
+    engine.send(Command::Capture(original.clone())).unwrap();
+    engine.send(Command::Flush).unwrap();
+    let id = search(&engine, "needle")[0].id.clone();
+    let mut db = Connection::open(path).unwrap();
+    let tx = db.transaction().unwrap();
+    for i in 0..600 {
+        let s = ItemSummary {
+            id: format!("recent:{i}"),
+            kind: ItemKind::Clipboard,
+            title: format!("ordinary needle item {i}"),
+            subtitle: String::new(),
+            alias: String::new(),
+            tags: vec![],
+            pinned: false,
+            created_at_ms: original.captured_at_ms + i + 1,
+            last_used_ms: original.captured_at_ms + i + 1,
+            use_count: 0,
+        };
+        tx.execute(
+            "INSERT INTO items VALUES(?1,0,?2,0,?3,?3,0,?4,?2,NULL,NULL)",
+            rusqlite::params![
+                s.id,
+                s.title,
+                s.created_at_ms,
+                serde_json::to_string(&s).unwrap()
+            ],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO item_search(rowid,content) SELECT rowid,'nee eed edl dle' FROM items WHERE id=?1",[s.id]).unwrap();
+    }
+    tx.commit().unwrap();
+    let mut repeated = original;
+    repeated.captured_at_ms += 2_000_000;
+    engine.send(Command::Capture(repeated)).unwrap();
+    engine.send(Command::Flush).unwrap();
+    assert_eq!(
+        search(&engine, "needle")[0].id,
+        id,
+        "old rowid hid a newly captured duplicate"
+    );
+    shutdown(&engine);
+}
+
+#[test]
+fn auxiliary_candidates_keep_body_only_matches_for_old_pin_usage_and_recapture() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let clips = [
+        snapshot("pinned preview\nneedle body"),
+        snapshot("used preview\nneedle body"),
+        snapshot("recent preview\nneedle body"),
+    ];
+    for clip in &clips {
+        engine.send(Command::Capture(clip.clone())).unwrap();
+    }
+    engine.send(Command::Flush).unwrap();
+    let initial = search(&engine, "needle");
+    let pinned = initial
+        .iter()
+        .find(|s| s.title == "pinned preview")
+        .unwrap()
+        .id
+        .clone();
+    let used = initial
+        .iter()
+        .find(|s| s.title == "used preview")
+        .unwrap()
+        .id
+        .clone();
+    let recent = initial
+        .iter()
+        .find(|s| s.title == "recent preview")
+        .unwrap()
+        .id
+        .clone();
+    engine
+        .send(Command::Pin {
+            id: pinned.clone(),
+            pinned: true,
+        })
+        .unwrap();
+    engine.send(Command::Used(used.clone())).unwrap();
+    engine.send(Command::Flush).unwrap();
+    search(&engine, "");
+    let mut db = Connection::open(path).unwrap();
+    let tx = db.transaction().unwrap();
+    for i in 0..600 {
+        let s = ItemSummary {
+            id: format!("body:{i}"),
+            kind: ItemKind::Clipboard,
+            title: format!("ordinary {i}"),
+            subtitle: String::new(),
+            alias: String::new(),
+            tags: vec![],
+            pinned: false,
+            created_at_ms: clips[0].captured_at_ms + i + 1,
+            last_used_ms: clips[0].captured_at_ms + i + 1,
+            use_count: 0,
+        };
+        tx.execute(
+            "INSERT INTO items VALUES(?1,0,?2,0,?3,?3,0,?4,'needle payload',NULL,NULL)",
+            rusqlite::params![
+                s.id,
+                s.title,
+                s.created_at_ms,
+                serde_json::to_string(&s).unwrap()
+            ],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO item_search(rowid,content) SELECT rowid,'nee eed edl dle' FROM items WHERE id=?1",[s.id]).unwrap();
+    }
+    tx.commit().unwrap();
+    let mut repeated = clips[2].clone();
+    repeated.captured_at_ms += 2_000_000;
+    engine.send(Command::Capture(repeated)).unwrap();
+    engine.send(Command::Flush).unwrap();
+    let items = search(&engine, "needle");
+    assert_eq!(items[0].id, pinned);
+    assert!(items.iter().any(|s| s.id == used));
+    assert!(items.iter().any(|s| s.id == recent));
+    shutdown(&engine);
 }

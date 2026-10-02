@@ -133,3 +133,38 @@ fn menu_command_and_hidden_tray_do_not_trigger_cancellation_hide() {
     assert!(!ui.menu_cancel_should_hide(false, false, false));
     assert!(!ui.visible);
 }
+
+#[test]
+fn instance_show_request_is_blocked_during_modal_or_shutdown() {
+    let mut ui = UiState::default();
+    assert!(ui.can_show_panel());
+    ui.modal_open = true;
+    assert!(!ui.can_show_panel());
+    ui.modal_open = false;
+    ui.begin_exit();
+    assert!(!ui.can_show_panel());
+    ui.cancel_exit();
+    assert!(ui.can_show_panel());
+}
+
+#[test]
+fn repeated_launch_hidden_panel_starts_a_new_target_session() {
+    let ui = UiState::default();
+    assert!(ui.instance_show_updates_target());
+    assert!(!ui.may_update_target(true));
+}
+#[test]
+fn repeated_launch_visible_panel_preserves_the_existing_target() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(!ui.instance_show_updates_target());
+}
+#[test]
+fn repeated_launch_modal_or_exiting_panel_never_updates_target() {
+    let mut ui = UiState::default();
+    ui.modal_open = true;
+    assert!(!ui.instance_show_updates_target());
+    ui.modal_open = false;
+    ui.begin_exit();
+    assert!(!ui.instance_show_updates_target());
+}
