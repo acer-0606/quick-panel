@@ -1,7 +1,7 @@
 //! One actor owns SQLite and all pending changes; no UI work runs on this thread.
 use crate::{
     model::*,
-    repository::{PendingItem, Repository},
+    repository::{Mutation, PendingItem, Repository},
     search,
 };
 use sha2::{Digest, Sha256};
@@ -59,6 +59,7 @@ impl Engine {
                     checkpoint_at: None,
                     commits: 0,
                     retry_delay_ms: 1_000,
+                    retry_not_before: None,
                     queued_bytes: worker_queue_bytes,
                     exiting: false,
                     events: events_tx,
@@ -182,6 +183,7 @@ struct Actor {
     checkpoint_at: Option<Instant>,
     commits: u64,
     retry_delay_ms: u64,
+    retry_not_before: Option<Instant>,
     queued_bytes: Arc<AtomicUsize>,
     exiting: bool,
     events: Sender<Event>,
@@ -264,14 +266,28 @@ impl Actor {
         if let Some(pending) = self.pending.get(id) {
             let mut item = pending.item.clone();
             if blobs
-                && !pending.replace_representations
+                && pending.mutation == Mutation::Metadata
                 && let Some(saved) = self.repo.load(id, true)?
             {
+                item.text = saved.text;
                 item.representations = saved.representations;
             }
             return Ok(Some(item));
         }
-        self.repo.load(id, blobs)
+        if blobs {
+            self.repo.load(id, true)
+        } else {
+            self.repo.metadata(id)
+        }
+    }
+    fn pressure_flush(&mut self) -> bool {
+        if self
+            .retry_not_before
+            .is_some_and(|when| Instant::now() < when)
+        {
+            return false;
+        }
+        self.flush()
     }
     fn flush(&mut self) -> bool {
         if !self.dirty() {
@@ -292,6 +308,7 @@ impl Actor {
                 self.deadline = None;
                 self.commits += 1;
                 self.retry_delay_ms = 1_000;
+                self.retry_not_before = None;
                 self.checkpoint_at
                     .get_or_insert(Instant::now() + Duration::from_secs(300));
                 if self.repo.wal_bytes() >= 16 * 1024 * 1024 {
@@ -308,6 +325,7 @@ impl Actor {
             }
             Err(message) => {
                 self.deadline = Some(Instant::now() + Duration::from_millis(self.retry_delay_ms));
+                self.retry_not_before = self.deadline;
                 self.retry_delay_ms = self.retry_delay_ms.saturating_mul(2).min(60_000);
                 self.error(message);
                 false
@@ -338,9 +356,26 @@ impl Actor {
             ));
         }
         let id = content_id(&snapshot);
+        if let Some(mut old) = self.lookup(&id, false)? {
+            old.summary.last_used_ms = old.summary.last_used_ms.max(snapshot.captured_at_ms);
+            let mutation = self
+                .pending
+                .get(&id)
+                .map_or(Mutation::Metadata, |p| p.mutation);
+            self.pending.insert(
+                id,
+                PendingItem {
+                    item: old,
+                    mutation,
+                },
+            );
+            self.mark_dirty();
+            self.emit(Event::Changed);
+            return Ok(());
+        }
         if self.pending_bytes().saturating_add(bytes) > self.options.max_pending_bytes
             && self.dirty()
-            && !self.flush()
+            && !self.pressure_flush()
         {
             return Err("待保存缓存已满，保存失败，本条未记录".into());
         }
@@ -384,13 +419,13 @@ impl Actor {
                     target: None,
                     open_with: None,
                 },
-                replace_representations: true,
+                mutation: Mutation::Content,
             },
         );
         self.mark_dirty();
         self.emit(Event::Changed);
         if self.pending_bytes() >= self.options.max_pending_bytes {
-            self.flush();
+            self.pressure_flush();
         }
         Ok(())
     }
@@ -399,12 +434,37 @@ impl Actor {
             .repo
             .summaries(&query)?
             .into_iter()
-            .filter(|s| !self.deleted.contains(&s.id) && !self.pending.contains_key(&s.id))
-            .map(|s| (s.id.clone(), s))
+            .filter(|s| {
+                !self.deleted.contains(&s.id)
+                    && !self
+                        .pending
+                        .get(&s.id)
+                        .is_some_and(|p| p.mutation == Mutation::Content)
+            })
+            .map(|s| {
+                let s = self
+                    .pending
+                    .get(&s.id)
+                    .map_or(s.clone(), |p| p.item.summary.clone());
+                (s.id.clone(), s)
+            })
             .collect();
         for p in self.pending.values() {
-            if scope_matches(p.item.summary.kind, query.scope)
-                && search::matches(&p.item, &query.text)
+            if p.mutation == Mutation::Metadata && items.contains_key(&p.item.summary.id) {
+                continue;
+            }
+            let body;
+            let item = if p.mutation == Mutation::Metadata && !search::matches(&p.item, &query.text)
+            {
+                body = self.repo.load(&p.item.summary.id, false)?;
+                let Some(body) = body.as_ref() else {
+                    continue;
+                };
+                body
+            } else {
+                &p.item
+            };
+            if scope_matches(p.item.summary.kind, query.scope) && search::matches(item, &query.text)
             {
                 items.insert(p.item.summary.id.clone(), p.item.summary.clone());
             }
@@ -458,7 +518,7 @@ impl Actor {
                     target: Some(favorite.target),
                     open_with: favorite.open_with,
                 },
-                replace_representations: true,
+                mutation: Mutation::Content,
             },
         );
         self.mark_dirty();
@@ -476,28 +536,14 @@ impl Actor {
             item.summary.use_count = item.summary.use_count.saturating_add(1);
             item.summary.last_used_ms = now_ms();
         }
-        let previous_bytes = self.pending.get(&id).map_or(0, |p| item_bytes(&p.item));
-        let projected_bytes = self
-            .pending_bytes()
-            .saturating_sub(previous_bytes)
-            .saturating_add(item_bytes(&item));
-        if projected_bytes > self.options.max_pending_bytes && self.dirty() && !self.flush() {
-            return Err("待保存缓存已满，保存失败，本次修改未接受".into());
-        }
-        let replace_representations = self
+        let mutation = self
             .pending
             .get(&id)
-            .is_some_and(|p| p.replace_representations);
-        self.pending.insert(
-            id,
-            PendingItem {
-                item,
-                replace_representations,
-            },
-        );
+            .map_or(Mutation::Metadata, |p| p.mutation);
+        self.pending.insert(id, PendingItem { item, mutation });
         self.mark_dirty();
         self.emit(Event::Changed);
-        if self.pending_bytes() >= self.options.max_pending_bytes {
+        if pinned.is_some() {
             self.flush();
         }
         Ok(())

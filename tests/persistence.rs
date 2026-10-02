@@ -332,8 +332,8 @@ fn retention_bounds_history_but_preserves_pinned_items_and_favorites() {
         }))
         .unwrap();
     wait(&engine, |e| matches!(e, Event::Saved(_)));
-    assert_eq!(count(&path), 3);
     assert_eq!(search(&engine, "pinned").len(), 1);
+    assert_eq!(count(&path), 3);
     shutdown(&engine);
 }
 
@@ -480,8 +480,8 @@ fn exact_alias_survives_candidate_limit_against_newer_common_prefixes() {
 }
 
 #[test]
-fn usage_overlay_flushes_under_the_same_pending_byte_pressure() {
-    let (_temp, engine, _path) = start(60_000, 100);
+fn usage_overlay_keeps_only_metadata_and_remains_delayed() {
+    let (_temp, engine, path) = start(60_000, 100);
     for index in 0..4 {
         engine
             .send(Command::Capture(snapshot(&format!(
@@ -497,6 +497,289 @@ fn usage_overlay_flushes_under_the_same_pending_byte_pressure() {
     for item in items {
         engine.send(Command::Used(item.id)).unwrap();
     }
+    assert!(search(&engine, "").iter().all(|item| item.use_count == 1));
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT sum(use_count) FROM items", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    while let Ok(event) = engine.try_recv() {
+        assert!(!matches!(event, Event::Saved(_)));
+    }
+    engine.send(Command::Flush).unwrap();
     wait(&engine, |e| matches!(e, Event::Saved(_)));
     shutdown(&engine);
+}
+
+#[test]
+fn retention_and_usage_preserve_the_used_items_original_representations() {
+    let (_temp, engine, path) = start(60_000, 100);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let clip = |ch: char, time: i64, blobs: bool| ClipboardSnapshot {
+        text: ch.to_string().repeat(80),
+        representations: if blobs {
+            vec![Representation {
+                format: "PNG".into(),
+                data: vec![1, 2, 3],
+            }]
+        } else {
+            vec![]
+        },
+        source_app: "editor".into(),
+        captured_at_ms: time,
+    };
+    engine
+        .send(Command::Capture(clip('b', now - 10_000, true)))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    let id = search(&engine, "")[0].id.clone();
+    engine
+        .send(Command::SaveSettings(Settings {
+            max_history: 1,
+            ..Settings::default()
+        }))
+        .unwrap();
+    search(&engine, "");
+    engine
+        .send(Command::Capture(clip('a', now - 1_000, false)))
+        .unwrap();
+    search(&engine, "");
+    engine.send(Command::Used(id.clone())).unwrap();
+    engine.send(Command::Flush).unwrap();
+    search(&engine, "");
+    engine.send(Command::Load { id, request_id: 22 }).unwrap();
+    match wait(&engine, |e| {
+        matches!(e, Event::Loaded { request_id: 22, .. })
+    }) {
+        Event::Loaded {
+            item: Some(item), ..
+        } => assert_eq!(
+            item.representations,
+            vec![Representation {
+                format: "PNG".into(),
+                data: vec![1, 2, 3]
+            }]
+        ),
+        other => panic!("used item disappeared: {other:?}"),
+    }
+    assert_eq!(count(&path), 1);
+    shutdown(&engine);
+}
+#[test]
+fn metadata_updates_and_duplicate_capture_do_not_rewrite_content_index_or_blobs() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("same payload")))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    let id = search(&engine, "")[0].id.clone();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE content_writes(n INTEGER); INSERT INTO content_writes VALUES(0); CREATE TRIGGER body_update AFTER UPDATE OF text ON items BEGIN UPDATE content_writes SET n=n+1; END; CREATE TRIGGER blob_delete AFTER DELETE ON representations BEGIN UPDATE content_writes SET n=n+1; END;").unwrap();
+    let original_index: String = db
+        .query_row("SELECT content FROM item_search", [], |r| r.get(0))
+        .unwrap();
+    // A sentinel makes any DELETE/INSERT index rewrite observable without depending on SQL source text.
+    db.execute(
+        "UPDATE item_search SET content=content || ' sentinelunchanged'",
+        [],
+    )
+    .unwrap();
+    engine.send(Command::Used(id.clone())).unwrap();
+    engine.send(Command::Pin { id, pinned: true }).unwrap();
+    search(&engine, "");
+    assert_eq!(
+        db.query_row("SELECT pinned FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1,
+        "Pin must commit immediately"
+    );
+    engine
+        .send(Command::Capture(snapshot("same payload")))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    search(&engine, "");
+    assert_eq!(
+        db.query_row("SELECT n FROM content_writes", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row("SELECT content FROM item_search", [], |r| r
+            .get::<_, String>(0))
+            .unwrap(),
+        original_index + " sentinelunchanged"
+    );
+    shutdown(&engine);
+}
+#[test]
+fn repeated_pressure_capture_respects_the_failed_batch_retry_gate() {
+    let (_temp, engine, path) = start(60_000, 100);
+    let make = |ch: char| ClipboardSnapshot {
+        text: ch.to_string().repeat(80),
+        representations: vec![],
+        source_app: "editor".into(),
+        captured_at_ms: 1_791_000_000_000,
+    };
+    engine.send(Command::Capture(make('a'))).unwrap();
+    search(&engine, "");
+    let db = Connection::open(path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    let started = Instant::now();
+    let mut attempts = 0;
+    for ch in ['b', 'c', 'd', 'e', 'f'] {
+        engine.send(Command::Capture(make(ch))).unwrap();
+        engine
+            .send(Command::Search(SearchQuery {
+                text: String::new(),
+                scope: Scope::All,
+                request_id: 99,
+            }))
+            .unwrap();
+        loop {
+            match wait(&engine, |_| true) {
+                Event::Results { request_id: 99, .. } => break,
+                Event::Error { message, .. } if message.contains("locked") => attempts += 1,
+                _ => (),
+            }
+        }
+    }
+    assert_eq!(
+        attempts, 0,
+        "pressure inputs retried SQL before the retry gate"
+    );
+    assert!(started.elapsed() < Duration::from_millis(300));
+    db.execute_batch("ROLLBACK").unwrap();
+    shutdown(&engine);
+}
+#[test]
+fn persisted_body_search_uses_bounded_sqlite_memory() {
+    if std::env::var_os("QP_MEMORY_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("persisted_body_search_uses_bounded_sqlite_memory")
+            .arg("--nocapture")
+            .env("QP_MEMORY_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        );
+        return;
+    }
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let db = Connection::open(path).unwrap();
+    let now = 1_791_000_000_000i64;
+    let body = "needle ".repeat(37_449);
+    let tx = db.unchecked_transaction().unwrap();
+    for i in 0..100 {
+        let s = ItemSummary {
+            id: format!("memory:{i}"),
+            kind: ItemKind::Clipboard,
+            title: format!("candidate {i}"),
+            subtitle: String::new(),
+            alias: String::new(),
+            tags: vec![],
+            pinned: false,
+            created_at_ms: now,
+            last_used_ms: now,
+            use_count: 0,
+        };
+        tx.execute(
+            "INSERT INTO items VALUES(?1,0,?2,0,?3,?3,0,?4,?5,NULL,NULL)",
+            rusqlite::params![s.id, s.title, now, serde_json::to_string(&s).unwrap(), body],
+        )
+        .unwrap();
+        tx.execute("INSERT INTO item_search(rowid,content) SELECT rowid,'n e d l ne ee ed dl le nee eed edl dle' FROM items WHERE id=?1",[s.id]).unwrap();
+    }
+    tx.commit().unwrap();
+    let (mut current, mut high) = (0i64, 0i64);
+    unsafe {
+        rusqlite::ffi::sqlite3_status64(
+            rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
+            &mut current,
+            &mut high,
+            1,
+        );
+    }
+    let baseline = current;
+    assert_eq!(search(&engine, "needle").len(), 50);
+    unsafe {
+        rusqlite::ffi::sqlite3_status64(
+            rusqlite::ffi::SQLITE_STATUS_MEMORY_USED,
+            &mut current,
+            &mut high,
+            0,
+        );
+    }
+    println!(
+        "SQLite search incremental high-water: {} bytes",
+        high - baseline
+    );
+    assert!(
+        high - baseline < 16 * 1024 * 1024,
+        "SQLite candidate sorting retained bodies: {} bytes",
+        high - baseline
+    );
+    shutdown(&engine);
+}
+
+#[test]
+fn old_fts_index_is_migrated_once_without_changing_original_representations() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine.send(Command::Capture(snapshot("myreport"))).unwrap();
+    shutdown(&engine);
+    drop(engine);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("INSERT INTO settings(key,value) VALUES('index_version','1') ON CONFLICT(key) DO UPDATE SET value='1'; UPDATE item_search SET content='myreport';").unwrap();
+    drop(db);
+    let reopened = Engine::start(EngineOptions::new(path.clone()), Arc::new(|| {})).unwrap();
+    wait(&reopened, |e| matches!(e, Event::Ready(_)));
+    assert_eq!(search(&reopened, "report").len(), 1);
+    shutdown(&reopened);
+    drop(reopened);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT value FROM settings WHERE key='index_version'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        quick_panel::search::INDEX_VERSION.to_string()
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM representations", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        2
+    );
+    db.execute(
+        "UPDATE item_search SET content=content || ' migrationpreserved'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let again = Engine::start(EngineOptions::new(path.clone()), Arc::new(|| {})).unwrap();
+    wait(&again, |e| matches!(e, Event::Ready(_)));
+    shutdown(&again);
+    let db = Connection::open(path).unwrap();
+    assert!(
+        db.query_row("SELECT content FROM item_search", [], |r| r
+            .get::<_, String>(0))
+            .unwrap()
+            .ends_with(" migrationpreserved")
+    );
 }

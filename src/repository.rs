@@ -7,22 +7,26 @@ use std::{
     time::Duration,
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mutation {
+    Content,
+    Metadata,
+}
 pub(crate) struct PendingItem {
     pub item: StoredItem,
-    pub replace_representations: bool,
+    pub mutation: Mutation,
 }
 pub(crate) struct Repository {
     connection: Connection,
     wal_path: std::path::PathBuf,
 }
-const SUMMARY_COLUMNS: &str = "i.summary";
 
 impl Repository {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        let connection = Connection::open(path).map_err(|e| e.to_string())?;
+        let mut connection = Connection::open(path).map_err(|e| e.to_string())?;
         connection
             .busy_timeout(Duration::from_millis(100))
             .map_err(|e| e.to_string())?;
@@ -37,6 +41,45 @@ impl Repository {
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE VIRTUAL TABLE IF NOT EXISTS item_search USING fts5(content);
             PRAGMA foreign_keys=ON;").map_err(|e| e.to_string())?;
+        let version: Option<String> = connection
+            .query_row(
+                "SELECT value FROM settings WHERE key='index_version'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if version.as_deref() != Some(search::INDEX_VERSION.to_string().as_str()) {
+            let tx = connection.transaction().map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM item_search", [])
+                .map_err(|e| e.to_string())?;
+            {
+                let mut statement = tx
+                    .prepare("SELECT rowid,summary,text,target,open_with FROM items")
+                    .map_err(|e| e.to_string())?;
+                let mut rows = statement.query([]).map_err(|e| e.to_string())?;
+                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                    let rowid: i64 = row.get(0).map_err(|e| e.to_string())?;
+                    let item = StoredItem {
+                        summary: serde_json::from_str(
+                            &row.get::<_, String>(1).map_err(|e| e.to_string())?,
+                        )
+                        .map_err(|e| e.to_string())?,
+                        text: row.get(2).map_err(|e| e.to_string())?,
+                        representations: vec![],
+                        target: row.get(3).map_err(|e| e.to_string())?,
+                        open_with: row.get(4).map_err(|e| e.to_string())?,
+                    };
+                    tx.execute(
+                        "INSERT INTO item_search(rowid,content) VALUES(?1,?2)",
+                        params![rowid, search::index_text(&item)],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            }
+            tx.execute("INSERT INTO settings(key,value) VALUES('index_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[search::INDEX_VERSION.to_string()]).map_err(|e|e.to_string())?;
+            tx.commit().map_err(|e| e.to_string())?;
+        }
         let mut wal_path = path.as_os_str().to_os_string();
         wal_path.push("-wal");
         Ok(Self {
@@ -54,6 +97,27 @@ impl Repository {
             .map_err(|e| e.to_string())?;
         json.map(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
             .unwrap_or_else(|| Ok(Settings::default()))
+    }
+    pub fn metadata(&self, id: &str) -> Result<Option<StoredItem>, String> {
+        let raw: Option<(String, Option<String>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT summary,target,open_with FROM items WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        raw.map(|(summary, target, open_with)| {
+            Ok(StoredItem {
+                summary: serde_json::from_str(&summary).map_err(|e| e.to_string())?,
+                text: String::new(),
+                representations: vec![],
+                target,
+                open_with,
+            })
+        })
+        .transpose()
     }
     pub fn load(&self, id: &str, blobs: bool) -> Result<Option<StoredItem>, String> {
         let raw: Option<(String, String, Option<String>, Option<String>)> = self
@@ -102,11 +166,7 @@ impl Repository {
         };
         let expression = search::query_expression(&query.text);
         let nonempty = !query.text.trim().is_empty();
-        let columns = if nonempty {
-            "i.summary,i.text,i.target,i.open_with"
-        } else {
-            SUMMARY_COLUMNS
-        };
+        let columns = "i.summary,i.target,i.open_with";
         // Relevance must influence recall before LIMIT: recent broad-prefix matches
         // must not evict an older exact alias or title from the candidate set.
         let order = "CASE WHEN ?3='' THEN 0 WHEN lower(json_extract(i.summary,'$.alias'))=lower(?3) THEN 0 WHEN lower(i.title)=lower(?3) THEN 1 WHEN substr(lower(json_extract(i.summary,'$.alias')),1,length(?3))=lower(?3) THEN 2 WHEN substr(lower(i.title),1,length(?3))=lower(?3) THEN 3 ELSE 4 END, i.pinned DESC, (i.kind<>0) DESC, i.last_used_ms DESC";
@@ -136,12 +196,16 @@ impl Repository {
                 // Inspect one candidate's text at a time, never its representations or all database payloads.
                 let item = StoredItem {
                     summary,
-                    text: row.get(1).map_err(|e| e.to_string())?,
+                    text: String::new(),
                     representations: vec![],
-                    target: row.get(2).map_err(|e| e.to_string())?,
-                    open_with: row.get(3).map_err(|e| e.to_string())?,
+                    target: row.get(1).map_err(|e| e.to_string())?,
+                    open_with: row.get(2).map_err(|e| e.to_string())?,
                 };
                 if search::matches(&item, &query.text) {
+                    summaries.push(item.summary);
+                } else if let Some(body) = self.load(&item.summary.id, false)?
+                    && search::matches(&body, &query.text)
+                {
                     summaries.push(item.summary);
                 }
             } else {
@@ -172,13 +236,17 @@ impl Repository {
             let item = &change.item;
             let s = &item.summary;
             let summary = serde_json::to_string(s).map_err(|e| e.to_string())?;
+            if change.mutation == Mutation::Metadata {
+                tx.execute("UPDATE items SET pinned=?2,last_used_ms=?3,use_count=?4,summary=?5 WHERE id=?1",params![id,s.pinned,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary]).map_err(|e|e.to_string())?;
+                continue;
+            }
             let kind = match s.kind {
                 ItemKind::Clipboard => 0,
                 ItemKind::Folder => 1,
                 ItemKind::Document => 2,
             };
             tx.execute("INSERT INTO items(id,kind,title,pinned,created_at_ms,last_used_ms,use_count,summary,text,target,open_with) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,pinned=excluded.pinned,created_at_ms=excluded.created_at_ms,last_used_ms=excluded.last_used_ms,use_count=excluded.use_count,summary=excluded.summary,text=excluded.text,target=excluded.target,open_with=excluded.open_with", params![id,kind,s.title,s.pinned,s.created_at_ms,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary,item.text,item.target,item.open_with]).map_err(|e| e.to_string())?;
-            if change.replace_representations {
+            if change.mutation == Mutation::Content {
                 tx.execute("DELETE FROM representations WHERE item_id=?1", [id])
                     .map_err(|e| e.to_string())?;
                 for repr in &item.representations {
