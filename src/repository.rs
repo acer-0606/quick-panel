@@ -83,7 +83,7 @@ impl Repository {
             .map_err(|e| e.to_string())?;
         if version.as_deref() != Some(search::INDEX_VERSION.to_string().as_str()) {
             let tx = connection.transaction().map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM item_search", [])
+            tx.execute_batch("DROP TABLE item_search; CREATE VIRTUAL TABLE item_search USING fts5(content,heading,phonetic)")
                 .map_err(|e| e.to_string())?;
             {
                 let mut statement = tx
@@ -103,8 +103,8 @@ impl Repository {
                         open_with: row.get(4).map_err(|e| e.to_string())?,
                     };
                     tx.execute(
-                        "INSERT INTO item_search(rowid,content) VALUES(?1,?2)",
-                        params![rowid, search::index_text(&item)],
+                        "INSERT INTO item_search(rowid,content,heading,phonetic) VALUES(?1,?2,?3,?4)",
+                        params![rowid, search::index_text(&item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true)],
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -274,6 +274,21 @@ impl Repository {
         }
         Ok(matches)
     }
+    fn candidate_metadata(&self, rowid: i64) -> Result<StoredItem, String> {
+        let (summary, target, open_with): (String, Option<String>, Option<String>) = self
+            .connection
+            .prepare_cached("SELECT summary,target,open_with FROM items WHERE rowid=?1")
+            .map_err(|e| e.to_string())?
+            .query_row([rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .map_err(|e| e.to_string())?;
+        Ok(StoredItem {
+            summary: serde_json::from_str(&summary).map_err(|e| e.to_string())?,
+            text: String::new(),
+            representations: vec![],
+            target,
+            open_with,
+        })
+    }
     pub fn summaries(&self, query: &SearchQuery) -> Result<Vec<ItemSummary>, String> {
         let expression = search::query_expression(&query.text);
         let nonempty = !query.text.trim().is_empty();
@@ -285,18 +300,57 @@ impl Repository {
         };
         let mut ids = HashSet::new();
         let mut fts_ids = HashSet::new();
+        let mut confirmed = HashMap::new();
         if let Some(expression) = expression.as_ref() {
-            // FTS supplies rowid order itself. Applying metadata relevance before LIMIT
-            // would sort every hit; retrieve a bounded recent pool before table lookup.
-            let fts_sql = if query.scope == Scope::All {
-                "SELECT rowid FROM item_search WHERE item_search MATCH ?1 ORDER BY rowid DESC LIMIT 512".to_string()
-            } else {
-                format!(
-                    "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND {scope} ORDER BY item_search.rowid DESC LIMIT 512"
-                )
-            };
-            self.candidate_ids(&fts_sql, &[expression], &mut fts_ids)?;
-            ids.extend(fts_ids.iter().copied());
+            // Keyset paging counts literal matches, never raw gram collisions.
+            // Heading streams have independent quotas so newer body matches cannot
+            // crowd old literal/phonetic title matches out of relevance ranking.
+            for (column, minimum_rank) in
+                [("heading", 600_000), ("phonetic", 400_000), ("content", 0)]
+            {
+                let qualified = format!("{column}: ({expression})");
+                let mut cursor = i64::MAX;
+                let mut accepted = 0;
+                loop {
+                    let sql = format!(
+                        "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND item_search.rowid<?2 AND {scope} ORDER BY item_search.rowid DESC LIMIT 128"
+                    );
+                    let mut page = HashSet::new();
+                    self.candidate_ids(&sql, &[&qualified, &cursor], &mut page)?;
+                    if page.is_empty() {
+                        break;
+                    }
+                    cursor = *page.iter().min().unwrap();
+                    let exhausted = page.len() < 128;
+                    for rowid in page {
+                        let mut item = self.candidate_metadata(rowid)?;
+                        if minimum_rank > 0
+                            && search::rank(&item.summary, &query.text) < minimum_rank
+                        {
+                            continue;
+                        }
+                        if !search::matches(&item, &query.text) {
+                            if minimum_rank > 0 {
+                                continue;
+                            }
+                            item.text = self
+                                .connection
+                                .prepare_cached("SELECT text FROM items WHERE rowid=?1")
+                                .map_err(|e| e.to_string())?
+                                .query_row([rowid], |r| r.get(0))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        if search::matches(&item, &query.text) {
+                            accepted += 1;
+                            fts_ids.insert(rowid);
+                            confirmed.insert(rowid, item.summary);
+                        }
+                    }
+                    if exhausted || accepted >= 50 {
+                        break;
+                    }
+                }
+            }
         } else {
             self.candidate_ids(
                 &format!(
@@ -325,9 +379,12 @@ impl Repository {
         for predicate in ["pinned=1", "kind<>0", "use_count>0", "1"] {
             self.candidate_ids(&format!("SELECT rowid FROM items WHERE {scope} AND {predicate} ORDER BY last_used_ms DESC LIMIT 128"),&[],&mut ids)?;
         }
-        let mut summaries = Vec::new();
+        let mut summaries: Vec<_> = confirmed.values().cloned().collect();
         let mut body_candidates = Vec::new();
         for rowid in ids {
+            if confirmed.contains_key(&rowid) {
+                continue;
+            }
             let raw: Option<(String, Option<String>, Option<String>)> = self
                 .connection
                 .prepare_cached("SELECT summary,target,open_with FROM items WHERE rowid=?1")
@@ -443,8 +500,8 @@ impl Repository {
             )
             .map_err(|e| e.to_string())?;
             tx.execute(
-                "INSERT INTO item_search(rowid,content) SELECT rowid,?2 FROM items WHERE id=?1",
-                params![id, search::index_text(item)],
+                "INSERT INTO item_search(rowid,content,heading,phonetic) SELECT rowid,?2,?3,?4 FROM items WHERE id=?1",
+                params![id, search::index_text(item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true)],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -489,7 +546,27 @@ impl Repository {
                 self.wal_progress
                     .checkpointed
                     .store(completed as usize, Ordering::Relaxed);
-                busy == 0 && completed == frames
+                if busy != 0 || completed != frames {
+                    return false;
+                }
+                // PASSIVE makes frames reusable, but the physical file can remain
+                // oversized after one large FTS merge. Reclaim it at the emergency
+                // threshold only. SQLite's bounded busy timeout protects readers;
+                // failure leaves progress intact and the actor schedules a retry.
+                if self.wal_bytes() >= 64 * 1024 * 1024 {
+                    let truncated =
+                        self.connection
+                            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                                row.get::<_, i64>(0)
+                            })
+                            == Ok(0);
+                    if !truncated {
+                        return false;
+                    }
+                    self.wal_progress.frames.store(0, Ordering::Relaxed);
+                    self.wal_progress.checkpointed.store(0, Ordering::Relaxed);
+                }
+                true
             }
             _ => false,
         }

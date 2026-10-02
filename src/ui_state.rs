@@ -59,6 +59,9 @@ impl UiState {
         self.ids = ids;
     }
     pub fn select(&mut self, index: usize) {
+        if self.selected.as_ref() != self.ids.get(index) {
+            self.target_changed();
+        }
         self.selected = self.ids.get(index).cloned();
     }
     pub fn selected_id(&self) -> Option<&str> {
@@ -86,6 +89,18 @@ impl UiState {
         }
         self.pending_action = Some((request_id, self.interaction_epoch));
         true
+    }
+    pub fn action_current(&self, request_id: u64) -> bool {
+        self.visible
+            && self.lifecycle == Lifecycle::Running
+            && !self.modal_open
+            && self.pending_action == Some((request_id, self.interaction_epoch))
+    }
+    pub fn finish_paste(&mut self, request_id: u64, keys_down: bool) -> bool {
+        if keys_down {
+            return false;
+        }
+        self.finish_action(request_id)
     }
     pub fn finish_action(&mut self, request_id: u64) -> bool {
         if !self.visible || self.lifecycle != Lifecycle::Running || self.modal_open {
@@ -123,6 +138,7 @@ impl UiState {
         self.visible = false;
     }
     pub fn next_request(&mut self) -> u64 {
+        self.target_changed();
         self.request_id = self.request_id.wrapping_add(1);
         self.request_id
     }
@@ -156,8 +172,12 @@ impl UiState {
         self.accepted_captures = self.accepted_captures.saturating_sub(1);
         self.advance_exit()
     }
-    pub fn exit_failed(&mut self) {
+    pub fn exit_failed(&mut self) -> bool {
+        if self.lifecycle != Lifecycle::Saving {
+            return false;
+        }
         self.lifecycle = Lifecycle::SaveFailed;
+        true
     }
     pub fn retry_exit(&mut self) {
         self.lifecycle = Lifecycle::Saving;

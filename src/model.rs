@@ -163,6 +163,13 @@ pub struct EngineOptions {
 }
 
 impl EngineOptions {
+    /// Start before the durability window closes, reserving five seconds at
+    /// the default minute, and one twelfth of shorter test/custom windows.
+    pub fn save_start_delay_ms(&self) -> u64 {
+        self.save_interval_ms
+            .saturating_sub(5_000.min(self.save_interval_ms / 12))
+    }
+
     pub fn new(database_path: PathBuf) -> Self {
         Self {
             database_path,

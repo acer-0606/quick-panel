@@ -168,3 +168,57 @@ fn repeated_launch_modal_or_exiting_panel_never_updates_target() {
     ui.begin_exit();
     assert!(!ui.instance_show_updates_target());
 }
+
+#[test]
+fn final_review_exit_errors_are_single_and_stale_errors_are_ignored() {
+    let mut ui = UiState::default();
+    assert!(!ui.exit_failed());
+    ui.begin_exit();
+    assert!(ui.exit_failed());
+    assert!(!ui.exit_failed());
+    ui.retry_exit();
+    assert!(ui.exit_failed());
+    ui.cancel_exit();
+    assert!(!ui.exit_failed());
+    assert_eq!(ui.lifecycle, Lifecycle::Running);
+}
+
+#[test]
+fn final_review_paste_waits_for_release_and_runs_once() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(ui.begin_action(7));
+    assert!(!ui.finish_paste(7, true));
+    assert!(ui.visible);
+    assert!(ui.action_current(7));
+    assert!(!ui.finish_paste(7, true));
+    assert!(ui.finish_paste(7, false));
+    assert!(!ui.finish_paste(7, false));
+    assert!(ui.begin_action(8));
+    assert!(ui.finish_paste(8, false)); // Loaded after release
+}
+
+#[test]
+fn final_review_deferred_paste_cancels_on_every_interaction_boundary() {
+    for boundary in 0..5 {
+        let mut ui = UiState::default();
+        ui.visible = true;
+        ui.replace_ids(vec!["a".into(), "b".into()]);
+        ui.begin_action(9);
+        assert!(!ui.finish_paste(9, true));
+        match boundary {
+            0 => ui.hide(),
+            1 => ui.target_changed(),
+            2 => ui.select(1),
+            3 => {
+                ui.next_request();
+            }
+            _ => {
+                ui.begin_exit();
+            }
+        }
+        ui.visible = true;
+        ui.cancel_exit();
+        assert!(!ui.finish_paste(9, false));
+    }
+}

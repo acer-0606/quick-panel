@@ -3,7 +3,7 @@ use pinyin::ToPinyin;
 use std::collections::BTreeSet;
 
 /// Persisted FTS contents must be rebuilt when the token representation changes.
-pub const INDEX_VERSION: u32 = 2;
+pub const INDEX_VERSION: u32 = 3;
 
 fn normalize(text: &str) -> String {
     text.chars()
@@ -195,4 +195,25 @@ pub fn rank(summary: &ItemSummary, query: &str) -> i64 {
         }
     };
     relevance + i64::from(summary.pinned) * 10_000 + summary.use_count.min(1_000) as i64
+}
+
+/// Dedicated heading postings keep old title matches ahead of body-only hits.
+pub fn index_heading(summary: &ItemSummary, phonetic_only: bool) -> String {
+    let text = if phonetic_only {
+        let (full, initials) = phonetic(&summary.title);
+        format!("{full} {initials}")
+    } else {
+        summary.title.clone()
+    };
+    let mut indexed = BTreeSet::new();
+    for word in tokens(&text) {
+        if is_cjk_token(&word) {
+            indexed.insert(word);
+        } else {
+            for length in 1..=3 {
+                indexed.extend(grams(&word, length));
+            }
+        }
+    }
+    indexed.into_iter().collect::<Vec<_>>().join(" ")
 }

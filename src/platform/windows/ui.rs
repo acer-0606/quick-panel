@@ -249,6 +249,7 @@ struct App {
     target: HWND,
     load_id: u64,
     pending_action: Option<(u64, Action)>,
+    pending_paste: Option<(u64, StoredItem, Action, HWND)>,
     preview_id: u64,
     preview_open: bool,
     image: Option<Arc<Image>>,
@@ -405,6 +406,7 @@ pub fn run() -> Result<(), String> {
             target: HWND::default(),
             load_id: 0,
             pending_action: None,
+            pending_paste: None,
             preview_id: 0,
             preview_open: false,
             image: None,
@@ -576,6 +578,7 @@ impl App {
     fn cancel_actions(&mut self) {
         self.load_id = self.load_id.wrapping_add(1);
         self.pending_action = None;
+        self.pending_paste = None;
         self.state.target_changed();
     }
     unsafe fn clear_preview(&mut self) {
@@ -917,6 +920,7 @@ impl App {
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
     unsafe fn search(&mut self) {
+        self.cancel_actions();
         let current = match self.scope {
             Scope::All => 0,
             Scope::Clipboard => 1,
@@ -1031,10 +1035,18 @@ impl App {
                             .is_some_and(|(id, _)| *id == request_id)
                         {
                             if GetForegroundWindow() == self.hwnd
-                                && self.state.finish_action(request_id)
+                                && self.state.action_current(request_id)
                             {
                                 if let Some((_, action)) = self.pending_action.take() {
-                                    self.perform(item, action);
+                                    if matches!(action, Action::Open(_))
+                                        && item.summary.kind == ItemKind::Clipboard
+                                    {
+                                        self.pending_paste =
+                                            Some((request_id, item, action, self.target));
+                                        self.release_paste();
+                                    } else if self.state.finish_action(request_id) {
+                                        self.perform(item, action);
+                                    }
                                 }
                             } else {
                                 self.cancel_actions();
@@ -1060,15 +1072,14 @@ impl App {
                     }
                 }
                 Event::Error { message, exiting } => {
-                    if exiting {
-                        self.state.exit_failed();
+                    if exiting && self.state.exit_failed() {
                         self.cancel_actions();
                         self.clear_preview();
                         self.effects.push_back(UiEffect::ExitError {
                             owner: self.hwnd,
                             message,
                         });
-                    } else {
+                    } else if !exiting {
                         self.status(&message);
                     }
                 }
@@ -1079,6 +1090,7 @@ impl App {
         }
     }
     unsafe fn selection(&mut self) {
+        self.cancel_actions();
         self.clear_preview();
         let i = SendMessageW(self.list, LB_GETCURSEL, None, None).0;
         if i >= 0 {
@@ -1116,6 +1128,7 @@ impl App {
                 self.preview_queue.cancel(self.preview_id);
                 self.sync_render();
             } else {
+                self.pending_paste = None;
                 if !self.state.begin_action(self.load_id) {
                     return;
                 }
@@ -1125,6 +1138,28 @@ impl App {
                 id,
                 request_id: self.load_id,
             });
+        }
+    }
+    unsafe fn release_paste(&mut self) {
+        let Some((request_id, _, _, target)) = self.pending_paste.as_ref() else {
+            return;
+        };
+        if self.target != *target
+            || GetForegroundWindow() != self.hwnd
+            || !self.state.action_current(*request_id)
+        {
+            self.cancel_actions();
+            return;
+        }
+        // Do not alter the user's physical key state. Enter and every modifier
+        // must actually be released, including when Paste came from a menu.
+        let keys_down = [VK_RETURN, VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(|key| GetAsyncKeyState(key.0 as i32) < 0);
+        if self.state.finish_paste(*request_id, keys_down)
+            && let Some((_, item, action, _)) = self.pending_paste.take()
+        {
+            self.perform(item, action);
         }
     }
     unsafe fn perform(&mut self, item: StoredItem, action: Action) {
@@ -1984,6 +2019,12 @@ impl Host {
     /// Keyboard handling precedes IsDialogMessage and applies to Edit, List and Buttons.
     /// During IME composition the original key reaches the native Edit unchanged.
     unsafe fn route_key(&self, msg: &MSG) -> bool {
+        if matches!(msg.message, WM_KEYUP | WM_SYSKEYUP) {
+            if let Ok(mut app) = self.app.try_borrow_mut() {
+                app.release_paste();
+            }
+            return false;
+        }
         if msg.message != WM_KEYDOWN || self.composing.get() {
             return false;
         }
@@ -2104,6 +2145,11 @@ impl Host {
                 };
                 let effect = app.effects.pop_front();
                 if let Some(effect) = &effect {
+                    if matches!(effect, UiEffect::ExitError { .. })
+                        && app.state.lifecycle != Lifecycle::SaveFailed
+                    {
+                        continue;
+                    }
                     if app.state.lifecycle != Lifecycle::Running
                         && !matches!(
                             effect,

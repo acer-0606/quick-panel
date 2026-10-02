@@ -1139,3 +1139,193 @@ fn auxiliary_candidates_keep_body_only_matches_for_old_pin_usage_and_recapture()
     assert!(items.iter().any(|s| s.id == recent));
     shutdown(&engine);
 }
+
+#[test]
+fn final_review_gram_collision_pages_preserve_old_title_body_and_infix() {
+    let (_temp, engine, _) = start(60_000, 16 * 1024 * 1024);
+    for text in [
+        "archive qwerty item",
+        "Archived unique\nqwerty",
+        "archive zzqwertyzz item",
+    ] {
+        engine.send(Command::Capture(snapshot(text))).unwrap();
+    }
+    engine.send(Command::Flush).unwrap();
+    assert_eq!(search(&engine, "qwerty").len(), 3);
+    for index in 0..1100 {
+        let mut clip = snapshot(&format!("new number {index}\nqwe wer ert rty"));
+        clip.captured_at_ms += index + 1;
+        engine.send(Command::Capture(clip)).unwrap();
+    }
+    assert_eq!(search(&engine, "qwerty").len(), 3);
+    engine.send(Command::Flush).unwrap();
+    assert_eq!(search(&engine, "qwerty").len(), 3);
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_old_interior_title_outranks_recent_body_hits() {
+    let (_temp, engine, _) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("archive zzqwertyzz item")))
+        .unwrap();
+    engine
+        .send(Command::Capture(snapshot("我的周报模板")))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    for index in 0..600 {
+        let mut clip = snapshot(&format!("new number {index}\nqwerty baomoban"));
+        clip.captured_at_ms += index + 1;
+        engine.send(Command::Capture(clip)).unwrap();
+    }
+    engine.send(Command::Flush).unwrap();
+    assert_eq!(
+        search(&engine, "qwerty")[0].title,
+        "archive zzqwertyzz item"
+    );
+    assert_eq!(search(&engine, "baomoban")[0].title, "我的周报模板");
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_favorite_delete_is_durable_but_history_is_batched() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    for kind in [ItemKind::Document, ItemKind::Folder] {
+        engine
+            .send(Command::SaveFavorite(FavoriteInput {
+                id: Some("favorite:durable".into()),
+                kind,
+                title: "favorite".into(),
+                target: "C:/demo".into(),
+                alias: String::new(),
+                tags: vec![],
+                open_with: None,
+            }))
+            .unwrap();
+        search(&engine, "");
+        assert_eq!(count(&path), 1);
+        engine
+            .send(Command::Delete("favorite:durable".into()))
+            .unwrap();
+        search(&engine, "");
+        assert_eq!(count(&path), 0);
+    }
+    engine.send(Command::Capture(snapshot("history"))).unwrap();
+    engine.send(Command::Flush).unwrap();
+    let id = search(&engine, "history")[0].id.clone();
+    engine.send(Command::Delete(id)).unwrap();
+    search(&engine, "");
+    assert_eq!(count(&path), 1);
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_exit_failure_waits_for_explicit_retry_or_cancel() {
+    let (_temp, engine, path) = start(200, 16 * 1024 * 1024);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    engine
+        .send(Command::Capture(snapshot("unsaved exit")))
+        .unwrap();
+    engine.send(Command::Shutdown).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { exiting: true, .. }));
+    thread::sleep(Duration::from_millis(1400));
+    assert!(
+        !engine
+            .try_recv()
+            .into_iter()
+            .any(|e| matches!(e, Event::Error { exiting: true, .. })),
+        "must not retry behind a modal prompt"
+    );
+    engine.send(Command::Shutdown).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { exiting: true, .. }));
+    db.execute_batch("ROLLBACK").unwrap();
+    thread::sleep(Duration::from_millis(2200));
+    assert_eq!(
+        count(&path),
+        0,
+        "unlocking must not save or exit until a user decision"
+    );
+    engine.send(Command::CancelShutdown).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(count(&path), 1);
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_save_window_reserves_commit_time() {
+    let mut options = EngineOptions::new("unused.db".into());
+    assert_eq!(options.save_start_delay_ms(), 55_000);
+    options.save_interval_ms = 1_200;
+    assert_eq!(options.save_start_delay_ms(), 1_100);
+    options.save_interval_ms = 12;
+    assert_eq!(options.save_start_delay_ms(), 11);
+    let (_temp, engine, path) = start(1_200, 16 * 1024 * 1024);
+    let accepted = Instant::now();
+    engine.send(Command::Capture(snapshot("window"))).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert!(accepted.elapsed() < Duration::from_millis(1_200));
+    assert_eq!(count(&path), 1);
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_pinned_history_delete_is_immediately_durable() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("pinned clip")))
+        .unwrap();
+    let id = search(&engine, "pinned")[0].id.clone();
+    engine
+        .send(Command::Pin {
+            id: id.clone(),
+            pinned: true,
+        })
+        .unwrap();
+    search(&engine, "");
+    assert_eq!(count(&path), 1);
+    engine.send(Command::Delete(id)).unwrap();
+    search(&engine, "");
+    assert_eq!(count(&path), 0);
+    engine
+        .send(Command::Delete("already missing".into()))
+        .unwrap();
+    search(&engine, "");
+    shutdown(&engine);
+}
+
+#[test]
+fn final_review_favorite_edit_updates_heading_and_phonetic_postings() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    for (title, alias) in [("archive qwerty", "oldalias"), ("我的周报模板", "newalias")] {
+        engine
+            .send(Command::SaveFavorite(FavoriteInput {
+                id: Some("favorite:edited".into()),
+                kind: ItemKind::Document,
+                title: title.into(),
+                target: "C:/demo.txt".into(),
+                alias: alias.into(),
+                tags: vec![],
+                open_with: None,
+            }))
+            .unwrap();
+        assert_eq!(search(&engine, alias).len(), 1);
+        assert_eq!(count(&path), 1);
+    }
+    assert!(search(&engine, "qwerty").is_empty());
+    assert!(search(&engine, "oldalias").is_empty());
+    assert_eq!(search(&engine, "zhoubaomoban").len(), 1);
+    assert_eq!(search(&engine, "周报").len(), 1);
+    let db = Connection::open(path).unwrap();
+    for column in ["heading", "phonetic"] {
+        let count: i64 = db
+            .query_row(
+                &format!("SELECT COUNT(*) FROM item_search WHERE {column}<>''"),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    shutdown(&engine);
+}

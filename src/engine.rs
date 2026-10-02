@@ -257,9 +257,9 @@ impl Actor {
         !self.pending.is_empty() || !self.deleted.is_empty() || self.settings_dirty
     }
     fn mark_dirty(&mut self) {
-        if self.deadline.is_none() {
+        if !self.exiting && self.deadline.is_none() {
             self.deadline =
-                Some(Instant::now() + Duration::from_millis(self.options.save_interval_ms));
+                Some(Instant::now() + Duration::from_millis(self.options.save_start_delay_ms()));
         }
     }
     fn pending_bytes(&self) -> usize {
@@ -287,6 +287,9 @@ impl Actor {
         }
     }
     fn pressure_flush(&mut self) -> bool {
+        if self.exiting {
+            return false;
+        }
         if self
             .retry_not_before
             .is_some_and(|when| Instant::now() < when)
@@ -347,8 +350,15 @@ impl Actor {
                 true
             }
             Err(message) => {
-                self.deadline = Some(Instant::now() + Duration::from_millis(self.retry_delay_ms));
-                self.retry_not_before = self.deadline;
+                self.retry_not_before =
+                    Some(Instant::now() + Duration::from_millis(self.retry_delay_ms));
+                // A failed exit waits for the explicit modal decision. Background
+                // retry must not save/exit or accumulate prompts behind that dialog.
+                self.deadline = if self.exiting {
+                    None
+                } else {
+                    self.retry_not_before
+                };
                 self.retry_delay_ms = self.retry_delay_ms.saturating_mul(2).min(60_000);
                 self.error(message);
                 false
@@ -647,10 +657,24 @@ impl Actor {
                     Ok(())
                 }
                 Command::Delete(id) => {
+                    let item = self.lookup(&id, false);
+                    let immediate = match item {
+                        Ok(Some(item)) => {
+                            item.summary.kind != ItemKind::Clipboard || item.summary.pinned
+                        }
+                        Ok(None) => continue,
+                        Err(message) => {
+                            self.error(message);
+                            continue;
+                        }
+                    };
                     self.pending.remove(&id);
                     self.deleted.insert(id);
                     self.mark_dirty();
                     self.emit(Event::Changed);
+                    if immediate {
+                        self.flush();
+                    }
                     Ok(())
                 }
                 Command::Pin { id, pinned } => self.modify(id, Some(pinned)),
@@ -661,6 +685,9 @@ impl Actor {
                 }
                 Command::CancelShutdown => {
                     self.exiting = false;
+                    if self.dirty() {
+                        self.deadline = Some(self.retry_not_before.unwrap_or_else(Instant::now));
+                    }
                     Ok(())
                 }
                 Command::Shutdown => {
