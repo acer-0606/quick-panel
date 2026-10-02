@@ -243,9 +243,30 @@ fn ansi_hdrop_text(handle: HANDLE, byte_limit: usize) -> Result<String, String> 
 }
 
 pub fn capture(owner: HWND, max_bytes: usize) -> Result<Option<ClipboardSnapshot>, String> {
+    capture_locked(owner, max_bytes, None)
+}
+
+/// Capture a notification's generation, checking its sequence only after the
+/// clipboard is locked. Normal WM_RENDERFORMAT may advance it during retrieval.
+pub fn capture_for_sequence(
+    owner: HWND,
+    max_bytes: usize,
+    expected: u32,
+) -> Result<Option<ClipboardSnapshot>, String> {
+    capture_locked(owner, max_bytes, Some(expected))
+}
+
+fn capture_locked(
+    owner: HWND,
+    max_bytes: usize,
+    expected: Option<u32>,
+) -> Result<Option<ClipboardSnapshot>, String> {
     let limit = max_bytes.min(MAX_ITEM_BYTES);
     let _clipboard = ClipboardGuard::open(owner)?;
-    let starting_sequence = sequence_number();
+    if expected.is_some_and(|sequence| sequence != sequence_number()) {
+        return Ok(None);
+    }
+    let starting_owner = unsafe { GetClipboardOwner() }.ok();
     if sensitive_content()? {
         return Ok(None);
     }
@@ -323,8 +344,11 @@ pub fn capture(owner: HWND, max_bytes: usize) -> Result<Option<ClipboardSnapshot
     {
         return Err("剪贴板内容及检索文本超过8 MiB或配置上限，未记录".into());
     }
-    if sequence_number() != starting_sequence {
-        return Err("读取期间剪贴板内容发生变化，未记录本次数据".into());
+    // OpenClipboard excludes other writers for the complete snapshot. A delayed
+    // provider is permitted to SetClipboardData in WM_RENDERFORMAT without
+    // reopening it; that legitimate rendering can advance the sequence number.
+    if unsafe { GetClipboardOwner() }.ok() != starting_owner {
+        return Err("读取期间剪贴板所有者发生变化，未记录本次数据".into());
     }
     let captured_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

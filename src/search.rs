@@ -2,6 +2,9 @@ use crate::model::{ItemSummary, StoredItem};
 use pinyin::ToPinyin;
 use std::collections::BTreeSet;
 
+/// Persisted FTS contents must be rebuilt when the token representation changes.
+pub const INDEX_VERSION: u32 = 2;
+
 fn normalize(text: &str) -> String {
     text.chars()
         .flat_map(char::to_lowercase)
@@ -72,13 +75,33 @@ fn phonetic(text: &str) -> (String, String) {
 }
 
 fn summary_fields(summary: &ItemSummary) -> Vec<&str> {
-    let mut fields = vec![summary.title.as_str(), summary.subtitle.as_str(), summary.alias.as_str()];
+    let mut fields = vec![
+        summary.title.as_str(),
+        summary.subtitle.as_str(),
+        summary.alias.as_str(),
+    ];
     fields.extend(summary.tags.iter().map(String::as_str));
     fields
 }
 
-/// Generate FTS tokens, including short Chinese substrings and title phonetics.
-/// A set bounds redundant index growth when long clips repeat the same words.
+fn grams(word: &str, length: usize) -> impl Iterator<Item = String> + '_ {
+    let mut window = std::collections::VecDeque::with_capacity(length);
+    word.chars().filter_map(move |character| {
+        window.push_back(character);
+        if window.len() > length {
+            window.pop_front();
+        }
+        (window.len() == length).then(|| window.iter().collect())
+    })
+}
+
+fn is_cjk_token(word: &str) -> bool {
+    word.chars().all(is_cjk)
+}
+
+/// Generate FTS tokens for Chinese substrings and Latin/phonetic interior matches.
+/// Unigrams and bigrams retain one/two-character recall; trigrams cover longer
+/// queries without storing every suffix. Sets bound repeated-clip index growth.
 pub fn index_text(item: &StoredItem) -> String {
     let mut indexed = tokens(&item.text);
     for field in summary_fields(&item.summary)
@@ -90,16 +113,38 @@ pub fn index_text(item: &StoredItem) -> String {
         indexed.extend(tokens(&full));
         indexed.extend(tokens(&initials));
     }
+    let words = std::mem::take(&mut indexed);
+    for word in words {
+        if is_cjk_token(&word) {
+            indexed.insert(word);
+        } else {
+            for length in 1..=3 {
+                indexed.extend(grams(&word, length));
+            }
+        }
+    }
     indexed.into_iter().collect::<Vec<_>>().join(" ")
 }
 
 /// Quote literal tokens rather than interpreting user input as FTS syntax.
 pub fn query_expression(query: &str) -> Option<String> {
-    let parts = tokens(query)
+    let mut candidate_tokens = BTreeSet::new();
+    for token in tokens(query) {
+        if is_cjk_token(&token) {
+            candidate_tokens.insert(token);
+        } else {
+            candidate_tokens.extend(grams(&token, token.chars().count().min(3)));
+        }
+    }
+    let parts = candidate_tokens
         .into_iter()
-        .map(|token| format!("\"{}\"*", token.replace('"', "\"\"")))
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
         .collect::<Vec<_>>();
-    if parts.is_empty() { None } else { Some(parts.join(" AND ")) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" AND "))
+    }
 }
 
 pub fn matches(item: &StoredItem, query: &str) -> bool {
@@ -149,6 +194,5 @@ pub fn rank(summary: &ItemSummary, query: &str) -> i64 {
             100_000
         }
     };
-    relevance + i64::from(summary.pinned) * 10_000
-        + summary.use_count.min(1_000) as i64
+    relevance + i64::from(summary.pinned) * 10_000 + summary.use_count.min(1_000) as i64
 }
