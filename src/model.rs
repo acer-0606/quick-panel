@@ -2,13 +2,28 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ItemKind { Clipboard, Folder, Document }
+pub enum ItemKind {
+    Clipboard,
+    Folder,
+    Document,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Scope { #[default] All, Clipboard, Folder, Document }
+pub enum Scope {
+    #[default]
+    All,
+    Clipboard,
+    Folder,
+    Document,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Theme { #[default] System, Light, Dark }
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Representation {
@@ -77,16 +92,24 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::System,
-            hotkey_modifiers: 3, hotkey_key: 32,
-            clipboard_hotkey_modifiers: 3, clipboard_hotkey_key: 86,
-            capture_paused: false, excluded_apps: Vec::new(),
-            retention_days: 30, max_history: 10_000,
+            hotkey_modifiers: 3,
+            hotkey_key: 32,
+            clipboard_hotkey_modifiers: 3,
+            clipboard_hotkey_key: 86,
+            capture_paused: false,
+            excluded_apps: Vec::new(),
+            retention_days: 30,
+            max_history: 10_000,
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct SearchQuery { pub text: String, pub scope: Scope, pub request_id: u64 }
+pub struct SearchQuery {
+    pub text: String,
+    pub scope: Scope,
+    pub request_id: u64,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveStats {
@@ -114,11 +137,20 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum Event {
     Ready(Settings),
-    Results { request_id: u64, items: Vec<ItemSummary> },
-    Loaded { request_id: u64, item: Option<StoredItem> },
+    Results {
+        request_id: u64,
+        items: Vec<ItemSummary>,
+    },
+    Loaded {
+        request_id: u64,
+        item: Option<StoredItem>,
+    },
     Changed,
     Saved(SaveStats),
-    Error { message: String, exiting: bool },
+    Error {
+        message: String,
+        exiting: bool,
+    },
     ExitReady,
 }
 
@@ -132,8 +164,11 @@ pub struct EngineOptions {
 
 impl EngineOptions {
     pub fn new(database_path: PathBuf) -> Self {
-        Self { database_path, save_interval_ms: 60_000,
+        Self {
+            database_path,
+            save_interval_ms: 60_000,
             max_pending_bytes: 16 * 1024 * 1024,
-            max_item_bytes: 8 * 1024 * 1024 }
+            max_item_bytes: 8 * 1024 * 1024,
+        }
     }
 }
