@@ -34,6 +34,7 @@ const ENGINE_WAKE: u32 = WM_APP + 1;
 const WORK_WAKE: u32 = WM_APP + 2;
 const TRAY: u32 = WM_APP + 3;
 const DEFERRED_WAKE: u32 = WM_APP + 4;
+const SHOW_EXISTING: u32 = WM_APP + 5;
 const SEARCH: usize = 100;
 const LIST: usize = 101;
 const ADD: usize = 102;
@@ -156,6 +157,59 @@ struct Host {
     deferred: RefCell<VecDeque<Deferred>>,
     wake_posted: Cell<bool>,
     effects_running: Cell<bool>,
+}
+/// Holding the named kernel handle, rather than mutex ownership, establishes
+/// instance lifetime. A duplicate closes its extra handle before waiting/notifying.
+struct SingleInstance(windows::Win32::Foundation::HANDLE);
+impl Drop for SingleInstance {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+impl SingleInstance {
+    unsafe fn acquire_or_notify() -> Result<Option<Self>, String> {
+        SetLastError(WIN32_ERROR(0));
+        let handle = windows::Win32::System::Threading::CreateMutexW(
+            None,
+            false,
+            w!("Local\\QuickPanel.SingleInstance.6CD5F4E3"),
+        )
+        .map_err(|error| format!("无法建立单实例保护：{error}"))?;
+        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
+        let instance = Self(handle);
+        if !already_running {
+            return Ok(Some(instance));
+        }
+        drop(instance);
+        // The first process may still be between acquiring its guard and creating
+        // its window. Never open its database or become another writer in this case.
+        for _ in 0..30 {
+            if let Ok(hwnd) = FindWindowW(w!("QuickPanelWindow"), PCWSTR::null()) {
+                if let Err(error) = PostMessageW(Some(hwnd), SHOW_EXISTING, WPARAM(0), LPARAM(0)) {
+                    let text = wide(&format!(
+                        "快捷面板已经运行，但无法唤起现有窗口。请从托盘打开。\n{error}"
+                    ));
+                    MessageBoxW(
+                        None,
+                        PCWSTR(text.as_ptr()),
+                        w!("快捷面板已经运行"),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                }
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        MessageBoxW(
+            None,
+            w!("已有快捷面板正在启动或退出，请稍后重试。"),
+            w!("快捷面板已经运行"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+        Ok(None)
+    }
 }
 struct WindowGuard(HWND);
 impl Drop for WindowGuard {
@@ -302,6 +356,9 @@ unsafe fn decode(item: &StoredItem, id: u64, generation: &AtomicU64) -> Result<I
 }
 pub fn run() -> Result<(), String> {
     unsafe {
+        let Some(_instance_guard) = SingleInstance::acquire_or_notify()? else {
+            return Ok(());
+        };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(None, COINIT_APARTMENTTHREADED)
             .ok()
@@ -797,14 +854,18 @@ impl App {
         Ok(())
     }
     unsafe fn show(&mut self, scope: Option<Scope>) {
-        if self.state.lifecycle != Lifecycle::Running || self.state.modal_open {
+        self.show_panel(scope, true);
+    }
+    unsafe fn show_panel(&mut self, scope: Option<Scope>, update_target: bool) {
+        if !self.state.can_show_panel() {
             return;
         }
         let foreground = GetForegroundWindow();
         let mut process = 0u32;
         GetWindowThreadProcessId(foreground, Some(&mut process));
         let own_window = process == windows::Win32::System::Threading::GetCurrentProcessId();
-        if !foreground.is_invalid()
+        if update_target
+            && !foreground.is_invalid()
             && self.state.may_update_target(own_window)
             && foreground != self.target
         {
@@ -1521,9 +1582,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Err(_) => {
                 match msg {
                     WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
-                    ENGINE_WAKE | WORK_WAKE | WM_CLIPBOARDUPDATE | WM_HOTKEY | WM_CLOSE
-                    | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND | WM_CONTEXTMENU
-                    | TRAY | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY => {
+                    ENGINE_WAKE | WORK_WAKE | SHOW_EXISTING | WM_CLIPBOARDUPDATE | WM_HOTKEY
+                    | WM_CLOSE | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND
+                    | WM_CONTEXTMENU | TRAY | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY => {
                         host.defer(Deferred::Message(msg, wp, lp))
                     }
                     WM_QUERYENDSESSION => return LRESULT(1),
@@ -1545,6 +1606,17 @@ unsafe fn app_message(
     lp: LPARAM,
 ) -> Option<LRESULT> {
     match msg {
+        SHOW_EXISTING => {
+            if app.state.lifecycle == Lifecycle::Running && app.state.modal_open {
+                let popup = GetLastActivePopup(app.hwnd);
+                if popup != app.hwnd && IsWindowVisible(popup).as_bool() {
+                    let _ = SetForegroundWindow(popup);
+                }
+            } else {
+                app.show_panel(None, false);
+            }
+            return Some(LRESULT(0));
+        }
         ENGINE_WAKE => {
             app.events();
             return Some(LRESULT(0));
