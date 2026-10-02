@@ -1329,3 +1329,125 @@ fn final_review_favorite_edit_updates_heading_and_phonetic_postings() {
     }
     shutdown(&engine);
 }
+
+fn phonetic_prefix_survives_newer_infix_titles(queries: &[&str]) {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine.send(Command::Capture(snapshot("周报模板"))).unwrap();
+    engine.send(Command::Flush).unwrap();
+    search(&engine, "zhoubao");
+    for index in 0..200 {
+        let mut clip = snapshot(&format!("我的周报模板{index}"));
+        clip.captured_at_ms += index + 1;
+        engine.send(Command::Capture(clip)).unwrap();
+    }
+    for query in queries {
+        assert_eq!(
+            search(&engine, query)[0].title,
+            "周报模板",
+            "before saving {query}"
+        );
+    }
+    engine.send(Command::Flush).unwrap();
+    let mut missing = vec![];
+    for query in queries {
+        let items = search(&engine, query);
+        let expression = format!(
+            "phonetic_prefix: {}",
+            quick_panel::search::phonetic_prefix_expression(query)
+        );
+        let prefix_rows: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM item_search WHERE item_search MATCH ?1",
+                [expression],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            prefix_rows, 1,
+            "infix rows leaked into prefix posting for {query}"
+        );
+        if items[0].title != "周报模板" {
+            missing.push(format!("{query}: {}", items[0].title));
+        }
+    }
+    assert!(missing.is_empty(), "prefix lost after saving: {missing:?}");
+    shutdown(&engine);
+}
+
+#[test]
+fn final_rereview_phonetic_prefix_survives_two_hundred_newer_infix_titles() {
+    phonetic_prefix_survives_newer_infix_titles(&["zhoubao"]);
+}
+
+#[test]
+fn final_rereview_initials_prefix_survives_two_hundred_newer_infix_titles() {
+    phonetic_prefix_survives_newer_infix_titles(&["zbmb"]);
+}
+
+#[test]
+fn final_rereview_short_prefixes_have_independent_postings_and_quota() {
+    phonetic_prefix_survives_newer_infix_titles(&["z", "zh", "zho", "zb", "zbm"]);
+}
+
+#[test]
+fn final_rereview_v3_upgrade_adds_prefix_postings_without_touching_blobs() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine.send(Command::Capture(snapshot("周报模板"))).unwrap();
+    shutdown(&engine);
+    drop(engine);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("UPDATE settings SET value='3' WHERE key='index_version'; DROP TABLE item_search; CREATE VIRTUAL TABLE item_search USING fts5(content,heading,phonetic); INSERT INTO item_search(rowid,content) SELECT rowid,'old index' FROM items;").unwrap();
+    let original: Vec<u8> = db
+        .query_row(
+            "SELECT data FROM representations WHERE format='PNG'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    drop(db);
+    let reopened = Engine::start(EngineOptions::new(path.clone()), Arc::new(|| {})).unwrap();
+    wait(&reopened, |e| matches!(e, Event::Ready(_)));
+    assert_eq!(search(&reopened, "zhoubao")[0].title, "周报模板");
+    shutdown(&reopened);
+    drop(reopened);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT value FROM settings WHERE key='index_version'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "4"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT data FROM representations WHERE format='PNG'",
+            [],
+            |r| r.get::<_, Vec<u8>>(0)
+        )
+        .unwrap(),
+        original
+    );
+    assert!(
+        !db.query_row("SELECT phonetic_prefix FROM item_search", [], |r| r
+            .get::<_, String>(0))
+            .unwrap()
+            .is_empty()
+    );
+    db.execute_batch("UPDATE item_search SET phonetic_prefix=phonetic_prefix || ' migrationkept'")
+        .unwrap();
+    drop(db);
+    let reopened = Engine::start(EngineOptions::new(path.clone()), Arc::new(|| {})).unwrap();
+    wait(&reopened, |e| matches!(e, Event::Ready(_)));
+    shutdown(&reopened);
+    drop(reopened);
+    let db = Connection::open(path).unwrap();
+    assert!(
+        db.query_row("SELECT phonetic_prefix FROM item_search", [], |r| r
+            .get::<_, String>(0))
+            .unwrap()
+            .ends_with(" migrationkept")
+    );
+}

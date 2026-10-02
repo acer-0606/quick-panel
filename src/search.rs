@@ -3,7 +3,7 @@ use pinyin::ToPinyin;
 use std::collections::BTreeSet;
 
 /// Persisted FTS contents must be rebuilt when the token representation changes.
-pub const INDEX_VERSION: u32 = 3;
+pub const INDEX_VERSION: u32 = 4;
 
 fn normalize(text: &str) -> String {
     text.chars()
@@ -216,4 +216,38 @@ pub fn index_heading(summary: &ItemSummary, phonetic_only: bool) -> String {
         }
     }
     indexed.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+// Encode characters rather than relying on FTS tokenization: a one/two-character
+// prefix must not collide with a gram or the first token of a longer prefix.
+fn prefix_token(text: &str, length: usize) -> String {
+    let prefix: String = text.chars().take(length).collect();
+    format!(
+        "p{}",
+        prefix
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// Exact postings for the first 1/2/3 characters of full pinyin and initials.
+/// Longer queries combine the first-three posting with normal phonetic grams,
+/// then the final rank/match check excludes residual candidate collisions.
+pub fn index_phonetic_prefix(summary: &ItemSummary) -> String {
+    let (full, initials) = phonetic(&summary.title);
+    let mut indexed = BTreeSet::new();
+    for value in [full, initials] {
+        if !value.is_empty() {
+            for length in 1..=3 {
+                indexed.insert(prefix_token(&value, length));
+            }
+        }
+    }
+    indexed.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+pub fn phonetic_prefix_expression(query: &str) -> String {
+    format!("\"{}\"", prefix_token(&normalize(query.trim()), 3))
 }

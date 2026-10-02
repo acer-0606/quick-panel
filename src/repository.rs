@@ -83,7 +83,7 @@ impl Repository {
             .map_err(|e| e.to_string())?;
         if version.as_deref() != Some(search::INDEX_VERSION.to_string().as_str()) {
             let tx = connection.transaction().map_err(|e| e.to_string())?;
-            tx.execute_batch("DROP TABLE item_search; CREATE VIRTUAL TABLE item_search USING fts5(content,heading,phonetic)")
+            tx.execute_batch("DROP TABLE item_search; CREATE VIRTUAL TABLE item_search USING fts5(content,heading,phonetic,phonetic_prefix)")
                 .map_err(|e| e.to_string())?;
             {
                 let mut statement = tx
@@ -103,8 +103,8 @@ impl Repository {
                         open_with: row.get(4).map_err(|e| e.to_string())?,
                     };
                     tx.execute(
-                        "INSERT INTO item_search(rowid,content,heading,phonetic) VALUES(?1,?2,?3,?4)",
-                        params![rowid, search::index_text(&item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true)],
+                        "INSERT INTO item_search(rowid,content,heading,phonetic,phonetic_prefix) VALUES(?1,?2,?3,?4,?5)",
+                        params![rowid, search::index_text(&item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true), search::index_phonetic_prefix(&item.summary)],
                     )
                     .map_err(|e| e.to_string())?;
                 }
@@ -305,10 +305,19 @@ impl Repository {
             // Keyset paging counts literal matches, never raw gram collisions.
             // Heading streams have independent quotas so newer body matches cannot
             // crowd old literal/phonetic title matches out of relevance ranking.
-            for (column, minimum_rank) in
-                [("heading", 600_000), ("phonetic", 400_000), ("content", 0)]
-            {
-                let qualified = format!("{column}: ({expression})");
+            let channels = [
+                (format!("heading: ({expression})"), 600_000),
+                (
+                    format!(
+                        "phonetic_prefix: {} AND phonetic: ({expression})",
+                        search::phonetic_prefix_expression(&query.text)
+                    ),
+                    500_000,
+                ),
+                (format!("phonetic: ({expression})"), 400_000),
+                (format!("content: ({expression})"), 0),
+            ];
+            for (qualified, minimum_rank) in channels {
                 let mut cursor = i64::MAX;
                 let mut accepted = 0;
                 loop {
@@ -500,8 +509,8 @@ impl Repository {
             )
             .map_err(|e| e.to_string())?;
             tx.execute(
-                "INSERT INTO item_search(rowid,content,heading,phonetic) SELECT rowid,?2,?3,?4 FROM items WHERE id=?1",
-                params![id, search::index_text(item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true)],
+                "INSERT INTO item_search(rowid,content,heading,phonetic,phonetic_prefix) SELECT rowid,?2,?3,?4,?5 FROM items WHERE id=?1",
+                params![id, search::index_text(item), search::index_heading(&item.summary, false), search::index_heading(&item.summary, true), search::index_phonetic_prefix(&item.summary)],
             )
             .map_err(|e| e.to_string())?;
         }
