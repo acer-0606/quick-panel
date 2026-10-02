@@ -56,3 +56,48 @@ fn stale_search_results_are_discarded() {
     assert!(!ui.is_current(old));
     assert!(ui.is_current(latest));
 }
+
+#[test]
+fn hiding_invalidates_a_pending_paste_even_after_reopen() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    assert!(ui.begin_action(7));
+    ui.hide();
+    ui.visible = true;
+    assert!(!ui.finish_action(7));
+}
+#[test]
+fn exit_and_external_focus_change_cancel_pending_actions() {
+    let mut exiting = UiState::default();
+    exiting.visible = true;
+    assert!(exiting.begin_action(10));
+    exiting.begin_exit();
+    assert!(!exiting.finish_action(10));
+    exiting.cancel_exit();
+    assert!(!exiting.finish_action(10));
+    let mut switched = UiState::default();
+    switched.visible = true;
+    assert!(switched.begin_action(20));
+    switched.target_changed();
+    assert!(!switched.finish_action(20));
+}
+#[test]
+fn modal_and_own_windows_never_replace_the_paste_target() {
+    let mut ui = UiState::default();
+    assert!(ui.may_update_target(false));
+    assert!(!ui.may_update_target(true));
+    ui.modal_open = true;
+    assert!(!ui.may_update_target(false));
+    assert!(!ui.begin_action(1));
+}
+#[test]
+fn latest_action_runs_once_only_while_visible_and_running() {
+    let mut ui = UiState::default();
+    assert!(!ui.begin_action(1));
+    ui.visible = true;
+    assert!(ui.begin_action(1));
+    assert!(ui.begin_action(2));
+    assert!(!ui.finish_action(1));
+    assert!(ui.finish_action(2));
+    assert!(!ui.finish_action(2));
+}

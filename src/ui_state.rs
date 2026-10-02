@@ -26,6 +26,9 @@ pub struct UiState {
     pub visible: bool,
     pub composing: bool,
     pub lifecycle: Lifecycle,
+    pub modal_open: bool,
+    interaction_epoch: u64,
+    pending_action: Option<(u64, u64)>,
     ids: Vec<String>,
     selected: Option<String>,
     request_id: u64,
@@ -37,6 +40,9 @@ impl Default for UiState {
             visible: false,
             composing: false,
             lifecycle: Lifecycle::Running,
+            modal_open: false,
+            interaction_epoch: 0,
+            pending_action: None,
             ids: Vec::new(),
             selected: None,
             request_id: 0,
@@ -74,7 +80,32 @@ impl UiState {
             PanelKey::Down => KeyAction::SelectNext,
         }
     }
+    pub fn begin_action(&mut self, request_id: u64) -> bool {
+        if !self.visible || self.lifecycle != Lifecycle::Running || self.modal_open {
+            return false;
+        }
+        self.pending_action = Some((request_id, self.interaction_epoch));
+        true
+    }
+    pub fn finish_action(&mut self, request_id: u64) -> bool {
+        if !self.visible || self.lifecycle != Lifecycle::Running || self.modal_open {
+            return false;
+        }
+        if self.pending_action != Some((request_id, self.interaction_epoch)) {
+            return false;
+        }
+        self.pending_action = None;
+        true
+    }
+    pub fn target_changed(&mut self) {
+        self.interaction_epoch = self.interaction_epoch.wrapping_add(1);
+        self.pending_action = None;
+    }
+    pub fn may_update_target(&self, own_window: bool) -> bool {
+        self.lifecycle == Lifecycle::Running && !self.modal_open && !own_window
+    }
     pub fn hide(&mut self) {
+        self.target_changed();
         self.visible = false;
     }
     pub fn next_request(&mut self) -> u64 {
@@ -95,6 +126,7 @@ impl UiState {
         if self.lifecycle != Lifecycle::Running {
             return false;
         }
+        self.target_changed();
         self.lifecycle = Lifecycle::Draining;
         self.advance_exit()
     }

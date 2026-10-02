@@ -7,10 +7,13 @@ use super::{
 use crate::{
     engine::Engine,
     model::*,
-    ui_state::{Lifecycle, UiState},
+    ui_state::{KeyAction, Lifecycle, PanelKey, UiState},
 };
 use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     path::Path,
+    rc::Rc,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -30,6 +33,7 @@ use windows::{
 const ENGINE_WAKE: u32 = WM_APP + 1;
 const WORK_WAKE: u32 = WM_APP + 2;
 const TRAY: u32 = WM_APP + 3;
+const DEFERRED_WAKE: u32 = WM_APP + 4;
 const SEARCH: usize = 100;
 const LIST: usize = 101;
 const ADD: usize = 102;
@@ -92,7 +96,82 @@ impl PreviewQueue {
         }
     }
 }
+#[derive(Clone)]
+struct RenderState {
+    dpi: u32,
+    theme: Theme,
+    font: HFONT,
+    brush: HBRUSH,
+    items: Vec<ItemSummary>,
+    image: Option<Arc<Image>>,
+}
+impl RenderState {
+    fn s(&self, n: i32) -> i32 {
+        n * self.dpi as i32 / 96
+    }
+}
+enum UiEffect {
+    Picker {
+        owner: HWND,
+        folder: bool,
+        item: Option<StoredItem>,
+    },
+    Favorite {
+        owner: HWND,
+        item: Option<StoredItem>,
+        kind: ItemKind,
+        fields: Vec<(&'static str, String)>,
+    },
+    Settings {
+        owner: HWND,
+        settings: Settings,
+    },
+    ExitError {
+        owner: HWND,
+        message: String,
+    },
+    Message {
+        owner: HWND,
+        message: String,
+    },
+    Menu {
+        owner: HWND,
+        x: i32,
+        y: i32,
+        entries: Vec<(usize, &'static str)>,
+    },
+    Destroy(HWND),
+}
+enum Deferred {
+    Message(u32, WPARAM, LPARAM),
+    Dpi(WPARAM, RECT),
+}
+/// Every callback retains only a shared Host. App is borrowed through one RefCell;
+/// rendering has its own immutable snapshot and never borrows App during SendMessage.
+struct Host {
+    app: RefCell<App>,
+    render: RefCell<Rc<RenderState>>,
+    hwnd: Cell<HWND>,
+    composing: Cell<bool>,
+    deferred: RefCell<VecDeque<Deferred>>,
+    wake_posted: Cell<bool>,
+    effects_running: Cell<bool>,
+}
+struct WindowGuard(HWND);
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(Some(self.0)).as_bool() {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+}
 struct App {
+    host: *const Host,
+    effects: VecDeque<UiEffect>,
+    hotkey_ids: [i32; 2],
+    hotkey_registered: [bool; 2],
     hwnd: HWND,
     edit: HWND,
     list: HWND,
@@ -111,14 +190,13 @@ struct App {
     pending_action: Option<(u64, Action)>,
     preview_id: u64,
     preview_open: bool,
-    image: Option<Image>,
+    image: Option<Arc<Image>>,
     tx: mpsc::Sender<Work>,
     rx: mpsc::Receiver<Done>,
     capture_worker: Option<std::thread::JoinHandle<()>>,
     preview_queue: Arc<PreviewQueue>,
     preview_worker: Option<std::thread::JoinHandle<()>>,
     dpi: u32,
-    dialog_open: bool,
     suppress_sequence: Option<u32>,
     last_capture_sequence: u32,
 }
@@ -181,7 +259,7 @@ unsafe fn decode(item: &StoredItem, id: u64, generation: &AtomicU64) -> Result<I
             .map_err(|e| e.to_string())?;
     let stream = factory.CreateStream().map_err(|e| e.to_string())?;
     stream
-        .InitializeFromMemory(&mut data)
+        .InitializeFromMemory(&data)
         .map_err(|e| e.to_string())?;
     let decoder = factory
         .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
@@ -242,7 +320,11 @@ pub fn run() -> Result<(), String> {
         RegisterClassW(&wc);
         let (tx, work_rx) = mpsc::channel();
         let (done_tx, rx) = mpsc::channel();
-        let mut app = Box::new(App {
+        let app_data = App {
+            host: std::ptr::null(),
+            effects: VecDeque::new(),
+            hotkey_ids: [1, 2],
+            hotkey_registered: [false, false],
             hwnd: HWND::default(),
             edit: HWND::default(),
             list: HWND::default(),
@@ -273,10 +355,27 @@ pub fn run() -> Result<(), String> {
             }),
             preview_worker: None,
             dpi: 96,
-            dialog_open: false,
             suppress_sequence: None,
             last_capture_sequence: 0,
+        };
+        let host = Box::new(Host {
+            app: RefCell::new(app_data),
+            render: RefCell::new(Rc::new(RenderState {
+                dpi: 96,
+                theme: Theme::System,
+                font: HFONT::default(),
+                brush: HBRUSH::default(),
+                items: Vec::new(),
+                image: None,
+            })),
+            hwnd: Cell::new(HWND::default()),
+            composing: Cell::new(false),
+            deferred: RefCell::new(VecDeque::new()),
+            wake_posted: Cell::new(false),
+            effects_running: Cell::new(false),
         });
+        let host_ptr = &*host as *const Host;
+        host.app.borrow_mut().host = host_ptr;
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class,
@@ -289,9 +388,11 @@ pub fn run() -> Result<(), String> {
             None,
             None,
             Some(instance.into()),
-            Some((&mut *app as *mut App).cast()),
+            Some(host_ptr.cast()),
         )
         .map_err(|e| e.to_string())?;
+        let _window_guard = WindowGuard(hwnd);
+        let mut app = host.app.borrow_mut();
         app.hwnd = hwnd;
         app.dpi = GetDpiForWindow(hwnd).max(96);
         app.create_controls()?;
@@ -312,18 +413,11 @@ pub fn run() -> Result<(), String> {
             while let Ok(work) = work_rx.recv() {
                 let done = match work {
                     Work::Stop => break,
-                    Work::Capture(expected) => {
-                        let captured = if clipboard::sequence_number() != expected {
-                            Ok(None)
-                        } else {
-                            clipboard::capture(HWND(handle as *mut _), 8 * 1024 * 1024)
-                        };
-                        Done::Captured(if clipboard::sequence_number() == expected {
-                            captured
-                        } else {
-                            Ok(None)
-                        })
-                    }
+                    Work::Capture(expected) => Done::Captured(clipboard::capture_for_sequence(
+                        HWND(handle as *mut _),
+                        8 * 1024 * 1024,
+                        expected,
+                    )),
                 };
                 if capture_done_tx.send(done).is_err() {
                     break;
@@ -367,11 +461,26 @@ pub fn run() -> Result<(), String> {
         app.tray(NIM_ADD);
         DragAcceptFiles(hwnd, true);
         app.capture();
+        drop(app);
+        host.drain_deferred();
+        host.drain_effects();
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            if host.is_panel_surface(msg.hwnd) && host.route_key(&msg) {
+                host.drain_effects();
+                continue;
+            }
+            if !host.is_panel_surface(msg.hwnd)
+                || host.composing.get()
+                || !IsDialogMessageW(hwnd, &msg).as_bool()
+            {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            host.drain_deferred();
+            host.drain_effects();
         }
+        let mut app = host.app.borrow_mut();
         let _ = app.tx.send(Work::Stop);
         if let Some(worker) = app.capture_worker.take() {
             let _ = worker.join();
@@ -386,12 +495,41 @@ pub fn run() -> Result<(), String> {
     }
 }
 impl App {
+    fn sync_render(&self) {
+        unsafe {
+            if let Some(host) = self.host.as_ref() {
+                *host.render.borrow_mut() = Rc::new(RenderState {
+                    dpi: self.dpi,
+                    theme: self.settings.theme,
+                    font: self.font,
+                    brush: self.brush,
+                    items: self.items.clone(),
+                    image: self.image.clone(),
+                });
+            }
+        }
+    }
+    fn cancel_actions(&mut self) {
+        self.load_id = self.load_id.wrapping_add(1);
+        self.pending_action = None;
+        self.state.target_changed();
+    }
+    unsafe fn clear_preview(&mut self) {
+        self.load_id = self.load_id.wrapping_add(1);
+        self.preview_id = self.load_id;
+        self.image = None;
+        self.preview_queue.cancel(self.preview_id);
+        self.sync_render();
+        let _ = SetWindowTextW(self.preview, w!(""));
+        let _ = InvalidateRect(Some(self.preview), None, true);
+    }
+
     fn send(&self, c: Command) {
-        if let Some(e) = &self.engine {
-            if let Err(error) = e.send(c) {
-                unsafe {
-                    self.status(&error);
-                }
+        if let Some(e) = &self.engine
+            && let Err(error) = e.send(c)
+        {
+            unsafe {
+                self.status(&error);
             }
         }
     }
@@ -484,9 +622,9 @@ impl App {
                 id,
             )?);
         }
-        let _ = SetWindowSubclass(self.edit, Some(edit_proc), 1, self as *mut _ as usize);
-        let _ = SetWindowSubclass(self.list, Some(edit_proc), 2, self as *mut _ as usize);
-        let _ = SetWindowSubclass(self.preview, Some(preview_proc), 3, self as *mut _ as usize);
+        let _ = SetWindowSubclass(self.edit, Some(edit_proc), 1, self.host as usize);
+        let _ = SetWindowSubclass(self.list, Some(edit_proc), 2, self.host as usize);
+        let _ = SetWindowSubclass(self.preview, Some(preview_proc), 3, self.host as usize);
         self.retheme();
         self.layout();
         Ok(())
@@ -500,6 +638,7 @@ impl App {
         }
         self.font = theme::font(self.dpi);
         self.brush = CreateSolidBrush(theme::palette(self.settings.theme).background);
+        self.sync_render();
         theme::apply(self.hwnd, self.settings.theme);
         for h in [self.edit, self.list, self.footer, self.preview]
             .into_iter()
@@ -521,6 +660,9 @@ impl App {
         let _ = InvalidateRect(Some(self.hwnd), None, true);
     }
     unsafe fn layout(&self) {
+        if self.buttons.len() < 7 || self.edit.is_invalid() || self.list.is_invalid() {
+            return;
+        }
         let mut r = RECT::default();
         let _ = GetClientRect(self.hwnd, &mut r);
         let w = r.right;
@@ -600,40 +742,74 @@ impl App {
         data.szTip[..title.len()].copy_from_slice(&title);
         let _ = Shell_NotifyIconW(operation, &data);
     }
-    unsafe fn hotkeys(&mut self) {
-        let _ = UnregisterHotKey(Some(self.hwnd), 1);
-        let _ = UnregisterHotKey(Some(self.hwnd), 2);
-        let mut failed = false;
-        for (id, mods, key) in [
-            (1, self.settings.hotkey_modifiers, self.settings.hotkey_key),
+    unsafe fn replace_hotkeys(&mut self, next: &Settings) -> Result<(), String> {
+        let old = [
+            (self.settings.hotkey_modifiers, self.settings.hotkey_key),
             (
-                2,
                 self.settings.clipboard_hotkey_modifiers,
                 self.settings.clipboard_hotkey_key,
             ),
-        ] {
+        ];
+        let new = [
+            (next.hotkey_modifiers, next.hotkey_key),
+            (next.clipboard_hotkey_modifiers, next.clipboard_hotkey_key),
+        ];
+        // A second ID pair validates registrations while old bindings stay active.
+        // Unchanged keys retain their current IDs; swaps of our existing keys reuse IDs.
+        let fresh: Vec<_> = [11, 12, 21, 22, 31, 32]
+            .into_iter()
+            .filter(|id| !self.hotkey_ids.contains(id))
+            .take(2)
+            .collect();
+        let mut ids = [0i32; 2];
+        let mut registered = Vec::new();
+        for i in 0..2 {
+            if let Some(j) = old.iter().position(|key| *key == new[i])
+                && self.hotkey_registered[j]
+            {
+                ids[i] = self.hotkey_ids[j];
+                continue;
+            }
+            let id = fresh[i];
             if RegisterHotKey(
                 Some(self.hwnd),
                 id,
-                HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT,
-                key,
+                HOT_KEY_MODIFIERS(new[i].0) | MOD_NOREPEAT,
+                new[i].1,
             )
             .is_err()
             {
-                failed = true;
+                for id in registered {
+                    let _ = UnregisterHotKey(Some(self.hwnd), id);
+                }
+                return Err("快捷键已被占用，原快捷键保持不变。请打开设置选择其他组合。".into());
+            }
+            registered.push(id);
+            ids[i] = id;
+        }
+        for id in self.hotkey_ids {
+            if !ids.contains(&id) {
+                let _ = UnregisterHotKey(Some(self.hwnd), id);
             }
         }
-        if failed {
-            self.show(None);
-            self.status("快捷键冲突；请在设置中修改。托盘仍可呼出。");
-        }
+        self.hotkey_ids = ids;
+        self.hotkey_registered = [true, true];
+        Ok(())
     }
     unsafe fn show(&mut self, scope: Option<Scope>) {
-        if self.state.lifecycle != Lifecycle::Running {
+        if self.state.lifecycle != Lifecycle::Running || self.state.modal_open {
             return;
         }
         let foreground = GetForegroundWindow();
-        if foreground != self.hwnd && !foreground.is_invalid() {
+        let mut process = 0u32;
+        GetWindowThreadProcessId(foreground, Some(&mut process));
+        let own_window = process == windows::Win32::System::Threading::GetCurrentProcessId();
+        if !foreground.is_invalid()
+            && self.state.may_update_target(own_window)
+            && foreground != self.target
+        {
+            self.cancel_actions();
+            self.clear_preview();
             self.target = foreground;
         }
         if let Some(s) = scope {
@@ -667,8 +843,8 @@ impl App {
         self.search();
     }
     unsafe fn hide(&mut self) {
-        self.image = None;
-        self.preview_queue.cancel(self.load_id.wrapping_add(1));
+        self.cancel_actions();
+        self.clear_preview();
         self.state.hide();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
@@ -703,10 +879,8 @@ impl App {
         if self.settings.capture_paused || !self.state.accept_capture() {
             return;
         }
-        if self.tx.send(Work::Capture(sequence)).is_err() {
-            if self.state.capture_completed() {
-                self.send(Command::Shutdown);
-            }
+        if self.tx.send(Work::Capture(sequence)).is_err() && self.state.capture_completed() {
+            self.send(Command::Shutdown);
         }
     }
     unsafe fn work_done(&mut self) {
@@ -726,7 +900,8 @@ impl App {
                     if id == self.preview_id && self.preview_open && self.state.visible {
                         match result {
                             Ok(image) => {
-                                self.image = Some(image);
+                                self.image = Some(Arc::new(image));
+                                self.sync_render();
                                 let _ = SetWindowTextW(self.preview, w!(""));
                             }
                             Err(e) => {
@@ -741,16 +916,18 @@ impl App {
         }
     }
     unsafe fn events(&mut self) {
-        loop {
-            let event = match self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
-                Some(e) => e,
-                None => break,
-            };
+        while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
                 Event::Ready(settings) => {
                     self.settings = settings;
                     self.retheme();
-                    self.hotkeys();
+                    if let Err(e) = self.replace_hotkeys(&self.settings.clone()) {
+                        self.show(None);
+                        self.effects.push_back(UiEffect::Message {
+                            owner: self.hwnd,
+                            message: e,
+                        });
+                    }
                     self.search();
                 }
                 Event::Results { request_id, items } => {
@@ -758,6 +935,7 @@ impl App {
                         self.state
                             .replace_ids(items.iter().map(|x| x.id.clone()).collect());
                         self.items = items;
+                        self.sync_render();
                         SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
                         SendMessageW(self.list, LB_RESETCONTENT, None, None);
                         for item in &self.items {
@@ -784,10 +962,21 @@ impl App {
                             .as_ref()
                             .is_some_and(|(id, _)| *id == request_id)
                         {
-                            if let Some((_, action)) = self.pending_action.take() {
-                                self.perform(item, action);
+                            if GetForegroundWindow() == self.hwnd
+                                && self.state.finish_action(request_id)
+                            {
+                                if let Some((_, action)) = self.pending_action.take() {
+                                    self.perform(item, action);
+                                }
+                            } else {
+                                self.cancel_actions();
                             }
-                        } else if self.preview_open && request_id == self.preview_id {
+                        } else if self.state.visible
+                            && self.state.lifecycle == Lifecycle::Running
+                            && !self.state.modal_open
+                            && self.preview_open
+                            && request_id == self.preview_id
+                        {
                             self.perform(item, Action::Preview);
                         }
                     }
@@ -805,41 +994,31 @@ impl App {
                 Event::Error { message, exiting } => {
                     if exiting {
                         self.state.exit_failed();
-                        self.dialog_open = true;
-                        let msg = wide(&format!(
-                            "保存失败，数据仍保留在内存中。\n{message}\n\n重试保存，或取消退出？"
-                        ));
-                        let answer = MessageBoxW(
-                            Some(self.hwnd),
-                            PCWSTR(msg.as_ptr()),
-                            w!("保存后退出"),
-                            MB_RETRYCANCEL | MB_ICONERROR,
-                        );
-                        self.dialog_open = false;
-                        if answer == IDRETRY {
-                            self.state.retry_exit();
-                            self.send(Command::Shutdown);
-                        } else {
-                            self.send(Command::CancelShutdown);
-                            self.state.cancel_exit();
-                            self.last_capture_sequence = 0;
-                            self.capture();
-                            self.show(None);
-                        }
+                        self.cancel_actions();
+                        self.clear_preview();
+                        self.effects.push_back(UiEffect::ExitError {
+                            owner: self.hwnd,
+                            message,
+                        });
                     } else {
                         self.status(&message);
                     }
                 }
                 Event::ExitReady => {
-                    let _ = DestroyWindow(self.hwnd);
+                    self.effects.push_back(UiEffect::Destroy(self.hwnd));
                 }
             }
         }
     }
     unsafe fn selection(&mut self) {
+        self.clear_preview();
         let i = SendMessageW(self.list, LB_GETCURSEL, None, None).0;
         if i >= 0 {
             self.state.select(i as usize);
+        } else {
+            self.state.select(usize::MAX);
+            self.status("没有匹配结果 · 可切换范围或添加收藏");
+            return;
         }
         let clipboard = self
             .items
@@ -855,23 +1034,27 @@ impl App {
         }
     }
     unsafe fn request(&mut self, action: Action) {
-        if matches!(action, Action::Preview) && !self.state.visible {
+        if !self.state.visible || self.state.modal_open {
             return;
         }
         if self.state.lifecycle != Lifecycle::Running {
             return;
         }
-        if let Some(id) = self.state.selected_id() {
+        if let Some(id) = self.state.selected_id().map(str::to_owned) {
             self.load_id = self.load_id.wrapping_add(1);
             if matches!(action, Action::Preview) {
                 self.preview_id = self.load_id;
                 self.image = None;
                 self.preview_queue.cancel(self.preview_id);
+                self.sync_render();
             } else {
+                if !self.state.begin_action(self.load_id) {
+                    return;
+                }
                 self.pending_action = Some((self.load_id, action));
             }
             self.send(Command::Load {
-                id: id.to_owned(),
+                id,
                 request_id: self.load_id,
             });
         }
@@ -937,14 +1120,11 @@ impl App {
                 self.edit_favorite(Some(item), None);
             }
             Action::Relink => {
-                self.dialog_open = true;
-                let picked = dialogs::pick(self.hwnd, item.summary.kind == ItemKind::Folder);
-                self.dialog_open = false;
-                match picked {
-                    Ok(Some(path)) => self.edit_favorite(Some(item), Some(path)),
-                    Ok(None) => {}
-                    Err(e) => self.status(&e),
-                }
+                self.effects.push_back(UiEffect::Picker {
+                    owner: self.hwnd,
+                    folder: item.summary.kind == ItemKind::Folder,
+                    item: Some(item),
+                });
             }
             Action::Preview => {
                 self.image = None;
@@ -1005,120 +1185,114 @@ impl App {
                     .to_string_lossy()
                     .into_owned()
             });
-        self.dialog_open = true;
-        let result = dialogs::form(
-            self.hwnd,
-            "编辑收藏",
-            &[
-                ("名称", name),
-                ("目标路径", path),
-                (
-                    "别名",
-                    item.as_ref()
-                        .map(|i| i.summary.alias.clone())
-                        .unwrap_or_default(),
-                ),
-                (
-                    "标签（逗号分隔）",
-                    item.as_ref()
-                        .map(|i| i.summary.tags.join(", "))
-                        .unwrap_or_default(),
-                ),
-                (
-                    "打开方式（程序完整路径，可留空）",
-                    item.as_ref()
-                        .and_then(|i| i.open_with.clone())
-                        .unwrap_or_default(),
-                ),
-            ],
-        );
-        self.dialog_open = false;
-        if let Some(v) = result {
-            if v[0].trim().is_empty() || v[1].trim().is_empty() {
-                self.status("名称和路径不能为空");
-                return;
-            }
-            self.send(Command::SaveFavorite(FavoriteInput {
-                id: item.map(|i| i.summary.id),
-                kind,
-                title: v[0].trim().into(),
-                target: v[1].trim().into(),
-                alias: v[2].trim().into(),
-                tags: v[3]
-                    .split([',', '，'])
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect(),
-                open_with: (!v[4].trim().is_empty()).then(|| v[4].trim().into()),
-            }));
-        }
-    }
-    unsafe fn add(&mut self, folder: bool) {
-        self.dialog_open = true;
-        let result = dialogs::pick(self.hwnd, folder);
-        self.dialog_open = false;
-        match result {
-            Ok(Some(path)) => self.edit_favorite(None, Some(path)),
-            Ok(None) => {}
-            Err(e) => self.status(&e),
-        }
-    }
-    unsafe fn settings(&mut self) {
-        self.dialog_open = true;
-        let result = dialogs::settings_form(
-            self.hwnd,
-            match self.settings.theme {
-                Theme::System => 0,
-                Theme::Light => 1,
-                Theme::Dark => 2,
-            },
-            format_hotkey(self.settings.hotkey_modifiers, self.settings.hotkey_key),
-            format_hotkey(
-                self.settings.clipboard_hotkey_modifiers,
-                self.settings.clipboard_hotkey_key,
+        let fields = vec![
+            ("名称", name),
+            ("目标路径", path),
+            (
+                "别名",
+                item.as_ref()
+                    .map(|i| i.summary.alias.clone())
+                    .unwrap_or_default(),
             ),
-            self.settings.capture_paused,
-            self.settings.excluded_apps.join(", "),
-        );
-        self.dialog_open = false;
-        if let Some(v) = result {
-            let mut settings = self.settings.clone();
-            settings.theme = match v[0].as_str() {
-                "1" => Theme::Light,
-                "2" => Theme::Dark,
-                _ => Theme::System,
-            };
-            let keys = parse_hotkey(&v[1]).zip(parse_hotkey(&v[2]));
-            let Some(((m, k), (cm, ck))) = keys else {
-                self.status("快捷键无效；请输入 Ctrl/Alt/Shift/Win + 字母、数字、Space 或 F1–F24");
-                return;
-            };
-            if (m, k) == (cm, ck) || (m == 8 && k == 86) || (cm == 8 && ck == 86) {
-                self.status("两组快捷键须不同；Win+V 留给系统剪贴板");
-                return;
-            }
-            settings.hotkey_modifiers = m;
-            settings.hotkey_key = k;
-            settings.clipboard_hotkey_modifiers = cm;
-            settings.clipboard_hotkey_key = ck;
-            settings.capture_paused = v[3] == "1";
-            settings.excluded_apps = v[4]
+            (
+                "标签（逗号分隔）",
+                item.as_ref()
+                    .map(|i| i.summary.tags.join(", "))
+                    .unwrap_or_default(),
+            ),
+            (
+                "打开方式（程序完整路径，可留空）",
+                item.as_ref()
+                    .and_then(|i| i.open_with.clone())
+                    .unwrap_or_default(),
+            ),
+        ];
+        self.effects.push_back(UiEffect::Favorite {
+            owner: self.hwnd,
+            item,
+            kind,
+            fields,
+        });
+    }
+    unsafe fn apply_favorite(&mut self, item: Option<StoredItem>, kind: ItemKind, v: Vec<String>) {
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        if v[0].trim().is_empty() || v[1].trim().is_empty() {
+            self.status("名称和路径不能为空");
+            return;
+        }
+        self.send(Command::SaveFavorite(FavoriteInput {
+            id: item.map(|i| i.summary.id),
+            kind,
+            title: v[0].trim().into(),
+            target: v[1].trim().into(),
+            alias: v[2].trim().into(),
+            tags: v[3]
                 .split([',', '，'])
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
-                .collect();
-            self.settings = settings.clone();
-            self.retheme();
-            self.hotkeys();
-            self.send(Command::SaveSettings(settings));
-        }
+                .collect(),
+            open_with: (!v[4].trim().is_empty()).then(|| v[4].trim().into()),
+        }));
     }
-    unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
-        let Ok(menu) = CreatePopupMenu() else {
+    unsafe fn add(&mut self, folder: bool) {
+        self.effects.push_back(UiEffect::Picker {
+            owner: self.hwnd,
+            folder,
+            item: None,
+        });
+    }
+    unsafe fn settings(&mut self) {
+        self.effects.push_back(UiEffect::Settings {
+            owner: self.hwnd,
+            settings: self.settings.clone(),
+        });
+    }
+    unsafe fn apply_settings(&mut self, v: Vec<String>) {
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+
+        let mut settings = self.settings.clone();
+        settings.theme = match v[0].as_str() {
+            "1" => Theme::Light,
+            "2" => Theme::Dark,
+            _ => Theme::System,
+        };
+        let keys = parse_hotkey(&v[1]).zip(parse_hotkey(&v[2]));
+        let Some(((m, k), (cm, ck))) = keys else {
+            self.status("快捷键无效；请输入 Ctrl/Alt/Shift/Win + 字母、数字、Space 或 F1–F24");
             return;
         };
+        if (m, k) == (cm, ck) || (m == 8 && k == 86) || (cm == 8 && ck == 86) {
+            self.status("两组快捷键须不同；Win+V 留给系统剪贴板");
+            return;
+        }
+        settings.hotkey_modifiers = m;
+        settings.hotkey_key = k;
+        settings.clipboard_hotkey_modifiers = cm;
+        settings.clipboard_hotkey_key = ck;
+        settings.capture_paused = v[3] == "1";
+        settings.excluded_apps = v[4]
+            .split([',', '，'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Err(message) = self.replace_hotkeys(&settings) {
+            self.effects.push_back(UiEffect::Message {
+                owner: self.hwnd,
+                message,
+            });
+            return;
+        }
+        self.settings = settings.clone();
+        self.retheme();
+        self.send(Command::SaveSettings(settings));
+    }
+    unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
         let entries: Vec<(usize, &str)> = if tray {
             vec![
                 (221, "打开面板"),
@@ -1153,23 +1327,12 @@ impl App {
                 (DELETE, "删除"),
             ]
         };
-        for (id, title) in entries {
-            let t = wide(title);
-            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(t.as_ptr()));
-        }
-        let _ = SetForegroundWindow(self.hwnd);
-        let command = TrackPopupMenu(
-            menu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+        self.effects.push_back(UiEffect::Menu {
+            owner: self.hwnd,
             x,
             y,
-            None,
-            self.hwnd,
-            None,
-        )
-        .0 as usize;
-        let _ = DestroyMenu(menu);
-        self.command(command);
+            entries,
+        });
     }
     unsafe fn command(&mut self, id: usize) {
         if self.state.lifecycle != Lifecycle::Running && id != EXIT {
@@ -1183,8 +1346,7 @@ impl App {
             }
             PREVIEW => {
                 self.preview_open = !self.preview_open;
-                self.preview_queue.cancel(self.load_id.wrapping_add(1));
-                self.image = None;
+                self.clear_preview();
                 let _ = ShowWindow(
                     self.preview,
                     if self.preview_open { SW_SHOW } else { SW_HIDE },
@@ -1231,14 +1393,14 @@ impl App {
             }
             223 => self.add(true),
             224 => self.add(false),
-            EXIT => {
-                if self.state.lifecycle == Lifecycle::Running {
-                    self.state.visible = true;
-                    let _ = ShowWindow(self.hwnd, SW_SHOWNA);
-                    self.status("正在保存后退出…");
-                    if self.state.begin_exit() {
-                        self.send(Command::Shutdown);
-                    }
+            EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.cancel_actions();
+                self.clear_preview();
+                self.state.visible = true;
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                self.status("正在保存后退出…");
+                if self.state.begin_exit() {
+                    self.send(Command::Shutdown);
                 }
             }
             _ => {}
@@ -1298,6 +1460,7 @@ fn format_hotkey(mods: u32, key: u32) -> String {
     });
     p.join("+")
 }
+
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -1306,107 +1469,109 @@ unsafe extern "system" fn edit_proc(
     _id: usize,
     data: usize,
 ) -> LRESULT {
-    let app = &mut *(data as *mut App);
+    let host = &*(data as *const Host);
     match msg {
-        WM_IME_STARTCOMPOSITION => app.state.composing = true,
-        WM_IME_ENDCOMPOSITION => app.state.composing = false,
-        WM_KEYDOWN if !app.state.composing => {
-            let key = wp.0 as u32;
-            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-            if key == VK_ESCAPE.0 as u32 {
-                app.hide();
-                return LRESULT(0);
-            }
-            if key == VK_RETURN.0 as u32 {
-                app.request(Action::Open(shift));
-                return LRESULT(0);
-            }
-            if key == VK_UP.0 as u32 || key == VK_DOWN.0 as u32 {
-                let old = app.state.selected_index().unwrap_or(0);
-                let index = if key == VK_UP.0 as u32 {
-                    old.saturating_sub(1)
-                } else {
-                    (old + 1).min(app.items.len().saturating_sub(1))
-                };
-                SendMessageW(app.list, LB_SETCURSEL, Some(WPARAM(index)), None);
-                app.selection();
-                return LRESULT(0);
-            }
-            if ctrl && key == 67 {
-                let (mut start, mut end) = (0u32, 0u32);
-                SendMessageW(
-                    app.edit,
-                    EM_GETSEL,
-                    Some(WPARAM((&mut start as *mut u32) as usize)),
-                    Some(LPARAM((&mut end as *mut u32) as isize)),
-                );
-                if hwnd != app.edit || start == end {
-                    app.request(Action::Copy(false));
-                    return LRESULT(0);
-                }
-            }
-            if ctrl && key == 75 {
-                let mut p = POINT::default();
-                let _ = GetCursorPos(&mut p);
-                app.context(p.x, p.y, false, false);
-                return LRESULT(0);
-            }
-            if ctrl && (49..=52).contains(&key) {
-                app.command(300 + (key - 49) as usize);
-                return LRESULT(0);
-            }
+        WM_IME_STARTCOMPOSITION => host.composing.set(true),
+        WM_IME_ENDCOMPOSITION => host.composing.set(false),
+        WM_GETDLGCODE if host.composing.get() => {
+            return LRESULT(DefSubclassProc(hwnd, msg, wp, lp).0 | DLGC_WANTALLKEYS as isize);
         }
         _ => {}
     }
     DefSubclassProc(hwnd, msg, wp, lp)
 }
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let cs = &*(lp.0 as *const CREATESTRUCTW);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
+        let host = &*(cs.lpCreateParams as *const Host);
+        host.hwnd.set(hwnd);
     }
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Host;
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
-    let app = &mut *ptr;
+    let host = &*ptr;
+    if msg == WM_QUERYENDSESSION {
+        return LRESULT(1);
+    }
+    if msg == WM_ENDSESSION {
+        if wp.0 != 0 {
+            if host.app.try_borrow_mut().is_err() {
+                host.defer(Deferred::Message(msg, wp, lp));
+            } else {
+                host.end_session(hwnd);
+            }
+        }
+        return LRESULT(0);
+    }
+    if let Some(result) = render_message(host, hwnd, msg, wp, lp) {
+        return result;
+    }
+    if msg == DEFERRED_WAKE {
+        host.wake_posted.set(false);
+        host.drain_deferred();
+        host.drain_effects();
+        return LRESULT(0);
+    }
+    let result = {
+        match host.app.try_borrow_mut() {
+            Ok(mut app) => app_message(&mut app, hwnd, msg, wp, lp),
+            Err(_) => {
+                match msg {
+                    WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
+                    ENGINE_WAKE | WORK_WAKE | WM_CLIPBOARDUPDATE | WM_HOTKEY | WM_CLOSE
+                    | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND | WM_CONTEXTMENU
+                    | TRAY | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY => {
+                        host.defer(Deferred::Message(msg, wp, lp))
+                    }
+                    WM_QUERYENDSESSION => return LRESULT(1),
+                    _ => return DefWindowProcW(hwnd, msg, wp, lp),
+                }
+                return LRESULT(0);
+            }
+        }
+    };
+    host.drain_effects();
+    result.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+}
+
+unsafe fn app_message(
+    app: &mut App,
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
     match msg {
         ENGINE_WAKE => {
             app.events();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WORK_WAKE => {
             app.work_done();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_CLIPBOARDUPDATE => {
             app.capture();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_HOTKEY => {
-            app.show((wp.0 == 2).then_some(Scope::Clipboard));
-            return LRESULT(0);
+            app.show((wp.0 as i32 == app.hotkey_ids[1]).then_some(Scope::Clipboard));
+            return Some(LRESULT(0));
         }
         WM_CLOSE => {
             app.hide();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
-        WM_ACTIVATE if (wp.0 & 0xffff) == WA_INACTIVE as usize && !app.dialog_open => {
+        WM_ACTIVATE if (wp.0 & 0xffff) == WA_INACTIVE as usize && !app.state.modal_open => {
             app.hide();
-            return LRESULT(0);
-        }
-        WM_GETMINMAXINFO => {
-            let info = &mut *(lp.0 as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT {
-                x: app.s(480),
-                y: app.s(340),
-            };
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_SIZE => {
             app.layout();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_DPICHANGED => {
             app.dpi = (wp.0 & 0xffff) as u32;
@@ -1422,11 +1587,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             );
             app.retheme();
             app.layout();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_SETTINGCHANGE => {
             app.retheme();
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_COMMAND => {
             let id = wp.0 & 0xffff;
@@ -1440,7 +1605,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             } else if notification == BN_CLICKED as usize {
                 app.command(id);
             }
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_CONTEXTMENU => {
             let (x, y) = if lp.0 == -1 {
@@ -1475,7 +1640,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
             }
             app.context(x, y, false, false);
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         TRAY => {
             match lp.0 as u32 {
@@ -1487,7 +1652,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 }
                 _ => {}
             }
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         WM_DROPFILES => {
             let drop = HDROP(wp.0 as *mut _);
@@ -1503,128 +1668,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             for path in paths {
                 app.edit_favorite(None, Some(path));
             }
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
-        WM_DRAWITEM => {
-            let draw = &*(lp.0 as *const DRAWITEMSTRUCT);
-            if draw.CtlID == LIST as u32 && draw.itemID != u32::MAX {
-                if let Some(item) = app.items.get(draw.itemID as usize) {
-                    let p = theme::palette(app.settings.theme);
-                    let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
-                    let brush = CreateSolidBrush(if selected { p.selected } else { p.surface });
-                    FillRect(draw.hDC, &draw.rcItem, brush);
-                    let _ = DeleteObject(brush.into());
-                    let _ = SetBkMode(draw.hDC, TRANSPARENT);
-                    let _ = SelectObject(draw.hDC, app.font.into());
-                    let kind = match item.kind {
-                        ItemKind::Clipboard => "▤ 剪贴板",
-                        ItemKind::Folder => "▣ 文件夹",
-                        ItemKind::Document => "▧ 文档",
-                    };
-                    let mut title = wide(&format!(
-                        "{}{}",
-                        if item.pinned { "★ " } else { "" },
-                        item.title
-                    ));
-                    let mut rect = draw.rcItem;
-                    rect.left += app.s(14);
-                    rect.right -= app.s(105);
-                    rect.top += app.s(8);
-                    rect.bottom = rect.top + app.s(25);
-                    SetTextColor(draw.hDC, p.text);
-                    DrawTextW(
-                        draw.hDC,
-                        &mut title,
-                        &mut rect,
-                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-                    );
-                    let mut typ = wide(kind);
-                    let mut type_rect = draw.rcItem;
-                    type_rect.left = type_rect.right - app.s(98);
-                    type_rect.top += app.s(9);
-                    type_rect.bottom = type_rect.top + app.s(24);
-                    SetTextColor(draw.hDC, p.muted);
-                    DrawTextW(
-                        draw.hDC,
-                        &mut typ,
-                        &mut type_rect,
-                        DT_SINGLELINE | DT_NOPREFIX,
-                    );
-                    let subtitle = if item.alias.is_empty() {
-                        item.subtitle.clone()
-                    } else {
-                        format!("{} · {}", item.alias, item.subtitle)
-                    };
-                    let mut subtitle = wide(&subtitle);
-                    rect.top += app.s(26);
-                    rect.bottom = rect.top + app.s(22);
-                    rect.right = draw.rcItem.right - app.s(14);
-                    DrawTextW(
-                        draw.hDC,
-                        &mut subtitle,
-                        &mut rect,
-                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-                    );
-                    if selected {
-                        let border = CreateSolidBrush(p.accent);
-                        FrameRect(draw.hDC, &draw.rcItem, border);
-                        let _ = DeleteObject(border.into());
-                    }
-                    if draw.itemState.0 & ODS_FOCUS.0 != 0 {
-                        let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
-                    }
-                }
-            }
-            return LRESULT(1);
-        }
-        WM_MEASUREITEM => {
-            let m = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
-            if m.CtlID == LIST as u32 {
-                m.itemHeight = app.s(62) as u32;
-                return LRESULT(1);
-            }
-        }
-        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
-            let dc = HDC(wp.0 as *mut _);
-            let p = theme::palette(app.settings.theme);
-            SetTextColor(dc, p.text);
-            SetBkColor(dc, p.background);
-            return LRESULT(app.brush.0 as isize);
-        }
-        WM_ERASEBKGND => {
-            let dc = HDC(wp.0 as *mut _);
-            let mut r = RECT::default();
-            let _ = GetClientRect(hwnd, &mut r);
-            FillRect(dc, &r, app.brush);
-            return LRESULT(1);
-        }
-        WM_QUERYENDSESSION => return LRESULT(1),
-        WM_ENDSESSION => {
-            if wp.0 != 0 {
-                if app.state.begin_exit() {
-                    app.send(Command::Shutdown);
-                }
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < deadline {
-                    app.work_done();
-                    let event = app.engine.as_ref().and_then(|e| e.try_recv().ok());
-                    match event {
-                        Some(Event::ExitReady) => break,
-                        Some(Event::Error { .. }) => break,
-                        _ => {
-                            std::thread::sleep(Duration::from_millis(5));
-                        }
-                    }
-                }
-                let _ = DestroyWindow(hwnd);
-                std::process::exit(0);
-            }
-            return LRESULT(0);
-        }
+        WM_QUERYENDSESSION => return Some(LRESULT(1)),
         WM_DESTROY => {
             let _ = RemoveClipboardFormatListener(hwnd);
-            let _ = UnregisterHotKey(Some(hwnd), 1);
-            let _ = UnregisterHotKey(Some(hwnd), 2);
+            for id in app.hotkey_ids {
+                let _ = UnregisterHotKey(Some(hwnd), id);
+            }
             app.tray(NIM_DELETE);
             let _ = RemoveWindowSubclass(app.preview, Some(preview_proc), 3);
             let _ = RemoveWindowSubclass(app.edit, Some(edit_proc), 1);
@@ -1636,11 +1687,127 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                 let _ = DeleteObject(app.brush.into());
             }
             PostQuitMessage(0);
-            return LRESULT(0);
+            return Some(LRESULT(0));
         }
         _ => {}
     }
-    DefWindowProcW(hwnd, msg, wp, lp)
+    None
+}
+
+unsafe fn render_message(
+    host: &Host,
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+) -> Option<LRESULT> {
+    let render = host.render.borrow().clone();
+    match msg {
+        WM_GETMINMAXINFO => {
+            let info = &mut *(lp.0 as *mut MINMAXINFO);
+            info.ptMinTrackSize = POINT {
+                x: render.s(480),
+                y: render.s(340),
+            };
+            return Some(LRESULT(0));
+        }
+        WM_DRAWITEM => {
+            let draw = &*(lp.0 as *const DRAWITEMSTRUCT);
+            if draw.CtlID == LIST as u32
+                && draw.itemID != u32::MAX
+                && let Some(item) = render.items.get(draw.itemID as usize)
+            {
+                let p = theme::palette(render.theme);
+                let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+                let brush = CreateSolidBrush(if selected { p.selected } else { p.surface });
+                FillRect(draw.hDC, &draw.rcItem, brush);
+                let _ = DeleteObject(brush.into());
+                let _ = SetBkMode(draw.hDC, TRANSPARENT);
+                let _ = SelectObject(draw.hDC, render.font.into());
+                let kind = match item.kind {
+                    ItemKind::Clipboard => "▤ 剪贴板",
+                    ItemKind::Folder => "▣ 文件夹",
+                    ItemKind::Document => "▧ 文档",
+                };
+                let mut title = wide(&format!(
+                    "{}{}",
+                    if item.pinned { "★ " } else { "" },
+                    item.title
+                ));
+                let mut rect = draw.rcItem;
+                rect.left += render.s(14);
+                rect.right -= render.s(105);
+                rect.top += render.s(8);
+                rect.bottom = rect.top + render.s(25);
+                SetTextColor(draw.hDC, p.text);
+                DrawTextW(
+                    draw.hDC,
+                    &mut title,
+                    &mut rect,
+                    DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                let mut typ = wide(kind);
+                let mut type_rect = draw.rcItem;
+                type_rect.left = type_rect.right - render.s(98);
+                type_rect.top += render.s(9);
+                type_rect.bottom = type_rect.top + render.s(24);
+                SetTextColor(draw.hDC, p.muted);
+                DrawTextW(
+                    draw.hDC,
+                    &mut typ,
+                    &mut type_rect,
+                    DT_SINGLELINE | DT_NOPREFIX,
+                );
+                let subtitle = if item.alias.is_empty() {
+                    item.subtitle.clone()
+                } else {
+                    format!("{} · {}", item.alias, item.subtitle)
+                };
+                let mut subtitle = wide(&subtitle);
+                rect.top += render.s(26);
+                rect.bottom = rect.top + render.s(22);
+                rect.right = draw.rcItem.right - render.s(14);
+                DrawTextW(
+                    draw.hDC,
+                    &mut subtitle,
+                    &mut rect,
+                    DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+                if selected {
+                    let border = CreateSolidBrush(p.accent);
+                    FrameRect(draw.hDC, &draw.rcItem, border);
+                    let _ = DeleteObject(border.into());
+                }
+                if draw.itemState.0 & ODS_FOCUS.0 != 0 {
+                    let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
+                }
+            }
+            return Some(LRESULT(1));
+        }
+        WM_MEASUREITEM => {
+            let m = &mut *(lp.0 as *mut MEASUREITEMSTRUCT);
+            if m.CtlID == LIST as u32 {
+                m.itemHeight = render.s(62) as u32;
+                return Some(LRESULT(1));
+            }
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
+            let dc = HDC(wp.0 as *mut _);
+            let p = theme::palette(render.theme);
+            SetTextColor(dc, p.text);
+            SetBkColor(dc, p.background);
+            return Some(LRESULT(render.brush.0 as isize));
+        }
+        WM_ERASEBKGND => {
+            let dc = HDC(wp.0 as *mut _);
+            let mut r = RECT::default();
+            let _ = GetClientRect(hwnd, &mut r);
+            FillRect(dc, &r, render.brush);
+            return Some(LRESULT(1));
+        }
+        _ => {}
+    }
+    None
 }
 
 unsafe extern "system" fn preview_proc(
@@ -1651,14 +1818,16 @@ unsafe extern "system" fn preview_proc(
     _id: usize,
     data: usize,
 ) -> LRESULT {
-    let app = &mut *(data as *mut App);
-    if msg == WM_PAINT && app.image.is_some() {
+    let host = &*(data as *const Host);
+    let render = host.render.borrow().clone();
+    if msg == WM_PAINT
+        && let Some(image) = &render.image
+    {
         let mut ps = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut ps);
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
-        FillRect(dc, &r, app.brush);
-        let image = app.image.as_ref().unwrap();
+        FillRect(dc, &r, render.brush);
         let ratio = (r.right as f64 / image.width as f64)
             .min(r.bottom as f64 / image.height as f64)
             .min(1.0);
@@ -1696,4 +1865,300 @@ unsafe extern "system" fn preview_proc(
         return LRESULT(0);
     }
     DefSubclassProc(hwnd, msg, wp, lp)
+}
+
+impl Host {
+    unsafe fn is_panel_surface(&self, window: HWND) -> bool {
+        window == self.hwnd.get() || IsChild(self.hwnd.get(), window).as_bool()
+    }
+    fn defer(&self, message: Deferred) {
+        self.deferred.borrow_mut().push_back(message);
+        if !self.wake_posted.replace(true) {
+            unsafe {
+                let _ = PostMessageW(Some(self.hwnd.get()), DEFERRED_WAKE, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+    unsafe fn drain_deferred(&self) {
+        if self.app.try_borrow_mut().is_err() {
+            return;
+        }
+        loop {
+            let next = self.deferred.borrow_mut().pop_front();
+            match next {
+                Some(Deferred::Message(msg, wp, lp)) => {
+                    window_proc(self.hwnd.get(), msg, wp, lp);
+                }
+                Some(Deferred::Dpi(wp, rect)) => {
+                    window_proc(
+                        self.hwnd.get(),
+                        WM_DPICHANGED,
+                        wp,
+                        LPARAM((&rect as *const RECT) as isize),
+                    );
+                }
+                None => break,
+            }
+        }
+    }
+    /// Keyboard handling precedes IsDialogMessage and applies to Edit, List and Buttons.
+    /// During IME composition the original key reaches the native Edit unchanged.
+    unsafe fn route_key(&self, msg: &MSG) -> bool {
+        if msg.message != WM_KEYDOWN || self.composing.get() {
+            return false;
+        }
+        let mut app = match self.app.try_borrow_mut() {
+            Ok(app) => app,
+            Err(_) => return false,
+        };
+        if !app.state.visible || app.state.lifecycle != Lifecycle::Running || app.state.modal_open {
+            return false;
+        }
+        app.state.composing = self.composing.get();
+        let key = msg.wParam.0 as u32;
+        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        // Native IsDialogMessage handles Enter for a focused Button. Only the
+        // search/list result surfaces activate the chosen stored item.
+        if key == VK_RETURN.0 as u32 && app.buttons.contains(&msg.hwnd) {
+            return false;
+        }
+        let panel_key = match key {
+            k if k == VK_ESCAPE.0 as u32 => Some(PanelKey::Escape),
+            k if k == VK_RETURN.0 as u32 => Some(PanelKey::Enter),
+            k if k == VK_UP.0 as u32 => Some(PanelKey::Up),
+            k if k == VK_DOWN.0 as u32 => Some(PanelKey::Down),
+            _ => None,
+        };
+        if let Some(panel_key) = panel_key {
+            match app.state.key(panel_key) {
+                KeyAction::NativeInput => return false,
+                KeyAction::Hide => app.hide(),
+                KeyAction::Activate => app.request(Action::Open(shift)),
+                action => {
+                    let old = app.state.selected_index().unwrap_or(0);
+                    let index = if action == KeyAction::SelectPrevious {
+                        old.saturating_sub(1)
+                    } else {
+                        (old + 1).min(app.items.len().saturating_sub(1))
+                    };
+                    SendMessageW(app.list, LB_SETCURSEL, Some(WPARAM(index)), None);
+                    app.selection();
+                }
+            }
+            return true;
+        }
+        match key {
+            67 if ctrl => {
+                let (mut start, mut end) = (0u32, 0u32);
+                SendMessageW(
+                    app.edit,
+                    EM_GETSEL,
+                    Some(WPARAM((&mut start as *mut u32) as usize)),
+                    Some(LPARAM((&mut end as *mut u32) as isize)),
+                );
+                if start != end {
+                    SendMessageW(app.edit, WM_COPY, None, None);
+                    app.suppress_sequence = Some(clipboard::sequence_number());
+                } else {
+                    app.request(Action::Copy(false));
+                }
+                true
+            }
+            75 if ctrl => {
+                let mut p = POINT::default();
+                let _ = GetCursorPos(&mut p);
+                app.context(p.x, p.y, false, false);
+                true
+            }
+            49..=52 if ctrl => {
+                app.command(300 + (key - 49) as usize);
+                true
+            }
+            _ => false,
+        }
+    }
+    /// This path also runs inside native modal pumps; it never waits for a dialog to close.
+    unsafe fn end_session(&self, hwnd: HWND) {
+        {
+            let mut app = self.app.borrow_mut();
+            app.cancel_actions();
+            app.clear_preview();
+            if app.state.begin_exit() {
+                app.send(Command::Shutdown);
+            } else if app.state.lifecycle == Lifecycle::SaveFailed {
+                app.state.retry_exit();
+                app.send(Command::Shutdown);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let finished = {
+                let mut app = self.app.borrow_mut();
+                app.work_done();
+                matches!(
+                    app.engine
+                        .as_ref()
+                        .and_then(|engine| engine.try_recv().ok()),
+                    Some(Event::ExitReady | Event::Error { .. })
+                )
+            };
+            if finished {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = DestroyWindow(hwnd);
+        std::process::exit(0);
+    }
+    /// Effect payloads own all dialog/menu inputs. No RefMut<App> survives this pump.
+    unsafe fn drain_effects(&self) {
+        if self.effects_running.replace(true) {
+            return;
+        }
+        loop {
+            let effect = {
+                let mut app = match self.app.try_borrow_mut() {
+                    Ok(app) => app,
+                    Err(_) => break,
+                };
+                let effect = app.effects.pop_front();
+                if let Some(effect) = &effect {
+                    if app.state.lifecycle != Lifecycle::Running
+                        && !matches!(
+                            effect,
+                            UiEffect::ExitError { .. }
+                                | UiEffect::Message { .. }
+                                | UiEffect::Destroy(_)
+                        )
+                    {
+                        continue;
+                    }
+                    app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
+                }
+                effect
+            };
+            let Some(effect) = effect else {
+                break;
+            };
+            match effect {
+                UiEffect::Picker {
+                    owner,
+                    folder,
+                    item,
+                } => {
+                    let result = dialogs::pick(owner, folder);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    match result {
+                        Ok(Some(path)) => app.edit_favorite(item, Some(path)),
+                        Ok(None) => {}
+                        Err(error) => app.status(&error),
+                    }
+                }
+                UiEffect::Favorite {
+                    owner,
+                    item,
+                    kind,
+                    fields,
+                } => {
+                    let result = dialogs::form(owner, "编辑收藏", &fields);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if let Some(values) = result {
+                        app.apply_favorite(item, kind, values);
+                    }
+                }
+                UiEffect::Settings { owner, settings } => {
+                    let result = dialogs::settings_form(
+                        owner,
+                        match settings.theme {
+                            Theme::System => 0,
+                            Theme::Light => 1,
+                            Theme::Dark => 2,
+                        },
+                        format_hotkey(settings.hotkey_modifiers, settings.hotkey_key),
+                        format_hotkey(
+                            settings.clipboard_hotkey_modifiers,
+                            settings.clipboard_hotkey_key,
+                        ),
+                        settings.capture_paused,
+                        settings.excluded_apps.join(", "),
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if let Some(values) = result {
+                        app.apply_settings(values);
+                    }
+                }
+                UiEffect::ExitError { owner, message } => {
+                    let text = wide(&format!(
+                        "保存失败，数据仍保留在内存中。\n{message}\n\n重试保存，或取消退出？"
+                    ));
+                    let answer = MessageBoxW(
+                        Some(owner),
+                        PCWSTR(text.as_ptr()),
+                        w!("保存后退出"),
+                        MB_RETRYCANCEL | MB_ICONERROR,
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if answer == IDRETRY {
+                        app.state.retry_exit();
+                        app.send(Command::Shutdown);
+                    } else {
+                        app.send(Command::CancelShutdown);
+                        app.state.cancel_exit();
+                        app.last_capture_sequence = 0;
+                        app.capture();
+                        app.show(None);
+                    }
+                }
+                UiEffect::Message { owner, message } => {
+                    let text = wide(&message);
+                    MessageBoxW(
+                        Some(owner),
+                        PCWSTR(text.as_ptr()),
+                        w!("快捷面板"),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    self.app.borrow_mut().state.modal_open = false;
+                }
+                UiEffect::Menu {
+                    owner,
+                    x,
+                    y,
+                    entries,
+                } => {
+                    if let Ok(menu) = CreatePopupMenu() {
+                        for (id, title) in entries {
+                            let text = wide(title);
+                            let _ = AppendMenuW(menu, MF_STRING, id, PCWSTR(text.as_ptr()));
+                        }
+                        let _ = SetForegroundWindow(owner);
+                        let command = TrackPopupMenu(
+                            menu,
+                            TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                            x,
+                            y,
+                            None,
+                            owner,
+                            None,
+                        )
+                        .0 as usize;
+                        let _ = DestroyMenu(menu);
+                        let mut app = self.app.borrow_mut();
+                        app.state.modal_open = false;
+                        app.command(command);
+                    } else {
+                        self.app.borrow_mut().state.modal_open = false;
+                    }
+                }
+                UiEffect::Destroy(hwnd) => {
+                    let _ = DestroyWindow(hwnd);
+                }
+            }
+        }
+        self.effects_running.set(false);
+    }
 }

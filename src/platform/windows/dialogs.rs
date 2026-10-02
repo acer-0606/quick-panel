@@ -1,5 +1,6 @@
 //! Small native dialogs keep every editable field in a real Win32 Edit control.
 use super::theme;
+use std::cell::RefCell;
 use windows::{
     Win32::{
         Foundation::*,
@@ -45,6 +46,16 @@ enum Field {
     Choice(usize),
     Toggle(bool),
 }
+struct FormWindow(HWND);
+impl Drop for FormWindow {
+    fn drop(&mut self) {
+        unsafe {
+            if IsWindow(Some(self.0)).as_bool() {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+}
 struct Form {
     edits: Vec<HWND>,
     done: bool,
@@ -56,17 +67,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             let cs = &*(lp.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
         }
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Form;
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<Form>;
         if !ptr.is_null() {
-            let f = &mut *ptr;
             match msg {
                 WM_COMMAND if (wp.0 & 0xffff) == 1 || (wp.0 & 0xffff) == 2 => {
+                    let mut f = (*ptr).borrow_mut();
                     f.accepted = (wp.0 & 0xffff) == 1;
                     f.done = true;
                     return LRESULT(0);
                 }
                 WM_CLOSE => {
-                    f.done = true;
+                    (*ptr).borrow_mut().done = true;
                     return LRESULT(0);
                 }
                 _ => {}
@@ -121,11 +132,11 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let mut state = Box::new(Form {
+        let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
             done: false,
             accepted: false,
-        });
+        }));
         let title = wide(title);
         let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
         let scale = |v: i32| v * (dpi as i32) / 96;
@@ -144,9 +155,10 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             Some(owner),
             None,
             Some(instance.into()),
-            Some((&mut *state as *mut Form).cast()),
+            Some((&*state as *const RefCell<Form>).cast()),
         )
         .ok()?;
+        let _window_guard = FormWindow(hwnd);
         let font = theme::font(dpi);
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
@@ -221,7 +233,7 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 }
                 Field::Text(_) => {}
             }
-            state.edits.push(e);
+            state.borrow_mut().edits.push(e);
         }
         for (id, label, x) in [(1, "保存", 300), (2, "取消", 398)] {
             let s = wide(label);
@@ -244,12 +256,16 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
         }
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        if let Some(e) = state.edits.first() {
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(*e));
+        let first_edit = state.borrow().edits.first().copied();
+        if let Some(e) = first_edit {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(e));
         }
         let mut msg = MSG::default();
         let mut quit = None;
-        while !state.done {
+        loop {
+            if state.borrow().done {
+                break;
+            }
             let status = GetMessageW(&mut msg, None, 0, 0);
             if status.0 <= 0 {
                 quit = Some(msg.wParam.0 as i32);
@@ -269,7 +285,7 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 false
             };
             if msg.message == WM_KEYDOWN && msg.wParam.0 == 27 && !composing {
-                state.done = true;
+                state.borrow_mut().done = true;
                 continue;
             }
             if composing || !IsDialogMessageW(hwnd, &msg).as_bool() {
@@ -277,9 +293,12 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 DispatchMessageW(&msg);
             }
         }
-        let result = state.accepted.then(|| {
-            state
-                .edits
+        let (accepted, edits) = {
+            let state = state.borrow();
+            (state.accepted, state.edits.clone())
+        };
+        let result = accepted.then(|| {
+            edits
                 .iter()
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
