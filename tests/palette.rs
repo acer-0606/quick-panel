@@ -241,3 +241,66 @@ fn disabled_ai_hides_search_action_but_configuration_remains_searchable() {
             .any(|row| row.function() == Some(Function::AiSearch))
     );
 }
+
+#[test]
+fn embedding_actions_are_searchable_only_when_available() {
+    let disabled = Context::default();
+    assert!(
+        palette::results("语义检索设置", vec![], disabled)
+            .iter()
+            .any(|e| e.function() == Some(Function::EmbeddingSettings))
+    );
+    for (query, action) in [
+        ("语义查找", Function::SemanticSearch),
+        ("更新语义索引", Function::UpdateSemanticIndex),
+        ("取消索引", Function::CancelSemanticIndex),
+    ] {
+        assert!(
+            !palette::results(query, vec![], disabled)
+                .iter()
+                .any(|e| e.function() == Some(action))
+        );
+        let enabled = Context {
+            embedding_enabled: true,
+            indexing: true,
+            ..disabled
+        };
+        assert!(
+            palette::results(query, vec![], enabled)
+                .iter()
+                .any(|e| e.function() == Some(action))
+        );
+    }
+    assert!(
+        !palette::results(
+            "取消索引",
+            vec![],
+            Context {
+                embedding_enabled: true,
+                ..disabled
+            }
+        )
+        .iter()
+        .any(|e| e.function() == Some(Function::CancelSemanticIndex))
+    );
+}
+
+#[test]
+fn semantic_saved_order_survives_exact_function_coexistence() {
+    let entries = palette::semantic_results(
+        "设置",
+        vec![
+            saved("cosine-first", "网络资料", ItemKind::Clipboard),
+            saved("lexical-later", "设置", ItemKind::Clipboard),
+        ],
+        Context::default(),
+    );
+    assert_eq!(entries[0].function(), Some(Function::Settings));
+    assert_eq!(
+        entries
+            .iter()
+            .filter_map(|e| e.saved().map(|s| s.id.as_str()))
+            .collect::<Vec<_>>(),
+        ["cosine-first", "lexical-later"]
+    );
+}

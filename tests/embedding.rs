@@ -334,7 +334,11 @@ fn candidate_removes_unsupported_controls_before_prepare_and_worker_admission() 
     saved.text = "甲\n乙\r丙\t丁\u{1}\u{c}尾".into();
     let original = saved.clone();
     let candidate = candidate(&saved, IndexScope::AllText).unwrap();
-    let prepared = embedding::prepare(&settings(), "fixture-key", &[candidate.text.clone()]);
+    let prepared = embedding::prepare(
+        &settings(),
+        "fixture-key",
+        std::slice::from_ref(&candidate.text),
+    );
     let (completed, completions) = mpsc::channel();
     let worker = EmbeddingWorker::start(
         |request| {

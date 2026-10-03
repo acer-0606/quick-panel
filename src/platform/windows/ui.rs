@@ -7,10 +7,13 @@ use super::{
 use crate::{
     ai::{AiPlan, AiSettings, AuthMethod},
     ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
+    embedding_jobs::{EmbeddingRequest, EmbeddingWorker},
     engine::Engine,
     hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
     model::*,
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
+    semantic::{self, EmbeddingSettings, IndexScope},
+    semantic_ui::{IndexSession, QuerySession, cancel_semantic_view, sync_semantic_view},
     ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
 };
 use std::{
@@ -47,6 +50,10 @@ const SETTINGS: usize = 104;
 const AI_FIND: usize = 105;
 const GENERAL_SETTINGS: usize = 106;
 const AI_SETTINGS: usize = 107;
+const SEMANTIC_FIND: usize = 108;
+const EMBEDDING_SETTINGS: usize = 109;
+const INDEX_START: usize = 110;
+const INDEX_CANCEL: usize = 111;
 const OPEN: usize = 200;
 const COPY: usize = 201;
 const PLAIN: usize = 202;
@@ -137,6 +144,13 @@ enum UiEffect {
     AiSettings {
         owner: HWND,
         settings: AiSettings,
+    },
+    EmbeddingSettings {
+        owner: HWND,
+        settings: EmbeddingSettings,
+    },
+    SemanticPrompt {
+        owner: HWND,
     },
     AiPrompt {
         owner: HWND,
@@ -253,6 +267,7 @@ struct App {
     footer: HWND,
     preview: HWND,
     ai_button: HWND,
+    semantic_button: HWND,
     buttons: Vec<HWND>,
     font: HFONT,
     brush: HBRUSH,
@@ -267,6 +282,10 @@ struct App {
     ai_worker: Option<AiWorker>,
     ai_gate: AiResultGate,
     ai_plan: Option<AiPlan>,
+    semantic_query: QuerySession,
+    semantic_index: IndexSession,
+    query_worker: Option<EmbeddingWorker>,
+    index_worker: Option<EmbeddingWorker>,
     scope: Scope,
     target: HWND,
     load_id: u64,
@@ -417,6 +436,7 @@ pub fn run() -> Result<(), String> {
             footer: HWND::default(),
             preview: HWND::default(),
             ai_button: HWND::default(),
+            semantic_button: HWND::default(),
             buttons: Vec::new(),
             font: HFONT::default(),
             brush: HBRUSH::default(),
@@ -431,6 +451,10 @@ pub fn run() -> Result<(), String> {
             ai_worker: None,
             ai_gate: AiResultGate::default(),
             ai_plan: None,
+            semantic_query: QuerySession::default(),
+            semantic_index: IndexSession::default(),
+            query_worker: None,
+            index_worker: None,
             scope: Scope::All,
             target: HWND::default(),
             load_id: 0,
@@ -638,6 +662,7 @@ impl App {
         {
             return;
         }
+        self.cancel_semantic();
         self.cancel_actions();
         if self.ai_gate.busy() {
             self.cancel_ai();
@@ -659,6 +684,9 @@ impl App {
             self.status("请输入不超过 2048 字的检索描述");
             return;
         }
+        // Switching from adopted semantic rows also refreshes ordinary results.
+        self.cancel_ai();
+        self.search();
         if self.ai_worker.is_none() {
             let handle = self.hwnd.0 as usize;
             self.ai_worker = Some(AiWorker::start(
@@ -680,6 +708,8 @@ impl App {
             preview_open: self.preview_open,
             content_ready: self.saved_ready,
             ai_enabled: true,
+            embedding_enabled: self.settings.embedding.enabled,
+            indexing: self.semantic_index.active(),
         });
         let request = AiRequest {
             settings: self.settings.ai.clone(),
@@ -720,6 +750,286 @@ impl App {
             }
             Err(message) => self.status(&format!("{message} · 本地检索仍可使用")),
         }
+    }
+    unsafe fn cancel_semantic(&mut self) {
+        if let Some(worker) = &self.query_worker {
+            worker.cancel();
+        }
+        if self.semantic_query.busy() || self.semantic_query.adopted() {
+            cancel_semantic_view(
+                &mut self.semantic_query,
+                &mut self.state,
+                &mut self.saved_items,
+                &mut self.saved_ready,
+            );
+            self.cancel_actions();
+            self.items.clear();
+            self.clear_preview();
+            self.rebuild_results();
+        }
+        let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+    }
+    fn embedding_worker(&self) -> EmbeddingWorker {
+        let handle = self.hwnd.0 as usize;
+        EmbeddingWorker::start(
+            |request| ai_client::embed(&request.settings, &request.inputs),
+            Arc::new(move || unsafe { post(handle, WORK_WAKE) }),
+        )
+    }
+    unsafe fn begin_semantic(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running
+            || self.state.modal_open
+            || !self.state.visible
+        {
+            return;
+        }
+        if self.semantic_query.busy() || self.semantic_query.adopted() {
+            self.cancel_semantic();
+            self.search();
+            self.status("已取消语义查找，恢复普通检索");
+            return;
+        }
+        self.cancel_ai();
+        if !self.settings.embedding.enabled {
+            self.embedding_settings();
+            return;
+        }
+        let query = dialogs::text(self.edit);
+        if ["语义查找", "语义搜索", "向量检索"].contains(&query.trim()) {
+            self.effects
+                .push_back(UiEffect::SemanticPrompt { owner: self.hwnd });
+            return;
+        }
+        if query.trim().is_empty() || query.chars().count() > semantic::MAX_INPUT_CHARS {
+            self.status("请输入不超过 4096 字的语义查询");
+            return;
+        }
+        let profile = match semantic::profile_id(&self.settings.embedding) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.status(&message);
+                return;
+            }
+        };
+        if self.query_worker.is_none() {
+            self.query_worker = Some(self.embedding_worker());
+        }
+        // Return immediately to ordinary results while the query vector is computed.
+        self.search();
+        match self
+            .query_worker
+            .as_ref()
+            .unwrap()
+            .submit(EmbeddingRequest {
+                settings: self.settings.embedding.clone(),
+                inputs: vec![query.clone()],
+            }) {
+            Ok(id) => {
+                self.semantic_query.begin(id, &query, self.scope, &profile);
+                let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
+                self.status("语义查询处理中…普通结果仍可使用");
+            }
+            Err(message) => self.status(&message),
+        }
+    }
+    unsafe fn embedding_done(&mut self) {
+        let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+        if let Some(completion) = self
+            .query_worker
+            .as_ref()
+            .and_then(EmbeddingWorker::try_result)
+        {
+            let query = dialogs::text(self.edit);
+            let active = self.settings.embedding.enabled
+                && self.state.visible
+                && !self.state.modal_open
+                && self.state.lifecycle == Lifecycle::Running;
+            if self
+                .semantic_query
+                .current(completion.id, &query, self.scope, &profile, active)
+            {
+                match completion.result {
+                    Ok(mut vectors) if vectors.len() == 1 => {
+                        if self.semantic_query.finish(
+                            completion.id,
+                            &query,
+                            self.scope,
+                            &profile,
+                            active,
+                            vectors.remove(0),
+                        ) {
+                            self.saved_items.clear();
+                            self.saved_ready = false;
+                            self.clear_preview();
+                            self.search();
+                            let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
+                        }
+                    }
+                    Ok(_) => {
+                        self.cancel_semantic();
+                        self.status("Embedding API 返回的查询向量无效");
+                    }
+                    Err(message) => {
+                        self.cancel_semantic();
+                        self.search();
+                        self.status(&message);
+                    }
+                }
+            }
+        }
+        if let Some(completion) = self
+            .index_worker
+            .as_ref()
+            .and_then(EmbeddingWorker::try_result)
+            && self.semantic_index.network_current(completion.id, &profile)
+        {
+            match completion.result {
+                Ok(vectors) => {
+                    if let Some(command) =
+                        self.semantic_index
+                            .network_result(completion.id, &profile, vectors)
+                    {
+                        self.send_index(command);
+                    } else {
+                        self.cancel_index();
+                        self.status("Embedding API 返回的索引向量无效");
+                    }
+                }
+                Err(message) => {
+                    self.cancel_index();
+                    self.status(&message);
+                }
+            }
+        }
+    }
+    unsafe fn send_index(&mut self, command: Command) {
+        if let Some(engine) = &self.engine
+            && let Err(message) = engine.send(command)
+        {
+            self.cancel_index();
+            self.status(&message);
+        }
+    }
+    unsafe fn begin_index(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running
+            || !self.settings.embedding.enabled
+            || self.semantic_index.active()
+        {
+            return;
+        }
+        let profile = match semantic::profile_id(&self.settings.embedding) {
+            Ok(profile) => profile,
+            Err(message) => {
+                self.status(&message);
+                return;
+            }
+        };
+        if self.index_worker.is_none() {
+            self.index_worker = Some(self.embedding_worker());
+        }
+        let command = self.semantic_index.begin(&profile);
+        self.send_index(command);
+        self.rebuild_results();
+        self.status("正在建立语义索引…仅发送选定范围的保存文本和元数据");
+    }
+    unsafe fn cancel_index(&mut self) {
+        if let Some(worker) = &self.index_worker {
+            worker.cancel();
+        }
+        self.semantic_index.cancel();
+        self.rebuild_results();
+    }
+    unsafe fn index_status(&mut self) {
+        self.rebuild_results();
+        self.status(&format!(
+            "语义索引{} · 已接收 {} 条",
+            if self.semantic_index.active() {
+                "更新中"
+            } else {
+                "完成"
+            },
+            self.semantic_index.accepted()
+        ));
+    }
+    unsafe fn index_batch(&mut self, batch: semantic::IndexBatch) {
+        if self.state.lifecycle != Lifecycle::Running || !self.settings.embedding.enabled {
+            return;
+        }
+        let Some(inputs) = self.semantic_index.accept_batch(batch) else {
+            return;
+        };
+        if inputs.is_empty() {
+            if let Some(command) = self.semantic_index.empty_page() {
+                self.send_index(command);
+            } else {
+                self.index_status();
+            }
+            return;
+        }
+        let Some(worker) = &self.index_worker else {
+            self.cancel_index();
+            return;
+        };
+        match worker.submit(EmbeddingRequest {
+            settings: self.settings.embedding.clone(),
+            inputs,
+        }) {
+            Ok(id) => self.semantic_index.network_started(id),
+            Err(message) => {
+                self.cancel_index();
+                self.status(&message);
+            }
+        }
+    }
+    unsafe fn embedding_settings(&mut self) {
+        self.cancel_semantic();
+        self.cancel_ai();
+        self.effects.push_back(UiEffect::EmbeddingSettings {
+            owner: self.hwnd,
+            settings: self.settings.embedding.clone(),
+        });
+    }
+    unsafe fn apply_embedding_settings(&mut self, mut values: Vec<String>) -> Result<(), String> {
+        let password = ai_client::SecretString(std::mem::take(&mut values[3]));
+        if self.state.lifecycle != Lifecycle::Running {
+            return Ok(());
+        }
+        let mut next = self.settings.embedding.clone();
+        next.enabled = values[0] == "1";
+        next.endpoint = values[1].trim().into();
+        next.model = values[2].trim().into();
+        next.index_scope = if values[5] == "1" {
+            IndexScope::AllText
+        } else {
+            IndexScope::PinnedAndFavorites
+        };
+        if values[4] == "1" {
+            if !password.0.is_empty() {
+                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
+            }
+            next.encrypted_key.clear();
+            next.enabled = false;
+        } else if !password.0.is_empty() {
+            if password.0.len() > 4096 || !password.0.bytes().all(|byte| (33..=126).contains(&byte))
+            {
+                return Err("Embedding API Key 格式无效，配置未保存".into());
+            }
+            next.encrypted_key = ai_client::protect_key(&password.0)?;
+        }
+        if next.enabled {
+            ai_client::validate_embedding_settings(&next)
+                .map_err(|message| format!("{message}，语义配置未保存"))?;
+        } else if !next.endpoint.is_empty()
+            && crate::embedding::parse_endpoint(&next.endpoint).is_err()
+        {
+            return Err("Embedding API 地址无效，配置未保存".into());
+        }
+        self.cancel_semantic();
+        self.cancel_index();
+        self.settings.embedding = next;
+        self.send(Command::SaveSettings(self.settings.clone()));
+        self.retheme();
+        Ok(())
     }
     unsafe fn clear_preview(&mut self) {
         self.load_id = self.load_id.wrapping_add(1);
@@ -805,6 +1115,7 @@ impl App {
         )?;
         self.preview = self.control(w!("STATIC"), "", WINDOW_STYLE(0), 110)?;
         self.ai_button = self.control(w!("BUTTON"), "按意思查找", WS_TABSTOP, AI_FIND)?;
+        self.semantic_button = self.control(w!("BUTTON"), "语义查找", WS_TABSTOP, SEMANTIC_FIND)?;
         let _ = ShowWindow(self.preview, SW_HIDE);
         for (id, title) in [
             (ADD, "添加 ＋"),
@@ -853,7 +1164,7 @@ impl App {
         for h in [self.edit, self.list, self.footer, self.preview]
             .into_iter()
             .chain(self.buttons.iter().copied())
-            .chain(std::iter::once(self.ai_button))
+            .chain([self.ai_button, self.semantic_button])
         {
             SendMessageW(
                 h,
@@ -865,6 +1176,14 @@ impl App {
         let _ = ShowWindow(
             self.ai_button,
             if self.settings.ai.enabled {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = ShowWindow(
+            self.semantic_button,
+            if self.settings.embedding.enabled {
                 SW_SHOW
             } else {
                 SW_HIDE
@@ -898,16 +1217,28 @@ impl App {
         } else {
             0
         };
+        let semantic_width = if self.settings.embedding.enabled {
+            self.s(114)
+        } else {
+            0
+        };
         mov(
             self.edit,
             edge,
             self.s(18),
-            (w - self.s(126) - ai_width).max(self.s(80)),
+            (w - self.s(126) - ai_width - semantic_width).max(self.s(80)),
             self.s(36),
         );
         mov(
             self.ai_button,
             w - self.s(212),
+            self.s(18),
+            self.s(106),
+            self.s(36),
+        );
+        mov(
+            self.semantic_button,
+            w - self.s(98) - ai_width - self.s(114),
             self.s(18),
             self.s(106),
             self.s(36),
@@ -1048,6 +1379,7 @@ impl App {
         self.search();
     }
     unsafe fn hide(&mut self) {
+        self.cancel_semantic();
         self.cancel_ai();
         self.cancel_actions();
         self.clear_preview();
@@ -1074,14 +1406,37 @@ impl App {
             );
         }
         let query = dialogs::text(self.edit);
+        let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+        let active =
+            self.settings.embedding.enabled && self.state.visible && !self.state.modal_open;
+        if sync_semantic_view(
+            &mut self.semantic_query,
+            &mut self.state,
+            &mut self.saved_items,
+            &mut self.saved_ready,
+            (&query, self.scope, &profile, active),
+        ) {
+            if let Some(worker) = &self.query_worker {
+                worker.cancel();
+            }
+            self.items.clear();
+            self.clear_preview();
+            let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+        }
         if query != self.query || self.scope != self.result_scope {
             self.cancel_ai();
+            self.cancel_semantic();
             self.saved_items.clear();
             self.saved_ready = false;
         }
         self.query = query;
         self.result_scope = self.scope;
         let id = self.state.next_request();
+        if let Some(query) = self.semantic_query.local_query(id) {
+            self.rebuild_results();
+            self.send(Command::SemanticSearch(query));
+            return;
+        }
         if let Some(plan) = self.ai_plan.as_ref() {
             let (from_ms, until_ms) = match ai_time::period_bounds(plan.period) {
                 Ok(bounds) => bounds,
@@ -1121,9 +1476,13 @@ impl App {
             preview_open: self.preview_open,
             content_ready: self.saved_ready,
             ai_enabled: self.settings.ai.enabled,
+            embedding_enabled: self.settings.embedding.enabled,
+            indexing: self.semantic_index.active(),
         };
         self.items = if let Some(plan) = self.ai_plan.as_ref() {
             palette::ai_results(plan, self.saved_items.clone(), context)
+        } else if self.semantic_query.adopted() {
+            palette::semantic_results(&self.query, self.saved_items.clone(), context)
         } else {
             palette::results(&self.query, self.saved_items.clone(), context)
         };
@@ -1167,6 +1526,7 @@ impl App {
     }
     unsafe fn work_done(&mut self) {
         self.ai_done();
+        self.embedding_done();
         while let Ok(done) = self.rx.try_recv() {
             match done {
                 Done::Captured(result) => {
@@ -1213,6 +1573,22 @@ impl App {
                     }
                     self.tray(NIM_MODIFY);
                     self.search();
+                }
+                Event::SemanticBatch(batch) => self.index_batch(batch),
+                Event::EmbeddingsStored {
+                    request_id,
+                    accepted,
+                } => {
+                    let was_active = self.semantic_index.active();
+                    if let Some(command) = self.semantic_index.acknowledge(request_id, accepted) {
+                        self.send_index(command);
+                    }
+                    if was_active {
+                        self.index_status();
+                    }
+                    if self.state.visible && self.semantic_query.adopted() {
+                        self.search();
+                    }
                 }
                 Event::Results { request_id, items } => {
                     if self.state.is_current(request_id) {
@@ -1274,6 +1650,8 @@ impl App {
                             message,
                         });
                     } else if !exiting {
+                        // Admission/profile failures have no store acknowledgement.
+                        self.cancel_index();
                         self.status(&message);
                     }
                 }
@@ -1578,11 +1956,22 @@ impl App {
             entries: vec![
                 (GENERAL_SETTINGS, "常规设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
+                (EMBEDDING_SETTINGS, "语义检索设置…"),
             ],
             target: None,
         });
+        if self.settings.embedding.enabled
+            && let Some(UiEffect::Menu { entries, .. }) = self.effects.back_mut()
+        {
+            entries.push(if self.semantic_index.active() {
+                (INDEX_CANCEL, "取消索引")
+            } else {
+                (INDEX_START, "建立/更新语义索引")
+            });
+        }
     }
     unsafe fn ai_settings(&mut self) {
+        self.cancel_semantic();
         self.cancel_ai();
         self.effects.push_back(UiEffect::AiSettings {
             owner: self.hwnd,
@@ -1683,6 +2072,7 @@ impl App {
                 (221, "打开面板"),
                 (GENERAL_SETTINGS, "常规设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
+                (EMBEDDING_SETTINGS, "语义检索设置…"),
                 (222, "暂停 / 恢复记录"),
                 (EXIT, "保存后退出"),
             ]
@@ -1731,7 +2121,10 @@ impl App {
     }
     unsafe fn execute_function(&mut self, function: Function) {
         self.cancel_actions();
-        if function != Function::Exit && function != Function::AiSearch {
+        if function != Function::Exit
+            && function != Function::AiSearch
+            && function != Function::SemanticSearch
+        {
             // Result commands return to browsing content. Scope and preview
             // commands read the cleared native Edit through their normal handler.
             let _ = SetWindowTextW(self.edit, w!(""));
@@ -1740,6 +2133,10 @@ impl App {
             Function::Settings => self.settings(),
             Function::AiSettings => self.ai_settings(),
             Function::AiSearch => self.begin_ai(),
+            Function::EmbeddingSettings => self.embedding_settings(),
+            Function::SemanticSearch => self.begin_semantic(),
+            Function::UpdateSemanticIndex => self.begin_index(),
+            Function::CancelSemanticIndex => self.cancel_index(),
             Function::AddFolder => self.command(223),
             Function::AddDocument => self.command(224),
             Function::PauseCapture if !self.settings.capture_paused => self.command(222),
@@ -1786,7 +2183,12 @@ impl App {
             GENERAL_SETTINGS => self.settings(),
             AI_SETTINGS => self.ai_settings(),
             AI_FIND => self.begin_ai(),
+            SEMANTIC_FIND => self.begin_semantic(),
+            EMBEDDING_SETTINGS => self.embedding_settings(),
+            INDEX_START => self.begin_index(),
+            INDEX_CANCEL => self.cancel_index(),
             300..=303 => {
+                self.cancel_semantic();
                 self.cancel_ai();
                 self.scope = match id {
                     301 => Scope::Clipboard,
@@ -1818,6 +2220,8 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.cancel_index();
+                self.cancel_semantic();
                 self.cancel_ai();
                 self.cancel_actions();
                 self.clear_preview();
@@ -2312,7 +2716,9 @@ impl Host {
         // Native IsDialogMessage handles Enter for a focused Button. Only the
         // search/list result surfaces activate the chosen stored item.
         if key == VK_RETURN.0 as u32
-            && (app.buttons.contains(&msg.hwnd) || msg.hwnd == app.ai_button)
+            && (app.buttons.contains(&msg.hwnd)
+                || msg.hwnd == app.ai_button
+                || msg.hwnd == app.semantic_button)
         {
             return false;
         }
@@ -2376,6 +2782,9 @@ impl Host {
     unsafe fn end_session(&self, hwnd: HWND) {
         {
             let mut app = self.app.borrow_mut();
+            app.cancel_index();
+            app.cancel_semantic();
+            app.cancel_ai();
             app.cancel_actions();
             app.clear_preview();
             if app.state.begin_exit() {
@@ -2434,6 +2843,7 @@ impl Host {
                         continue;
                     }
                     app.stop_ai_request();
+                    app.cancel_semantic();
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
                 effect
@@ -2501,6 +2911,35 @@ impl Host {
                     app.search();
                     if let Some(message) = error {
                         app.effects.push_back(UiEffect::Message { owner, message });
+                    }
+                }
+                UiEffect::EmbeddingSettings { owner, settings } => {
+                    let result = dialogs::embedding_settings_form(owner, &settings);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    let error =
+                        result.and_then(|values| app.apply_embedding_settings(values).err());
+                    app.search();
+                    if let Some(message) = error {
+                        app.effects.push_back(UiEffect::Message { owner, message });
+                    }
+                }
+                UiEffect::SemanticPrompt { owner } => {
+                    let result = dialogs::form(
+                        owner,
+                        "语义查找",
+                        &[(
+                            "本次查询发送给独立 Embedding 服务（最多 4096 字）",
+                            String::new(),
+                        )],
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if let Some(values) = result {
+                        let text = wide(&values[0]);
+                        let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
+                        app.search();
+                        app.begin_semantic();
                     }
                 }
                 UiEffect::AiPrompt { owner } => {

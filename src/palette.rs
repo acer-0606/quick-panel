@@ -11,6 +11,10 @@ pub enum Function {
     Settings,
     AiSettings,
     AiSearch,
+    EmbeddingSettings,
+    SemanticSearch,
+    UpdateSemanticIndex,
+    CancelSemanticIndex,
     AddFolder,
     AddDocument,
     PauseCapture,
@@ -29,6 +33,10 @@ impl Function {
             Self::Settings => "function:settings",
             Self::AiSettings => "function:ai-settings",
             Self::AiSearch => "function:ai-search",
+            Self::EmbeddingSettings => "function:embedding-settings",
+            Self::SemanticSearch => "function:semantic-search",
+            Self::UpdateSemanticIndex => "function:update-semantic-index",
+            Self::CancelSemanticIndex => "function:cancel-semantic-index",
             Self::AddFolder => "function:add-folder",
             Self::AddDocument => "function:add-document",
             Self::PauseCapture => "function:pause",
@@ -50,6 +58,8 @@ pub struct Context {
     pub preview_open: bool,
     pub content_ready: bool,
     pub ai_enabled: bool,
+    pub embedding_enabled: bool,
+    pub indexing: bool,
 }
 impl Default for Context {
     fn default() -> Self {
@@ -58,6 +68,8 @@ impl Default for Context {
             preview_open: false,
             content_ready: true,
             ai_enabled: false,
+            embedding_enabled: false,
+            indexing: false,
         }
     }
 }
@@ -134,6 +146,34 @@ struct Spec {
     keywords: &'static [&'static str],
 }
 const CATALOG: &[Spec] = &[
+    Spec {
+        action: Function::EmbeddingSettings,
+        title: "语义检索设置",
+        description: "配置独立 Embedding API、密钥和索引范围",
+        alias: "向量设置",
+        keywords: &["Embedding配置", "语义配置"],
+    },
+    Spec {
+        action: Function::SemanticSearch,
+        title: "语义查找",
+        description: "发送本次查询，检索已建立的语义索引",
+        alias: "语义搜索",
+        keywords: &["向量检索"],
+    },
+    Spec {
+        action: Function::UpdateSemanticIndex,
+        title: "建立/更新语义索引",
+        description: "发送选定范围的保存文本与元数据，逐批建立索引",
+        alias: "更新语义索引",
+        keywords: &["建立索引", "向量索引"],
+    },
+    Spec {
+        action: Function::CancelSemanticIndex,
+        title: "取消索引",
+        description: "停止后续批次，保留已接收向量",
+        alias: "取消语义索引",
+        keywords: &["停止索引"],
+    },
     Spec {
         action: Function::AiSettings,
         title: "AI检索设置",
@@ -237,6 +277,8 @@ const CATALOG: &[Spec] = &[
 fn available(action: Function, context: Context) -> bool {
     match action {
         Function::AiSearch => context.ai_enabled,
+        Function::SemanticSearch | Function::UpdateSemanticIndex => context.embedding_enabled,
+        Function::CancelSemanticIndex => context.embedding_enabled && context.indexing,
         Function::PauseCapture => !context.capture_paused,
         Function::ResumeCapture => context.capture_paused,
         Function::ShowPreview => !context.preview_open,
@@ -360,6 +402,25 @@ pub fn results(query: &str, saved: Vec<ItemSummary>, context: Context) -> Vec<En
             Entry::Saved(item) => search::rank(item, query),
         })
     });
+    entries.truncate(50);
+    entries
+}
+
+/// Keep actor hybrid/cosine ordering intact; function hits stay searchable.
+pub fn semantic_results(query: &str, saved: Vec<ItemSummary>, context: Context) -> Vec<Entry> {
+    let functions = results(
+        query,
+        vec![],
+        Context {
+            content_ready: false,
+            ..context
+        },
+    );
+    let mut entries: Vec<_> = functions
+        .into_iter()
+        .filter(|entry| matches!(entry, Entry::Function(_)))
+        .collect();
+    entries.extend(saved.into_iter().map(Entry::Saved));
     entries.truncate(50);
     entries
 }

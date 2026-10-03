@@ -239,7 +239,11 @@ fn query_number(handle: &InternetHandle, kind: u32) -> Result<u32, String> {
     Ok(number)
 }
 
-fn exchange(request: &HttpRequest) -> Result<(u16, Vec<u8>), String> {
+fn exchange(
+    request: &HttpRequest,
+    response_limit: usize,
+    oversize: &str,
+) -> Result<(u16, Vec<u8>), String> {
     let deadline = Instant::now() + REQUEST_BUDGET;
     let endpoint = &request.endpoint;
     // A loopback endpoint must stay local, even if the current user configured a proxy.
@@ -330,8 +334,8 @@ fn exchange(request: &HttpRequest) -> Result<(u16, Vec<u8>), String> {
         return Ok((status, Vec::new()));
     }
     let declared_size = query_number(&handle, WINHTTP_QUERY_CONTENT_LENGTH).ok();
-    if declared_size.is_some_and(|size| size as usize > MAX_RESPONSE_BYTES) {
-        return Err("AI 响应超过 64 KiB，已停止读取".into());
+    if declared_size.is_some_and(|size| size as usize > response_limit) {
+        return Err(oversize.into());
     }
     let mut body = Vec::with_capacity(declared_size.unwrap_or(0) as usize);
     let mut buffer = [0u8; 8192];
@@ -339,7 +343,7 @@ fn exchange(request: &HttpRequest) -> Result<(u16, Vec<u8>), String> {
         handle.timeouts(deadline)?;
         let mut count = 0u32;
         // Read one extra byte at the exact limit so a longer chunked response is rejected.
-        let wanted = buffer.len().min(MAX_RESPONSE_BYTES + 1 - body.len());
+        let wanted = buffer.len().min(response_limit + 1 - body.len());
         unsafe {
             WinHttpReadData(
                 handle.0,
@@ -352,8 +356,8 @@ fn exchange(request: &HttpRequest) -> Result<(u16, Vec<u8>), String> {
         if count == 0 {
             break;
         }
-        if count as usize > wanted || body.len() + count as usize > MAX_RESPONSE_BYTES {
-            return Err("AI 响应超过 64 KiB，已停止读取".into());
+        if count as usize > wanted || body.len() + count as usize > response_limit {
+            return Err(oversize.into());
         }
         body.extend_from_slice(&buffer[..count as usize]);
     }
@@ -383,6 +387,38 @@ pub fn interpret(
     let key = SecretString(unprotect_key(&settings.encrypted_key)?);
     let request = SensitiveRequest(prepare(settings, &key.0, query, scope, functions)?);
     drop(key);
-    let (status, body) = exchange(&request.0)?;
+    let (status, body) = exchange(
+        &request.0,
+        MAX_RESPONSE_BYTES,
+        "AI 响应超过 64 KiB，已停止读取",
+    )?;
     parse_response(status, &body, functions)
+}
+
+/// Local-only validation of the independent embedding credential and protocol.
+pub fn validate_embedding_settings(
+    settings: &crate::semantic::EmbeddingSettings,
+) -> Result<(), String> {
+    let key = SecretString(unprotect_key(&settings.encrypted_key)?);
+    let _request = SensitiveRequest(crate::embedding::prepare(
+        settings,
+        &key.0,
+        &["检查配置".into()],
+    )?);
+    Ok(())
+}
+/// One explicit bounded request; run only on the independent embedding worker.
+pub fn embed(
+    settings: &crate::semantic::EmbeddingSettings,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    let key = SecretString(unprotect_key(&settings.encrypted_key)?);
+    let request = SensitiveRequest(crate::embedding::prepare(settings, &key.0, inputs)?);
+    drop(key);
+    let (status, body) = exchange(
+        &request.0,
+        crate::embedding::MAX_RESPONSE_BYTES,
+        "Embedding API 响应超过 2 MiB，已停止读取",
+    )?;
+    crate::embedding::parse_response(status, &body, inputs.len())
 }

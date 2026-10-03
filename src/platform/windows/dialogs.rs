@@ -49,6 +49,7 @@ enum Field {
     Password(String),
     Choice(usize),
     AuthChoice(usize),
+    IndexChoice(usize),
     Toggle(bool),
     Switch(bool, &'static str),
 }
@@ -163,6 +164,45 @@ pub unsafe fn ai_settings_form(
         )
     }
 }
+pub unsafe fn embedding_settings_form(
+    owner: HWND,
+    settings: &crate::semantic::EmbeddingSettings,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields(
+            owner,
+            "语义检索设置 · 独立 Embedding 服务",
+            &[
+                (
+                    "查询与选定保存文本会发往独立服务",
+                    Field::Switch(settings.enabled, "启用语义检索（默认关闭）"),
+                ),
+                (
+                    "OpenAI 兼容 API 地址（根地址、/v1 或完整接口）",
+                    Field::Text(settings.endpoint.clone()),
+                ),
+                (
+                    "模型 ID（由服务商提供）",
+                    Field::Text(settings.model.clone()),
+                ),
+                (
+                    "API Key（留空保留已保存密钥）",
+                    Field::Password(String::new()),
+                ),
+                (
+                    "密钥管理",
+                    Field::Switch(false, "清除已保存密钥（同时关闭语义检索）"),
+                ),
+                (
+                    "文档/目录仅发名称、路径、别名、标签，不解析正文",
+                    Field::IndexChoice(usize::from(
+                        settings.index_scope == crate::semantic::IndexScope::AllText,
+                    )),
+                ),
+            ],
+        )
+    }
+}
 unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -218,7 +258,7 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             let label = wide(label);
             let value = wide(match value {
                 Field::Text(t) | Field::Password(t) => t,
-                Field::Choice(_) | Field::AuthChoice(_) => "",
+                Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => "",
                 Field::Toggle(_) => "暂停剪贴板记录",
                 Field::Switch(_, label) => label,
             });
@@ -242,7 +282,9 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 WS_EX_CLIENTEDGE,
                 match fields[i].1 {
                     Field::Text(_) | Field::Password(_) => w!("EDIT"),
-                    Field::Choice(_) | Field::AuthChoice(_) => w!("COMBOBOX"),
+                    Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
+                        w!("COMBOBOX")
+                    }
                     Field::Toggle(_) | Field::Switch(_, _) => w!("BUTTON"),
                 },
                 PCWSTR(value.as_ptr()),
@@ -252,14 +294,19 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                     | WINDOW_STYLE(match fields[i].1 {
                         Field::Text(_) => ES_AUTOHSCROLL as u32,
                         Field::Password(_) => (ES_AUTOHSCROLL | ES_PASSWORD) as u32,
-                        Field::Choice(_) | Field::AuthChoice(_) => CBS_DROPDOWNLIST as u32,
+                        Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
+                            CBS_DROPDOWNLIST as u32
+                        }
                         Field::Toggle(_) | Field::Switch(_, _) => BS_AUTOCHECKBOX as u32,
                     }),
                 scale(18),
                 y + scale(24),
                 scale(470),
                 scale(
-                    if matches!(fields[i].1, Field::Choice(_) | Field::AuthChoice(_)) {
+                    if matches!(
+                        fields[i].1,
+                        Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_)
+                    ) {
                         150
                     } else {
                         28
@@ -274,9 +321,13 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             SendMessageW(l, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             SendMessageW(e, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             match fields[i].1 {
-                Field::Choice(selected) | Field::AuthChoice(selected) => {
+                Field::Choice(selected)
+                | Field::AuthChoice(selected)
+                | Field::IndexChoice(selected) => {
                     let choices: &[&str] = if matches!(fields[i].1, Field::AuthChoice(_)) {
                         &["API Key（x-api-key）", "Bearer token（兼容网关）"]
+                    } else if matches!(fields[i].1, Field::IndexChoice(_)) {
+                        &["固定内容与收藏", "全部文本"]
                     } else {
                         &["跟随系统", "浅色", "深色"]
                     };
@@ -366,7 +417,7 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
                     Field::Text(_) | Field::Password(_) => text(*e),
-                    Field::Choice(_) | Field::AuthChoice(_) => {
+                    Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
                         SendMessageW(*e, CB_GETCURSEL, None, None).0.to_string()
                     }
                     Field::Toggle(_) | Field::Switch(_, _) => {

@@ -15,4 +15,5 @@ pub mod repository;
 pub mod search;
 pub mod semantic;
 mod semantic_store;
+pub mod semantic_ui;
 pub mod ui_state;
