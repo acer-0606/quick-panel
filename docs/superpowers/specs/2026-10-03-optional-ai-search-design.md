@@ -36,7 +36,7 @@ Windows 使用 WinHTTP 与 DPAPI，保留小型原生程序。共享协议、查
 
 ## 2026-10-03：sqlite-vec 选型方向
 
-用户表示倾向采用 sqlite-vec。后续语义索引以此为设计方向；本节记录下一阶段的接入建议，当前交付程序尚未包含 sqlite-vec 或 embedding 模型。
+用户表示倾向采用 sqlite-vec，并选择独立 Embedding API。此阶段已经完成默认关闭的 sqlite-vec 0.1.9 语义索引，接入范围及数据发送边界见 [独立语义检索设计](2026-10-03-sqlite-vec-semantic-search-design.md)；验证结果见 [验证记录](../../verification.md)。本节保留最初的选型理由，完整 RAG、MCP 和文档正文解析仍属于后续候选范围。
 
 保留现有 SQLite 原文、元数据和 FTS 索引，在同一数据库中按需增加向量索引。使用官方 Rust crate 静态链接，不要求用户安装 SQLite 扩展 DLL。普通搜索先返回现有关键词、拼音和功能结果；启用语义检索后异步补充真实内容条目，按条目 ID 去重，精确的标题、别名、路径匹配保持优先。功能目录继续使用结构化定义，不随私有内容一起向量化。[官方 Rust 接入](https://alexgarcia.xyz/sqlite-vec/rust.html)。
 

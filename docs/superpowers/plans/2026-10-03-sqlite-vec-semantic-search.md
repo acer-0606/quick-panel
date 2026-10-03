@@ -1,6 +1,6 @@
 # sqlite-vec Semantic Search Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 实现默认关闭的 sqlite-vec 语义检索，使用独立配置的 OpenAI 兼容 Embedding API。
 
@@ -38,16 +38,16 @@
 - Produces `embedding::parse_endpoint(&str) -> Result<claude::Endpoint,String>`, `embedding::prepare(&EmbeddingSettings, &str, &[String]) -> Result<claude::HttpRequest,String>`, `embedding::parse_response(u16, &[u8], usize) -> Result<Vec<Vec<f32>>,String>`.
 - Produces `EmbeddingRequest { settings: EmbeddingSettings, inputs: Vec<String> }`, `EmbeddingCompletion { id: u64, result: Result<Vec<Vec<f32>>,String> }`, and `EmbeddingWorker::{start(runner, notifier),submit(request)->Result<u64,String>,cancel(),try_result()->Option<EmbeddingCompletion>}` following existing `AiWorker` lifecycle. No engine Command/Event variants in this task.
 
-- [ ] Write portable tests before implementation. Response order fixture has indexes 1 then 0 and must return vectors in input order; repeated/missing indexes, mixed dimensions, zero and non-finite vectors, oversize and non-2xx must fail with sanitized errors. Address fixtures include root, `/v1`, complete path, proxy prefix, IPv6 and rejected userinfo/query/injection. A blocked runner test submits A, then B and C; only A and C may run, only C may publish; cancel/drop must not join A.
+- [x] Write portable tests before implementation. Response order fixture has indexes 1 then 0 and must return vectors in input order; repeated/missing indexes, mixed dimensions, zero and non-finite vectors, oversize and non-2xx must fail with sanitized errors. Address fixtures include root, `/v1`, complete path, proxy prefix, IPv6 and rejected userinfo/query/injection. A blocked runner test submits A, then B and C; only A and C may run, only C may publish; cancel/drop must not join A.
 
 ```rust
 let reply = br#"{"data":[{"index":1,"embedding":[0,1]},{"index":0,"embedding":[1,0]}]}"#;
 assert_eq!(embedding::parse_response(200, reply, 2).unwrap(), vec![vec![1.0,0.0],vec![0.0,1.0]]);
 ```
 
-- [ ] Run `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --test embedding --test embedding_jobs` and record red failures for missing behavior.
-- [ ] Implement interfaces and bounded validation. Default endpoint `https://api.openai.com`, model empty, enabled false, ciphertext empty, scope fixed/favorites. Model profile hashes normalized address/model/input format version; candidate text excludes pins/use stats and is bounded before hashing. Preserve prior Settings JSON through serde defaults. Factor the existing strict endpoint parser only enough to select `messages` or `embeddings`; both protocols retain exact existing address behavior. Use literal expectations, no source-grep tests.
-- [ ] Run the new tests and `cargo test --test claude --test palette --test persistence`; format and self-review. Commit only owned files and write report containing exact commands, pass/fail evidence, signatures and concerns.
+- [x] Run `CARGO_INCREMENTAL=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --test embedding --test embedding_jobs` and record red failures for missing behavior.
+- [x] Implement interfaces and bounded validation. Default endpoint `https://api.openai.com`, model empty, enabled false, ciphertext empty, scope fixed/favorites. Model profile hashes normalized address/model/input format version; candidate text excludes pins/use stats and is bounded before hashing. Preserve prior Settings JSON through serde defaults. Factor the existing strict endpoint parser only enough to select `messages` or `embeddings`; both protocols retain exact existing address behavior. Use literal expectations, no source-grep tests.
+- [x] Run the new tests and `cargo test --test claude --test palette --test persistence`; format and self-review. Commit only owned files and write report containing exact commands, pass/fail evidence, signatures and concerns.
 
 ### Task 2: sqlite-vec storage, engine indexing and hybrid retrieval
 
@@ -62,7 +62,7 @@ assert_eq!(embedding::parse_response(200, reply, 2).unwrap(), vec![vec![1.0,0.0]
 - Add `Event::SemanticBatch(IndexBatch)` and `Event::EmbeddingsStored { request_id: u64, accepted: usize }`; query results remain existing Event::Results.
 - SQLite methods stay internal; expose CLI/engine integration through these commands. Preserve normal Command/Event behavior and all old search paths.
 
-- [ ] Add engine integration tests first using a temporary real SQLite file and real engine. Seed text with no lexical overlap, configure enabled embedding settings, obtain candidate hashes with PrepareSemanticIndex, submit independently chosen `[1,0]`, query `[1,0]`, assert real ID appears before flush while a second DB connection has no persisted vector; shutdown/reopen must restore it. Additional cases cover filters before top-k, text changes while request in flight, deleted/originally cleaned rows, scope changes, metadata-only statistics, dimensions/profile isolation, bounded candidate pages and expired queries.
+- [x] Add engine integration tests first using a temporary real SQLite file and real engine. Seed text with no lexical overlap, configure enabled embedding settings, obtain candidate hashes with PrepareSemanticIndex, submit independently chosen `[1,0]`, query `[1,0]`, assert real ID appears before flush while a second DB connection has no persisted vector; shutdown/reopen must restore it. Additional cases cover filters before top-k, text changes while request in flight, deleted/originally cleaned rows, scope changes, metadata-only statistics, dimensions/profile isolation, bounded candidate pages and expired queries.
 
 ```rust
 engine.send(Command::SemanticSearch(SemanticSearchQuery {
@@ -72,16 +72,16 @@ engine.send(Command::SemanticSearch(SemanticSearchQuery {
 assert_eq!(wait_results(&engine,20)[0].id, saved_id);
 ```
 
-- [ ] Record the red test failure before production implementation. Resolve and pin a published non alpha sqlite-vec Rust crate, record the exact native `vec_version()`; statically register its extension once before SQLite opens.
-- [ ] Implement lazy derived schema with an active profile and actual dimension; use `vec0` cosine KNN and mapping rows back to true items. Keep large SQL/index responsibilities in semantic_store.rs. Candidate paging reads only required text/metadata and no representations. Revalidate batches atomically before changing memory; enforce 4 MiB budget, profile/dimension coherence, stale hash and changed eligibility. For mixed valid/stale entries skip obsolete entries and acknowledge only accepted ones; invalid vector batches must not partially modify state.
-- [ ] Incorporate pending vectors in actor dirty/deadline/pressure/flush/shutdown. Persist completed vectors in the same dirty transaction after original item changes and retention; clear pending only on successful commit. Delete orphaned mappings and vec0 rows on source delete/retention/content invalidation. Metadata-only changes do not rewrite vector coordinates. Query DB only when profile/dimension match; filter scope/eligibility and pending/deleted obsolete data before nearest-neighbor limit, merge memory vectors and lexical results by actual ID, exact matches first, max 50. No query commits or network.
-- [ ] Run new storage tests plus `cargo test --test persistence --test ai_search --test search`; fmt and targeted Clippy. Commit owned changes, report exact version, interface implementation, test results and migration/error behavior.
+- [x] Record the red test failure before production implementation. Resolve and pin a published non alpha sqlite-vec Rust crate, record the exact native `vec_version()`; statically register its extension once before SQLite opens.
+- [x] Implement lazy derived schema with an active profile and actual dimension; use `vec0` cosine KNN and mapping rows back to true items. Keep large SQL/index responsibilities in semantic_store.rs. Candidate paging reads only required text/metadata and no representations. Revalidate batches atomically before changing memory; enforce 4 MiB budget, profile/dimension coherence, stale hash and changed eligibility. For mixed valid/stale entries skip obsolete entries and acknowledge only accepted ones; invalid vector batches must not partially modify state.
+- [x] Incorporate pending vectors in actor dirty/deadline/pressure/flush/shutdown. Persist completed vectors in the same dirty transaction after original item changes and retention; clear pending only on successful commit. Delete orphaned mappings and vec0 rows on source delete/retention/content invalidation. Metadata-only changes do not rewrite vector coordinates. Query DB only when profile/dimension match; filter scope/eligibility and pending/deleted obsolete data before nearest-neighbor limit, merge memory vectors and lexical results by actual ID, exact matches first, max 50. No query commits or network.
+- [x] Run new storage tests plus `cargo test --test persistence --test ai_search --test search`; fmt and targeted Clippy. Commit owned changes, report exact version, interface implementation, test results and migration/error behavior.
 
 ### Task 3: Windows client, configuration, query and indexing UI
 
 **Files:**
 - Create: `src/semantic_ui.rs` (portable session/gating state), `tests/semantic_ui.rs`, `tests/windows_embedding.rs`
-- Modify: `src/platform/windows/ai_client.rs`, `src/platform/windows/ui.rs`, `src/platform/windows/mod.rs` if module needed, `src/palette.rs`, `src/lib.rs`, `tests/palette.rs`
+- Modify: `src/platform/windows/ai_client.rs`, `src/platform/windows/ui.rs`, `src/platform/windows/dialogs.rs` (owned Embedding form and range control), `src/platform/windows/mod.rs` if module needed, `src/palette.rs`, `src/lib.rs`, `tests/palette.rs`
 - Update: `README.md`, `THIRD_PARTY_NOTICES.txt`
 
 **Interfaces:**
@@ -89,7 +89,7 @@ assert_eq!(wait_results(&engine,20)[0].id, saved_id);
 - Produces native `ai_client::embed(&EmbeddingSettings, &[String]) -> Result<Vec<Vec<f32>>,String>` and `ai_client::validate_embedding_settings(&EmbeddingSettings) -> Result<(),String>`, reusing DPAPI and an explicitly bounded exchange.
 - New Function variants `EmbeddingSettings`, `SemanticSearch`, `UpdateSemanticIndex`, `CancelSemanticIndex`; extend Context only as needed and update all consumers. Only enabled functions appear; cancel-index only during an active index session. Configuration always searchable.
 
-- [ ] Write portable session tests for explicit cancellation after network completion but before local search completion, query edits/scope/config changes/hide, stale indexing session/profile replies, source changes and sequential batch acknowledgement. Expected visible selection and result-cache state must clear immediately, not just discard HTTP completion. Write palette behavior tests for enablement/search and Windows local TCP/DPAPI fixtures before native implementation.
+- [x] Write portable session tests for explicit cancellation after network completion but before local search completion, query edits/scope/config changes/hide, stale indexing session/profile replies, source changes and sequential batch acknowledgement. Expected visible selection and result-cache state must clear immediately, not just discard HTTP completion. Write palette behavior tests for enablement/search and Windows local TCP/DPAPI fixtures before native implementation.
 
 ```rust
 // Cancellation must advance the current local request token as well as cancel HTTP.
@@ -100,13 +100,20 @@ assert!(saved.is_empty());
 assert!(!ready);
 ```
 
-- [ ] Record red tests; implement separate semantic UI state with clear query-vs-index lifecycles. Native network uses existing WinHTTP RAII/TLS defaults and sanitized errors, generalized response-body budget only where needed to support 2 MiB. Existing Claude remains limited to 64 KiB. Decrypted credentials and sensitive request copies use the current erasure wrappers; settings validation sends no POST.
-- [ ] Add owned native Embedding settings dialog with enable/address/model/key/clear-key/index-scope fields; blank password preserves existing, clear disables, invalid configuration shows owned Message and does not save. Explicitly explain outgoing selected text and saved metadata-only document indexing. Add enabled-only semantic button and settings menu index/cancel actions, no hotkeys. Route results using request/generation/profile/query/scope checks; adopted semantic query/cache are revoked on cancel/settings return. Index batches are requested in bounded pages; submit current candidates to network, turn replies into StoreEmbeddings only while session is current; acknowledge accepted batches before progressing; display progress/error without auto-retry. Exit/hide/edit cancellation cannot block storage exit, index canceled on exit/config change.
-- [ ] Update README and licenses with real behavior, API format, scope, text limits, write policy and actual verification limits. Run `cargo test --test embedding --test embedding_jobs --test semantic_search --test semantic_ui --test palette`, Windows target compile of fixtures, shared and Windows Clippy with `-D warnings`, fmt. Commit owned changes and report commands/results and outstanding Windows/API manual acceptance.
+- [x] Record red tests; implement separate semantic UI state with clear query-vs-index lifecycles. Native network uses existing WinHTTP RAII/TLS defaults and sanitized errors, generalized response-body budget only where needed to support 2 MiB. Existing Claude remains limited to 64 KiB. Decrypted credentials and sensitive request copies use the current erasure wrappers; settings validation sends no POST.
+- [x] Add owned native Embedding settings dialog with enable/address/model/key/clear-key/index-scope fields; blank password preserves existing, clear disables, invalid configuration shows owned Message and does not save. Explicitly explain outgoing selected text and saved metadata-only document indexing. Add enabled-only semantic button and settings menu index/cancel actions, no hotkeys. Route results using request/generation/profile/query/scope checks; adopted semantic query/cache are revoked on cancel/settings return. Index batches are requested in bounded pages; submit current candidates to network, turn replies into StoreEmbeddings only while session is current; acknowledge accepted batches before progressing; display progress/error without auto-retry. Exit/hide/edit cancellation cannot block storage exit, index canceled on exit/config change.
+- [x] Update README and licenses with real behavior, API format, scope, text limits, write policy and actual verification limits. Run `cargo test --test embedding --test embedding_jobs --test semantic_search --test semantic_ui --test palette`, Windows target compile of fixtures, shared and Windows Clippy with `-D warnings`, fmt. Commit owned changes and report commands/results and outstanding Windows/API manual acceptance.
 
 ## Final acceptance
 
-- [ ] One whole-feature review, one consolidated fix wave if findings; preserve accepted scope and report remaining material limitations.
-- [ ] Root run fresh full shared suite, fmt and both target Clippy after fixes; build Windows Release and verify archive/executable hashes and packaged docs. Avoid repeating unchanged passing heavy checks.
-- [ ] Record actual sqlite-vec version, test totals, source commit and semantic/ordinary search benchmark boundaries in `docs/verification.md`; benchmark model latency only when a real configured provider is available.
-- [ ] Preserve delivery ZIP and checksum sidecar; clean only this plan's temporary review workspace when complete.
+- [x] One whole-feature review, one consolidated fix wave if findings; preserve accepted scope and report remaining material limitations.
+- [x] Root run fresh full shared suite, fmt and both target Clippy after fixes; build Windows Release and verify archive/executable hashes and packaged docs. Avoid repeating unchanged passing heavy checks.
+- [x] Record actual sqlite-vec version, test totals, source commit and semantic/ordinary search benchmark boundaries in `docs/verification.md`; benchmark model latency only when a real configured provider is available.
+- [x] Preserve delivery ZIP and checksum sidecar; clean only this plan's temporary review workspace when complete.
+
+
+## 完成记录（2026-10-04）
+
+产品源码 `7768dba`。三项实施任务分别完成协议/worker、sqlite-vec/actor、Windows/会话/配置；任务审查和定点修正通过。整体审查两项问题统一修复，并对新增的 Claude 恢复编号回归做了必要的最小补充修正，复审无未解决的 Critical/Important。
+
+最终共享全套串行190pass/0fail/2既有ignored，fmt与双目标strictClippy通过；macOS与Windows GNU Release构建通过，core-check三项true。Windows18个fixtures只交叉check，没有运行；未调用真实API。最终便携包、hash、当前性能及历史结果见 `docs/verification.md`。路径元数据扫描时间随路径总量增长，模型质量及Windows实际响应需实机验证。
