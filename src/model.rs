@@ -77,6 +77,7 @@ pub struct FavoriteInput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub ai: crate::ai::AiSettings,
     pub theme: Theme,
     pub hotkey_modifiers: u32,
     pub hotkey_key: u32,
@@ -91,6 +92,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            ai: crate::ai::AiSettings::default(),
             theme: Theme::System,
             hotkey_modifiers: 3,
             hotkey_key: 32,
@@ -111,6 +113,15 @@ pub struct SearchQuery {
     pub request_id: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AiSearchQuery {
+    pub queries: Vec<String>,
+    pub scope: Scope,
+    pub from_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+    pub request_id: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveStats {
     pub pending_items: usize,
@@ -123,6 +134,7 @@ pub struct SaveStats {
 pub enum Command {
     Capture(ClipboardSnapshot),
     Search(SearchQuery),
+    AiSearch(AiSearchQuery),
     Load { id: String, request_id: u64 },
     SaveFavorite(FavoriteInput),
     SaveSettings(Settings),

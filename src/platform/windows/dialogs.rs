@@ -4,6 +4,9 @@ use std::cell::RefCell;
 use windows::{
     Win32::{
         Foundation::*,
+        Graphics::Gdi::{
+            GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+        },
         System::{Com::*, LibraryLoader::GetModuleHandleW},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
@@ -43,8 +46,11 @@ pub unsafe fn pick(owner: HWND, folder: bool) -> Result<Option<String>, String> 
 }
 enum Field {
     Text(String),
+    Password(String),
     Choice(usize),
+    AuthChoice(usize),
     Toggle(bool),
+    Switch(bool, &'static str),
 }
 struct FormWindow(HWND);
 impl Drop for FormWindow {
@@ -119,6 +125,44 @@ pub unsafe fn settings_form(
         )
     }
 }
+
+pub unsafe fn ai_settings_form(
+    owner: HWND,
+    settings: &crate::ai::AiSettings,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields(
+            owner,
+            "AI检索设置 · 仅发送查询与功能目录",
+            &[
+                (
+                    "可选功能",
+                    Field::Switch(settings.enabled, "启用 AI 按意思查找（默认关闭）"),
+                ),
+                (
+                    "Claude 格式 API 地址（根地址、/v1 或完整接口）",
+                    Field::Text(settings.endpoint.clone()),
+                ),
+                (
+                    "模型 ID（由服务商提供）",
+                    Field::Text(settings.model.clone()),
+                ),
+                (
+                    "认证方式",
+                    Field::AuthChoice(usize::from(settings.auth == crate::ai::AuthMethod::Bearer)),
+                ),
+                (
+                    "API Key（留空保留已保存密钥）",
+                    Field::Password(String::new()),
+                ),
+                (
+                    "密钥管理",
+                    Field::Switch(false, "清除已保存密钥（同时关闭 AI）"),
+                ),
+            ],
+        )
+    }
+}
 unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -138,18 +182,28 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             accepted: false,
         }));
         let title = wide(title);
-        let dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
+        let owner_dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
+        let mut monitor = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(
+            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST),
+            &mut monitor,
+        );
+        let work = monitor.rcWork;
+        let fit = ((work.bottom - work.top - 24).max(1) * 96 / (104 + fields.len() as i32 * 62))
+            .max(96) as u32;
+        let dpi = owner_dpi.min(fit);
         let scale = |v: i32| v * (dpi as i32) / 96;
-        let mut rect = RECT::default();
-        let _ = GetWindowRect(owner, &mut rect);
         let height = scale(104 + fields.len() as i32 * 62);
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             class,
             PCWSTR(title.as_ptr()),
             WS_CAPTION | WS_SYSMENU | WS_POPUP,
-            rect.left + scale(72),
-            rect.top + scale(30),
+            work.left + ((work.right - work.left - scale(520)) / 2).max(0),
+            work.top + ((work.bottom - work.top - height) / 2).max(0),
             scale(520),
             height,
             Some(owner),
@@ -163,9 +217,10 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
             let value = wide(match value {
-                Field::Text(t) => t,
-                Field::Choice(_) => "",
+                Field::Text(t) | Field::Password(t) => t,
+                Field::Choice(_) | Field::AuthChoice(_) => "",
                 Field::Toggle(_) => "暂停剪贴板记录",
+                Field::Switch(_, label) => label,
             });
             let y = scale(12 + i as i32 * 62);
             let l = CreateWindowExW(
@@ -186,9 +241,9 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             let e = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 match fields[i].1 {
-                    Field::Text(_) => w!("EDIT"),
-                    Field::Choice(_) => w!("COMBOBOX"),
-                    Field::Toggle(_) => w!("BUTTON"),
+                    Field::Text(_) | Field::Password(_) => w!("EDIT"),
+                    Field::Choice(_) | Field::AuthChoice(_) => w!("COMBOBOX"),
+                    Field::Toggle(_) | Field::Switch(_, _) => w!("BUTTON"),
                 },
                 PCWSTR(value.as_ptr()),
                 WS_CHILD
@@ -196,17 +251,20 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                     | WS_TABSTOP
                     | WINDOW_STYLE(match fields[i].1 {
                         Field::Text(_) => ES_AUTOHSCROLL as u32,
-                        Field::Choice(_) => CBS_DROPDOWNLIST as u32,
-                        Field::Toggle(_) => BS_AUTOCHECKBOX as u32,
+                        Field::Password(_) => (ES_AUTOHSCROLL | ES_PASSWORD) as u32,
+                        Field::Choice(_) | Field::AuthChoice(_) => CBS_DROPDOWNLIST as u32,
+                        Field::Toggle(_) | Field::Switch(_, _) => BS_AUTOCHECKBOX as u32,
                     }),
                 scale(18),
                 y + scale(24),
                 scale(470),
-                scale(if matches!(fields[i].1, Field::Choice(_)) {
-                    150
-                } else {
-                    28
-                }),
+                scale(
+                    if matches!(fields[i].1, Field::Choice(_) | Field::AuthChoice(_)) {
+                        150
+                    } else {
+                        28
+                    },
+                ),
                 Some(hwnd),
                 None,
                 None,
@@ -216,8 +274,13 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             SendMessageW(l, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             SendMessageW(e, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             match fields[i].1 {
-                Field::Choice(selected) => {
-                    for choice in ["跟随系统", "浅色", "深色"] {
+                Field::Choice(selected) | Field::AuthChoice(selected) => {
+                    let choices: &[&str] = if matches!(fields[i].1, Field::AuthChoice(_)) {
+                        &["API Key（x-api-key）", "Bearer token（兼容网关）"]
+                    } else {
+                        &["跟随系统", "浅色", "深色"]
+                    };
+                    for choice in choices {
                         let choice = wide(choice);
                         SendMessageW(
                             e,
@@ -228,10 +291,10 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                     }
                     SendMessageW(e, CB_SETCURSEL, Some(WPARAM(selected)), None);
                 }
-                Field::Toggle(checked) => {
+                Field::Toggle(checked) | Field::Switch(checked, _) => {
                     SendMessageW(e, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None);
                 }
-                Field::Text(_) => {}
+                Field::Text(_) | Field::Password(_) => {}
             }
             state.borrow_mut().edits.push(e);
         }
@@ -302,9 +365,13 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
                 .iter()
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
-                    Field::Text(_) => text(*e),
-                    Field::Choice(_) => SendMessageW(*e, CB_GETCURSEL, None, None).0.to_string(),
-                    Field::Toggle(_) => SendMessageW(*e, BM_GETCHECK, None, None).0.to_string(),
+                    Field::Text(_) | Field::Password(_) => text(*e),
+                    Field::Choice(_) | Field::AuthChoice(_) => {
+                        SendMessageW(*e, CB_GETCURSEL, None, None).0.to_string()
+                    }
+                    Field::Toggle(_) | Field::Switch(_, _) => {
+                        SendMessageW(*e, BM_GETCHECK, None, None).0.to_string()
+                    }
                 })
                 .collect()
         });

@@ -190,3 +190,54 @@ fn empty_loading_query_waits_for_contents_before_showing_starter_functions() {
     let ready = palette::results("", vec![], Context::default());
     assert_eq!(ready[0].function(), Some(Function::AddFolder));
 }
+
+#[test]
+fn ai_suggestions_resolve_only_existing_functions_and_keep_real_saved_rows() {
+    use quick_panel::ai::AiPlan;
+    let plan = AiPlan {
+        functions: vec!["function:pause".into(), "function:invented".into()],
+        ..AiPlan::default()
+    };
+    let rows = palette::ai_results(
+        &plan,
+        vec![saved("real", "实际内容", ItemKind::Clipboard)],
+        Context::default(),
+    );
+    assert_eq!(rows[0].function(), Some(Function::PauseCapture));
+    assert_eq!(rows[1].id(), "real");
+    assert_eq!(rows.len(), 2);
+    let catalog = palette::ai_catalog(Context::default());
+    assert!(
+        catalog
+            .iter()
+            .any(|function| function.id == "function:settings")
+    );
+    assert!(
+        !catalog
+            .iter()
+            .any(|function| function.id == "function:ai-search")
+    );
+}
+
+#[test]
+fn disabled_ai_hides_search_action_but_configuration_remains_searchable() {
+    assert!(
+        !palette::results("AI检索", vec![], Context::default())
+            .iter()
+            .any(|row| row.function() == Some(Function::AiSearch))
+    );
+    assert!(
+        palette::results("AI设置", vec![], Context::default())
+            .iter()
+            .any(|row| row.function() == Some(Function::AiSettings))
+    );
+    let enabled = Context {
+        ai_enabled: true,
+        ..Context::default()
+    };
+    assert!(
+        palette::results("按意思查找", vec![], enabled)
+            .iter()
+            .any(|row| row.function() == Some(Function::AiSearch))
+    );
+}

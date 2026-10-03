@@ -1,5 +1,6 @@
 //! Functions live only in memory; saved results continue to come from the engine.
 use crate::{
+    ai::{AiPlan, FunctionDescriptor},
     model::{ItemKind, ItemSummary, StoredItem},
     search,
 };
@@ -8,6 +9,8 @@ use std::cmp::Reverse;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Function {
     Settings,
+    AiSettings,
+    AiSearch,
     AddFolder,
     AddDocument,
     PauseCapture,
@@ -24,6 +27,8 @@ impl Function {
     fn id(self) -> &'static str {
         match self {
             Self::Settings => "function:settings",
+            Self::AiSettings => "function:ai-settings",
+            Self::AiSearch => "function:ai-search",
             Self::AddFolder => "function:add-folder",
             Self::AddDocument => "function:add-document",
             Self::PauseCapture => "function:pause",
@@ -44,6 +49,7 @@ pub struct Context {
     pub capture_paused: bool,
     pub preview_open: bool,
     pub content_ready: bool,
+    pub ai_enabled: bool,
 }
 impl Default for Context {
     fn default() -> Self {
@@ -51,6 +57,7 @@ impl Default for Context {
             capture_paused: false,
             preview_open: false,
             content_ready: true,
+            ai_enabled: false,
         }
     }
 }
@@ -127,6 +134,20 @@ struct Spec {
     keywords: &'static [&'static str],
 }
 const CATALOG: &[Spec] = &[
+    Spec {
+        action: Function::AiSettings,
+        title: "AI检索设置",
+        description: "配置可选 Claude 格式 API、模型与密钥",
+        alias: "AI设置",
+        keywords: &["Claude配置", "AI配置", "API配置", "模型配置"],
+    },
+    Spec {
+        action: Function::AiSearch,
+        title: "按意思查找",
+        description: "使用已配置的 AI 理解检索描述",
+        alias: "AI检索",
+        keywords: &["AI搜索", "智能查找"],
+    },
     Spec {
         action: Function::Settings,
         title: "设置",
@@ -215,12 +236,47 @@ const CATALOG: &[Spec] = &[
 
 fn available(action: Function, context: Context) -> bool {
     match action {
+        Function::AiSearch => context.ai_enabled,
         Function::PauseCapture => !context.capture_paused,
         Function::ResumeCapture => context.capture_paused,
         Function::ShowPreview => !context.preview_open,
         Function::HidePreview => context.preview_open,
         _ => true,
     }
+}
+
+pub fn ai_catalog(context: Context) -> Vec<FunctionDescriptor> {
+    CATALOG
+        .iter()
+        .filter(|spec| spec.action != Function::AiSearch && available(spec.action, context))
+        .map(|spec| FunctionDescriptor {
+            id: spec.action.id().into(),
+            title: spec.title.into(),
+            description: spec.description.into(),
+        })
+        .collect()
+}
+
+pub fn ai_results(plan: &AiPlan, saved: Vec<ItemSummary>, context: Context) -> Vec<Entry> {
+    let mut rows = Vec::new();
+    for id in &plan.functions {
+        if let Some(spec) = CATALOG.iter().find(|spec| {
+            spec.action != Function::AiSearch
+                && spec.action.id() == id
+                && available(spec.action, context)
+        }) && !rows.iter().any(|row: &Entry| row.id() == id)
+        {
+            rows.push(Entry::Function(FunctionResult {
+                action: spec.action,
+                title: spec.title,
+                description: spec.description,
+                score: 1_020_000,
+            }));
+        }
+    }
+    rows.extend(saved.into_iter().map(Entry::Saved));
+    rows.truncate(50);
+    rows
 }
 
 fn searchable(spec: &Spec) -> StoredItem {

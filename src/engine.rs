@@ -462,10 +462,18 @@ impl Actor {
         }
         Ok(())
     }
-    fn search(&self, query: SearchQuery) -> Result<(), String> {
-        let mut items: HashMap<String, ItemSummary> = self
-            .repo
-            .summaries(&query)?
+    fn collect_search(
+        &self,
+        query: &SearchQuery,
+        from_ms: Option<i64>,
+        until_ms: Option<i64>,
+    ) -> Result<Vec<ItemSummary>, String> {
+        let saved = if from_ms.is_none() && until_ms.is_none() {
+            self.repo.summaries(query)?
+        } else {
+            self.repo.summaries_in_period(query, from_ms, until_ms)?
+        };
+        let mut items: HashMap<String, ItemSummary> = saved
             .into_iter()
             .filter(|s| {
                 !self.deleted.contains(&s.id)
@@ -483,6 +491,12 @@ impl Actor {
             })
             .collect();
         for p in self.pending.values() {
+            let created = p.item.summary.created_at_ms;
+            if from_ms.is_some_and(|from| created < from)
+                || until_ms.is_some_and(|until| created >= until)
+            {
+                continue;
+            }
             if p.mutation == Mutation::Metadata && items.contains_key(&p.item.summary.id) {
                 continue;
             }
@@ -511,9 +525,72 @@ impl Actor {
                 .then(a.id.cmp(&b.id))
         });
         items.truncate(50);
+        Ok(items)
+    }
+    fn search(&self, query: SearchQuery) -> Result<(), String> {
+        let items = self.collect_search(&query, None, None)?;
         self.emit(Event::Results {
             request_id: query.request_id,
             items,
+        });
+        Ok(())
+    }
+    fn ai_search(&self, query: AiSearchQuery) -> Result<(), String> {
+        if query.queries.len() > 6
+            || query
+                .queries
+                .iter()
+                .any(|term| term.chars().take(65).count() > 64)
+        {
+            return Err("AI 检索最多接受 6 个关键词，每个不超过 64 个字符".into());
+        }
+        if matches!((query.from_ms, query.until_ms), (Some(from), Some(until)) if from >= until) {
+            return Err("AI 检索时间范围无效".into());
+        }
+        let mut seen = HashSet::new();
+        let mut terms: Vec<_> = query
+            .queries
+            .iter()
+            .map(|term| term.trim())
+            .filter(|term| !term.is_empty() && seen.insert(term.to_lowercase()))
+            .map(str::to_owned)
+            .collect();
+        if terms.is_empty() {
+            if query.scope == Scope::All && query.from_ms.is_none() && query.until_ms.is_none() {
+                return Err("AI 检索需要关键词、内容范围或时间条件".into());
+            }
+            terms.push(String::new());
+        }
+        // Every term uses the same ordered top 50 as ordinary search. An entry
+        // outside all six top-50 lists cannot enter the global top 50 under the
+        // same rank/tie ordering, so the merge holds at most 300 real IDs.
+        let mut merged: HashMap<String, (ItemSummary, i64)> = HashMap::new();
+        for text in terms {
+            let local = SearchQuery {
+                text,
+                scope: query.scope,
+                request_id: query.request_id,
+            };
+            for summary in self.collect_search(&local, query.from_ms, query.until_ms)? {
+                let rank = result_rank(&summary, &local.text);
+                merged
+                    .entry(summary.id.clone())
+                    .and_modify(|entry| entry.1 = entry.1.max(rank))
+                    .or_insert((summary, rank));
+            }
+        }
+        let mut items: Vec<_> = merged.into_values().collect();
+        items.sort_by(|(a, a_rank), (b, b_rank)| {
+            b_rank
+                .cmp(a_rank)
+                .then(b.pinned.cmp(&a.pinned))
+                .then(b.last_used_ms.cmp(&a.last_used_ms))
+                .then(a.id.cmp(&b.id))
+        });
+        items.truncate(50);
+        self.emit(Event::Results {
+            request_id: query.request_id,
+            items: items.into_iter().map(|(summary, _)| summary).collect(),
         });
         Ok(())
     }
@@ -644,6 +721,7 @@ impl Actor {
             let result = match command {
                 Command::Capture(snapshot) => self.capture(snapshot),
                 Command::Search(query) => self.search(query),
+                Command::AiSearch(query) => self.ai_search(query),
                 Command::Load { id, request_id } => self
                     .lookup(&id, true)
                     .map(|item| self.emit(Event::Loaded { request_id, item })),

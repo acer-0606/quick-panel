@@ -1,10 +1,12 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 use super::{
-    actions, clipboard,
+    actions, ai_client, ai_time, clipboard,
     dialogs::{self, wide},
     theme,
 };
 use crate::{
+    ai::{AiPlan, AiSettings, AuthMethod},
+    ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
     engine::Engine,
     hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
     model::*,
@@ -42,6 +44,9 @@ const LIST: usize = 101;
 const ADD: usize = 102;
 const PREVIEW: usize = 103;
 const SETTINGS: usize = 104;
+const AI_FIND: usize = 105;
+const GENERAL_SETTINGS: usize = 106;
+const AI_SETTINGS: usize = 107;
 const OPEN: usize = 200;
 const COPY: usize = 201;
 const PLAIN: usize = 202;
@@ -128,6 +133,13 @@ enum UiEffect {
     Settings {
         owner: HWND,
         settings: Settings,
+    },
+    AiSettings {
+        owner: HWND,
+        settings: AiSettings,
+    },
+    AiPrompt {
+        owner: HWND,
     },
     ExitError {
         owner: HWND,
@@ -240,6 +252,7 @@ struct App {
     list: HWND,
     footer: HWND,
     preview: HWND,
+    ai_button: HWND,
     buttons: Vec<HWND>,
     font: HFONT,
     brush: HBRUSH,
@@ -251,6 +264,9 @@ struct App {
     saved_ready: bool,
     query: String,
     result_scope: Scope,
+    ai_worker: Option<AiWorker>,
+    ai_gate: AiResultGate,
+    ai_plan: Option<AiPlan>,
     scope: Scope,
     target: HWND,
     load_id: u64,
@@ -400,6 +416,7 @@ pub fn run() -> Result<(), String> {
             list: HWND::default(),
             footer: HWND::default(),
             preview: HWND::default(),
+            ai_button: HWND::default(),
             buttons: Vec::new(),
             font: HFONT::default(),
             brush: HBRUSH::default(),
@@ -411,6 +428,9 @@ pub fn run() -> Result<(), String> {
             saved_ready: false,
             query: String::new(),
             result_scope: Scope::All,
+            ai_worker: None,
+            ai_gate: AiResultGate::default(),
+            ai_plan: None,
             scope: Scope::All,
             target: HWND::default(),
             load_id: 0,
@@ -590,6 +610,117 @@ impl App {
         self.pending_paste = None;
         self.state.target_changed();
     }
+    unsafe fn stop_ai_request(&mut self) {
+        if let Some(worker) = self.ai_worker.as_ref() {
+            worker.cancel();
+        }
+        self.ai_gate.cancel();
+        let _ = SetWindowTextW(self.ai_button, w!("按意思查找"));
+    }
+    unsafe fn cancel_ai(&mut self) {
+        self.stop_ai_request();
+        if revoke_adopted_plan(
+            &mut self.ai_plan,
+            &mut self.state,
+            &mut self.saved_items,
+            &mut self.saved_ready,
+        ) {
+            self.cancel_actions();
+            self.items.clear();
+            self.clear_preview();
+            self.rebuild_results();
+        }
+    }
+    unsafe fn begin_ai(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running
+            || self.state.modal_open
+            || !self.state.visible
+        {
+            return;
+        }
+        self.cancel_actions();
+        if self.ai_gate.busy() {
+            self.cancel_ai();
+            self.search();
+            self.status("已取消 AI 检索，保留本地检索");
+            return;
+        }
+        if !self.settings.ai.enabled {
+            self.ai_settings();
+            return;
+        }
+        let query = dialogs::text(self.edit);
+        if ["按意思查找", "AI检索", "AI搜索", "智能查找"].contains(&query.trim()) {
+            self.effects
+                .push_back(UiEffect::AiPrompt { owner: self.hwnd });
+            return;
+        }
+        if query.trim().is_empty() || query.chars().count() > 2048 {
+            self.status("请输入不超过 2048 字的检索描述");
+            return;
+        }
+        if self.ai_worker.is_none() {
+            let handle = self.hwnd.0 as usize;
+            self.ai_worker = Some(AiWorker::start(
+                |request| {
+                    ai_client::interpret(
+                        &request.settings,
+                        &request.query,
+                        request.scope,
+                        &request.functions,
+                    )
+                },
+                Arc::new(move || {
+                    post(handle, WORK_WAKE);
+                }),
+            ));
+        }
+        let functions = palette::ai_catalog(PaletteContext {
+            capture_paused: self.settings.capture_paused,
+            preview_open: self.preview_open,
+            content_ready: self.saved_ready,
+            ai_enabled: true,
+        });
+        let request = AiRequest {
+            settings: self.settings.ai.clone(),
+            query: query.clone(),
+            scope: self.scope,
+            functions,
+        };
+        match self.ai_worker.as_ref().unwrap().submit(request) {
+            Ok(id) => {
+                self.ai_gate.begin(id, &query, self.scope);
+                let _ = SetWindowTextW(self.ai_button, w!("取消 AI"));
+                self.status("AI 正在理解查询…普通结果仍可使用");
+            }
+            Err(message) => self.status(&message),
+        }
+    }
+    unsafe fn ai_done(&mut self) {
+        let Some(completion) = self.ai_worker.as_ref().and_then(AiWorker::try_result) else {
+            return;
+        };
+        let active = self.state.visible
+            && !self.state.modal_open
+            && self.state.lifecycle == Lifecycle::Running
+            && self.settings.ai.enabled;
+        if !self
+            .ai_gate
+            .finish(completion.id, &dialogs::text(self.edit), self.scope, active)
+        {
+            return;
+        }
+        let _ = SetWindowTextW(self.ai_button, w!("按意思查找"));
+        match completion.result {
+            Ok(plan) => {
+                self.ai_plan = Some(plan);
+                self.saved_items.clear();
+                self.saved_ready = false;
+                self.search();
+            }
+            Err(message) => self.status(&format!("{message} · 本地检索仍可使用")),
+        }
+    }
     unsafe fn clear_preview(&mut self) {
         self.load_id = self.load_id.wrapping_add(1);
         self.preview_id = self.load_id;
@@ -673,11 +804,12 @@ impl App {
             109,
         )?;
         self.preview = self.control(w!("STATIC"), "", WINDOW_STYLE(0), 110)?;
+        self.ai_button = self.control(w!("BUTTON"), "按意思查找", WS_TABSTOP, AI_FIND)?;
         let _ = ShowWindow(self.preview, SW_HIDE);
         for (id, title) in [
             (ADD, "添加 ＋"),
             (PREVIEW, "预览 ›"),
-            (SETTINGS, "设置"),
+            (SETTINGS, "设置 ▾"),
             (300, "全部"),
             (301, "剪贴板"),
             (302, "文件夹"),
@@ -721,6 +853,7 @@ impl App {
         for h in [self.edit, self.list, self.footer, self.preview]
             .into_iter()
             .chain(self.buttons.iter().copied())
+            .chain(std::iter::once(self.ai_button))
         {
             SendMessageW(
                 h,
@@ -729,6 +862,15 @@ impl App {
                 Some(LPARAM(1)),
             );
         }
+        let _ = ShowWindow(
+            self.ai_button,
+            if self.settings.ai.enabled {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        self.layout();
         SendMessageW(
             self.list,
             LB_SETITEMHEIGHT,
@@ -751,7 +893,25 @@ impl App {
         let mov = |hwnd: HWND, x, y, width, height| {
             let _ = MoveWindow(hwnd, x, y, width, height, true);
         };
-        mov(self.edit, edge, self.s(18), w - self.s(126), self.s(36));
+        let ai_width = if self.settings.ai.enabled {
+            self.s(114)
+        } else {
+            0
+        };
+        mov(
+            self.edit,
+            edge,
+            self.s(18),
+            (w - self.s(126) - ai_width).max(self.s(80)),
+            self.s(36),
+        );
+        mov(
+            self.ai_button,
+            w - self.s(212),
+            self.s(18),
+            self.s(106),
+            self.s(36),
+        );
         mov(
             self.buttons[0],
             w - self.s(98),
@@ -888,6 +1048,7 @@ impl App {
         self.search();
     }
     unsafe fn hide(&mut self) {
+        self.cancel_ai();
         self.cancel_actions();
         self.clear_preview();
         self.state.hide();
@@ -914,12 +1075,39 @@ impl App {
         }
         let query = dialogs::text(self.edit);
         if query != self.query || self.scope != self.result_scope {
+            self.cancel_ai();
             self.saved_items.clear();
             self.saved_ready = false;
         }
         self.query = query;
         self.result_scope = self.scope;
         let id = self.state.next_request();
+        if let Some(plan) = self.ai_plan.as_ref() {
+            let (from_ms, until_ms) = match ai_time::period_bounds(plan.period) {
+                Ok(bounds) => bounds,
+                Err(message) => {
+                    self.status(&message);
+                    return;
+                }
+            };
+            let scope = plan.scope.unwrap_or(self.scope);
+            if plan.queries.is_empty() && scope == Scope::All && from_ms.is_none() {
+                self.saved_items.clear();
+                self.saved_ready = true;
+                self.rebuild_results();
+                return;
+            }
+            let expanded = AiSearchQuery {
+                queries: plan.queries.clone(),
+                scope,
+                from_ms,
+                until_ms,
+                request_id: id,
+            };
+            self.rebuild_results();
+            self.send(Command::AiSearch(expanded));
+            return;
+        }
         self.rebuild_results();
         self.send(Command::Search(SearchQuery {
             text: self.query.clone(),
@@ -928,15 +1116,17 @@ impl App {
         }));
     }
     unsafe fn rebuild_results(&mut self) {
-        self.items = palette::results(
-            &self.query,
-            self.saved_items.clone(),
-            PaletteContext {
-                capture_paused: self.settings.capture_paused,
-                preview_open: self.preview_open,
-                content_ready: self.saved_ready,
-            },
-        );
+        let context = PaletteContext {
+            capture_paused: self.settings.capture_paused,
+            preview_open: self.preview_open,
+            content_ready: self.saved_ready,
+            ai_enabled: self.settings.ai.enabled,
+        };
+        self.items = if let Some(plan) = self.ai_plan.as_ref() {
+            palette::ai_results(plan, self.saved_items.clone(), context)
+        } else {
+            palette::results(&self.query, self.saved_items.clone(), context)
+        };
         self.state.replace_ids(
             self.items
                 .iter()
@@ -976,6 +1166,7 @@ impl App {
         }
     }
     unsafe fn work_done(&mut self) {
+        self.ai_done();
         while let Ok(done) = self.rx.try_recv() {
             match done {
                 Done::Captured(result) => {
@@ -1121,6 +1312,9 @@ impl App {
         });
         if self.preview_open && !function {
             self.request(Action::Preview);
+        }
+        if self.ai_gate.busy() {
+            self.status("AI 正在理解查询…可点击取消 AI");
         }
     }
     unsafe fn request(&mut self, action: Action) {
@@ -1374,6 +1568,71 @@ impl App {
             settings: self.settings.clone(),
         });
     }
+    unsafe fn settings_menu(&mut self) {
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(self.buttons[2], &mut rect);
+        self.effects.push_back(UiEffect::Menu {
+            owner: self.hwnd,
+            x: rect.left,
+            y: rect.bottom,
+            entries: vec![
+                (GENERAL_SETTINGS, "常规设置…"),
+                (AI_SETTINGS, "AI 检索设置…"),
+            ],
+            target: None,
+        });
+    }
+    unsafe fn ai_settings(&mut self) {
+        self.cancel_ai();
+        self.effects.push_back(UiEffect::AiSettings {
+            owner: self.hwnd,
+            settings: self.settings.ai.clone(),
+        });
+    }
+    unsafe fn apply_ai_settings(&mut self, mut values: Vec<String>) -> Result<(), String> {
+        let password = ai_client::SecretString(std::mem::take(&mut values[4]));
+        if self.state.lifecycle != Lifecycle::Running {
+            return Ok(());
+        }
+        let mut next = self.settings.ai.clone();
+        next.enabled = values[0] == "1";
+        next.endpoint = values[1].trim().into();
+        next.model = values[2].trim().into();
+        next.auth = if values[3] == "1" {
+            AuthMethod::Bearer
+        } else {
+            AuthMethod::ApiKey
+        };
+        if values[5] == "1" {
+            if !password.0.is_empty() {
+                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
+            }
+            next.encrypted_key.clear();
+            next.enabled = false;
+        } else if !password.0.is_empty() {
+            if password.0.len() > 4096 || !password.0.bytes().all(|byte| (33..=126).contains(&byte))
+            {
+                return Err("API Key 格式无效".into());
+            }
+            match ai_client::protect_key(&password.0) {
+                Ok(cipher) => next.encrypted_key = cipher,
+                Err(message) => return Err(message),
+            }
+        }
+        if next.enabled {
+            ai_client::validate_settings(&next)
+                .map_err(|message| format!("{message}，AI 配置未保存"))?;
+        } else if !next.endpoint.is_empty()
+            && crate::claude::parse_endpoint(&next.endpoint).is_err()
+        {
+            return Err("API 地址无效，配置未保存".into());
+        }
+        self.cancel_ai();
+        self.settings.ai = next;
+        self.send(Command::SaveSettings(self.settings.clone()));
+        self.retheme();
+        Ok(())
+    }
     unsafe fn apply_settings(&mut self, v: Vec<String>) {
         if self.state.lifecycle != Lifecycle::Running {
             return;
@@ -1422,7 +1681,8 @@ impl App {
         let entries: Vec<(usize, &str)> = if tray {
             vec![
                 (221, "打开面板"),
-                (SETTINGS, "设置"),
+                (GENERAL_SETTINGS, "常规设置…"),
+                (AI_SETTINGS, "AI 检索设置…"),
                 (222, "暂停 / 恢复记录"),
                 (EXIT, "保存后退出"),
             ]
@@ -1471,13 +1731,15 @@ impl App {
     }
     unsafe fn execute_function(&mut self, function: Function) {
         self.cancel_actions();
-        if function != Function::Exit {
+        if function != Function::Exit && function != Function::AiSearch {
             // Result commands return to browsing content. Scope and preview
             // commands read the cleared native Edit through their normal handler.
             let _ = SetWindowTextW(self.edit, w!(""));
         }
         match function {
-            Function::Settings => self.command(SETTINGS),
+            Function::Settings => self.settings(),
+            Function::AiSettings => self.ai_settings(),
+            Function::AiSearch => self.begin_ai(),
             Function::AddFolder => self.command(223),
             Function::AddDocument => self.command(224),
             Function::PauseCapture if !self.settings.capture_paused => self.command(222),
@@ -1520,8 +1782,12 @@ impl App {
                     self.request(Action::Preview);
                 }
             }
-            SETTINGS => self.settings(),
+            SETTINGS => self.settings_menu(),
+            GENERAL_SETTINGS => self.settings(),
+            AI_SETTINGS => self.ai_settings(),
+            AI_FIND => self.begin_ai(),
             300..=303 => {
+                self.cancel_ai();
                 self.scope = match id {
                     301 => Scope::Clipboard,
                     302 => Scope::Folder,
@@ -1552,6 +1818,7 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.cancel_ai();
                 self.cancel_actions();
                 self.clear_preview();
                 self.state.visible = true;
@@ -2044,7 +2311,9 @@ impl Host {
         }
         // Native IsDialogMessage handles Enter for a focused Button. Only the
         // search/list result surfaces activate the chosen stored item.
-        if key == VK_RETURN.0 as u32 && app.buttons.contains(&msg.hwnd) {
+        if key == VK_RETURN.0 as u32
+            && (app.buttons.contains(&msg.hwnd) || msg.hwnd == app.ai_button)
+        {
             return false;
         }
         let panel_key = match key {
@@ -2164,6 +2433,7 @@ impl Host {
                     {
                         continue;
                     }
+                    app.stop_ai_request();
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
                 effect
@@ -2219,6 +2489,33 @@ impl Host {
                     app.state.modal_open = false;
                     if let Some(values) = result {
                         app.apply_settings(values);
+                    }
+                }
+                UiEffect::AiSettings { owner, settings } => {
+                    let result = dialogs::ai_settings_form(owner, &settings);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    let error = result.and_then(|values| app.apply_ai_settings(values).err());
+                    // Opening this form revoked its adopted plan. Cancel and validation
+                    // failure also need a fresh ordinary query rather than derived rows.
+                    app.search();
+                    if let Some(message) = error {
+                        app.effects.push_back(UiEffect::Message { owner, message });
+                    }
+                }
+                UiEffect::AiPrompt { owner } => {
+                    let result = dialogs::form(
+                        owner,
+                        "按意思查找",
+                        &[("描述想找的内容或功能（仅此查询发送给 AI）", String::new())],
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if let Some(values) = result {
+                        let text = wide(&values[0]);
+                        let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
+                        app.search();
+                        app.begin_ai();
                     }
                 }
                 UiEffect::ExitError { owner, message } => {

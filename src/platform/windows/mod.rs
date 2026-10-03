@@ -1,4 +1,6 @@
 pub mod actions;
+pub mod ai_client;
+mod ai_time;
 pub mod clipboard;
 mod dialogs;
 mod theme;

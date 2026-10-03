@@ -46,6 +46,28 @@ pub(crate) struct Repository {
     wal_progress: Box<WalProgress>,
 }
 
+fn period_predicate(
+    from_ms: Option<i64>,
+    until_ms: Option<i64>,
+    first_parameter: usize,
+) -> (String, Vec<i64>) {
+    if from_ms.is_none() && until_ms.is_none() {
+        return (String::new(), Vec::new());
+    }
+    let mut predicate = String::new();
+    let mut bounds = Vec::with_capacity(2);
+    if let Some(from_ms) = from_ms {
+        predicate.push_str(&format!(" AND created_at_ms>=?{first_parameter}"));
+        bounds.push(from_ms);
+    }
+    if let Some(until_ms) = until_ms {
+        let parameter = first_parameter + bounds.len();
+        predicate.push_str(&format!(" AND created_at_ms<?{parameter}"));
+        bounds.push(until_ms);
+    }
+    (predicate, bounds)
+}
+
 impl Repository {
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -226,6 +248,21 @@ impl Repository {
         }
         Ok(())
     }
+    fn candidate_ids_with_bounds(
+        &self,
+        sql: &str,
+        arguments: &[&dyn rusqlite::ToSql],
+        bounds: &[i64],
+        ids: &mut HashSet<i64>,
+    ) -> Result<(), String> {
+        if bounds.is_empty() {
+            return self.candidate_ids(sql, arguments, ids);
+        }
+        let mut combined = Vec::with_capacity(arguments.len() + bounds.len());
+        combined.extend_from_slice(arguments);
+        combined.extend(bounds.iter().map(|value| value as &dyn rusqlite::ToSql));
+        self.candidate_ids(sql, &combined, ids)
+    }
     fn auxiliary_fts_ids(
         &self,
         expression: &str,
@@ -290,6 +327,16 @@ impl Repository {
         })
     }
     pub fn summaries(&self, query: &SearchQuery) -> Result<Vec<ItemSummary>, String> {
+        self.summaries_in_period(query, None, None)
+    }
+    /// Time predicates precede every candidate quota. `until_ms` is exclusive.
+    /// Omitting both bounds leaves the ordinary-search SQL unchanged.
+    pub fn summaries_in_period(
+        &self,
+        query: &SearchQuery,
+        from_ms: Option<i64>,
+        until_ms: Option<i64>,
+    ) -> Result<Vec<ItemSummary>, String> {
         let expression = search::query_expression(&query.text);
         let nonempty = !query.text.trim().is_empty();
         let scope = match query.scope {
@@ -321,11 +368,17 @@ impl Repository {
                 let mut cursor = i64::MAX;
                 let mut accepted = 0;
                 loop {
+                    let (period, bounds) = period_predicate(from_ms, until_ms, 3);
                     let sql = format!(
-                        "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND item_search.rowid<?2 AND {scope} ORDER BY item_search.rowid DESC LIMIT 128"
+                        "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND item_search.rowid<?2 AND {scope}{period} ORDER BY item_search.rowid DESC LIMIT 128"
                     );
                     let mut page = HashSet::new();
-                    self.candidate_ids(&sql, &[&qualified, &cursor], &mut page)?;
+                    self.candidate_ids_with_bounds(
+                        &sql,
+                        &[&qualified, &cursor],
+                        &bounds,
+                        &mut page,
+                    )?;
                     if page.is_empty() {
                         break;
                     }
@@ -361,11 +414,13 @@ impl Repository {
                 }
             }
         } else {
-            self.candidate_ids(
+            let (period, bounds) = period_predicate(from_ms, until_ms, 1);
+            self.candidate_ids_with_bounds(
                 &format!(
-                    "SELECT rowid FROM items WHERE {scope} ORDER BY last_used_ms DESC LIMIT 512"
+                    "SELECT rowid FROM items WHERE {scope}{period} ORDER BY last_used_ms DESC LIMIT 512"
                 ),
                 &[],
+                &bounds,
                 &mut ids,
             )?;
         }
@@ -373,12 +428,17 @@ impl Repository {
             let needle = query.text.trim().to_lowercase();
             let ceiling = format!("{needle}\u{10ffff}");
             for field in ["lower(json_extract(summary,'$.alias'))", "lower(title)"] {
-                self.candidate_ids(
-                    &format!("SELECT rowid FROM items WHERE {scope} AND {field}=?1 LIMIT 128"),
+                let (period, bounds) = period_predicate(from_ms, until_ms, 2);
+                self.candidate_ids_with_bounds(
+                    &format!(
+                        "SELECT rowid FROM items WHERE {scope} AND {field}=?1{period} LIMIT 128"
+                    ),
                     &[&needle],
+                    &bounds,
                     &mut ids,
                 )?;
-                self.candidate_ids(&format!("SELECT rowid FROM items WHERE {scope} AND {field}>=?1 AND {field}<?2 LIMIT 128"),&[&needle,&ceiling],&mut ids)?;
+                let (period, bounds) = period_predicate(from_ms, until_ms, 3);
+                self.candidate_ids_with_bounds(&format!("SELECT rowid FROM items WHERE {scope} AND {field}>=?1 AND {field}<?2{period} LIMIT 128"),&[&needle,&ceiling],&bounds,&mut ids)?;
             }
         }
         // Indexed auxiliary pools preserve old pinned/favorite/recently-used entries
@@ -386,7 +446,8 @@ impl Repository {
         // too: deduplicated captures update recency without changing rowid.
         // Each category has its own quota.
         for predicate in ["pinned=1", "kind<>0", "use_count>0", "1"] {
-            self.candidate_ids(&format!("SELECT rowid FROM items WHERE {scope} AND {predicate} ORDER BY last_used_ms DESC LIMIT 128"),&[],&mut ids)?;
+            let (period, bounds) = period_predicate(from_ms, until_ms, 1);
+            self.candidate_ids_with_bounds(&format!("SELECT rowid FROM items WHERE {scope} AND {predicate}{period} ORDER BY last_used_ms DESC LIMIT 128"),&[],&bounds,&mut ids)?;
         }
         let mut summaries: Vec<_> = confirmed.values().cloned().collect();
         let mut body_candidates = Vec::new();
