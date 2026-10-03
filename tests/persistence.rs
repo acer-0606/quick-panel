@@ -88,6 +88,31 @@ fn capture_is_searchable_before_disk_persistence() {
     assert_eq!(count(&path), 0);
     shutdown(&engine);
 }
+
+#[test]
+fn unified_search_keeps_pending_content_visible_without_persisting_functions() {
+    use quick_panel::palette::{self, Context, Entry, Function};
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("设置操作说明")))
+        .unwrap();
+    let pending = palette::results("设置", search(&engine, "设置"), Context::default());
+    assert_eq!(pending[0].function(), Some(Function::Settings));
+    let content_id = pending.iter().find_map(Entry::saved).unwrap().id.clone();
+    assert_eq!(count(&path), 0);
+    for _ in 0..5 {
+        let entries = palette::results("设置", search(&engine, "设置"), Context::default());
+        assert!(entries.iter().any(|entry| entry.id() == content_id));
+        assert_eq!(count(&path), 0, "search must not flush pending data");
+    }
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |event| matches!(event, Event::Saved(_)));
+    let persisted = palette::results("设置", search(&engine, "设置"), Context::default());
+    assert_eq!(persisted[0].function(), Some(Function::Settings));
+    assert!(persisted.iter().any(|entry| entry.id() == content_id));
+    assert_eq!(count(&path), 1, "function rows never enter saved storage");
+    shutdown(&engine);
+}
 #[test]
 fn shutdown_commits_text_and_binary_atomically_and_releases_database() {
     let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
@@ -144,6 +169,10 @@ fn favorites_and_settings_survive_immediate_reopening() {
     wait(&engine, |e| matches!(e, Event::Saved(_)));
     assert_eq!(count(&path), 1);
     let settings = Settings {
+        hotkey_modifiers: 6,
+        hotkey_key: 80,
+        clipboard_hotkey_modifiers: 0,
+        clipboard_hotkey_key: 0,
         theme: Theme::Dark,
         ..Settings::default()
     };

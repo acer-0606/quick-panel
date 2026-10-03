@@ -222,3 +222,44 @@ fn final_review_deferred_paste_cancels_on_every_interaction_boundary() {
         assert!(!ui.finish_paste(9, false));
     }
 }
+
+#[test]
+fn result_menu_cannot_execute_after_function_is_replaced_by_saved_content() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    ui.replace_ids(vec!["function:show-preview".into()]);
+    let target = ui.menu_target();
+    ui.modal_open = true;
+    ui.replace_ids(vec!["clip:0".into()]);
+    ui.modal_open = false;
+    assert!(!ui.menu_target_current(&target));
+}
+
+#[test]
+fn result_menu_requires_an_original_selection_and_the_same_interaction() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    let empty = ui.menu_target();
+    ui.replace_ids(vec!["a".into()]);
+    assert!(!ui.menu_target_current(&empty));
+    let selected = ui.menu_target();
+    ui.replace_ids(vec!["a".into(), "b".into()]);
+    assert!(ui.menu_target_current(&selected));
+    ui.hide();
+    ui.visible = true;
+    assert!(!ui.menu_target_current(&selected));
+}
+
+#[test]
+fn held_enter_cannot_activate_new_content_after_a_function_clears_the_query() {
+    let mut ui = UiState::default();
+    ui.visible = true;
+    ui.replace_ids(vec!["function:pause".into()]);
+    assert_eq!(ui.key_down(PanelKey::Enter, false), KeyAction::Activate);
+    ui.replace_ids(vec!["clip:new".into()]);
+    assert_eq!(ui.key_down(PanelKey::Enter, true), KeyAction::Ignore);
+    assert_eq!(ui.key_down(PanelKey::Down, true), KeyAction::SelectNext);
+    assert_eq!(ui.key_down(PanelKey::Enter, false), KeyAction::Activate);
+    ui.composing = true;
+    assert_eq!(ui.key_down(PanelKey::Enter, true), KeyAction::NativeInput);
+}

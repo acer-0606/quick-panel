@@ -15,11 +15,17 @@ pub enum PanelKey {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAction {
+    Ignore,
     NativeInput,
     Activate,
     Hide,
     SelectPrevious,
     SelectNext,
+}
+#[derive(Clone, Debug)]
+pub struct MenuTarget {
+    selected: Option<String>,
+    interaction_epoch: u64,
 }
 #[derive(Debug)]
 pub struct UiState {
@@ -82,6 +88,26 @@ impl UiState {
             PanelKey::Up => KeyAction::SelectPrevious,
             PanelKey::Down => KeyAction::SelectNext,
         }
+    }
+    pub fn key_down(&self, key: PanelKey, repeated: bool) -> KeyAction {
+        if !self.composing && key == PanelKey::Enter && repeated {
+            return KeyAction::Ignore;
+        }
+        self.key(key)
+    }
+    pub fn menu_target(&self) -> MenuTarget {
+        MenuTarget {
+            selected: self.selected.clone(),
+            interaction_epoch: self.interaction_epoch,
+        }
+    }
+    pub fn menu_target_current(&self, target: &MenuTarget) -> bool {
+        self.visible
+            && self.lifecycle == Lifecycle::Running
+            && !self.modal_open
+            && target.selected.is_some()
+            && self.selected == target.selected
+            && self.interaction_epoch == target.interaction_epoch
     }
     pub fn begin_action(&mut self, request_id: u64) -> bool {
         if !self.visible || self.lifecycle != Lifecycle::Running || self.modal_open {

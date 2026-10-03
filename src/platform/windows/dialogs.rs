@@ -108,9 +108,9 @@ pub unsafe fn settings_form(
             "设置",
             &[
                 ("外观主题", Field::Choice(theme)),
-                ("呼出快捷键（如 Ctrl+Alt+Space）", Field::Text(hotkey)),
+                ("呼出快捷键（留空关闭）", Field::Text(hotkey)),
                 (
-                    "剪贴板快捷键（如 Ctrl+Alt+V）",
+                    "剪贴板专用快捷键（留空关闭）",
                     Field::Text(clipboard_hotkey),
                 ),
                 ("记录状态", Field::Toggle(paused)),

@@ -6,8 +6,10 @@ use super::{
 };
 use crate::{
     engine::Engine,
+    hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
     model::*,
-    ui_state::{KeyAction, Lifecycle, PanelKey, UiState},
+    palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
+    ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -103,7 +105,7 @@ struct RenderState {
     theme: Theme,
     font: HFONT,
     brush: HBRUSH,
-    items: Vec<ItemSummary>,
+    items: Vec<PaletteEntry>,
     image: Option<Arc<Image>>,
 }
 impl RenderState {
@@ -140,6 +142,7 @@ enum UiEffect {
         x: i32,
         y: i32,
         entries: Vec<(usize, &'static str)>,
+        target: Option<MenuTarget>,
     },
     Destroy(HWND),
 }
@@ -231,8 +234,7 @@ impl Drop for WindowGuard {
 struct App {
     host: *const Host,
     effects: VecDeque<UiEffect>,
-    hotkey_ids: [i32; 2],
-    hotkey_registered: [bool; 2],
+    hotkey_bindings: HotkeyBindings,
     hwnd: HWND,
     edit: HWND,
     list: HWND,
@@ -244,7 +246,11 @@ struct App {
     engine: Option<Engine>,
     state: UiState,
     settings: Settings,
-    items: Vec<ItemSummary>,
+    items: Vec<PaletteEntry>,
+    saved_items: Vec<ItemSummary>,
+    saved_ready: bool,
+    query: String,
+    result_scope: Scope,
     scope: Scope,
     target: HWND,
     load_id: u64,
@@ -388,8 +394,7 @@ pub fn run() -> Result<(), String> {
         let app_data = App {
             host: std::ptr::null(),
             effects: VecDeque::new(),
-            hotkey_ids: [1, 2],
-            hotkey_registered: [false, false],
+            hotkey_bindings: HotkeyBindings::default(),
             hwnd: HWND::default(),
             edit: HWND::default(),
             list: HWND::default(),
@@ -402,6 +407,10 @@ pub fn run() -> Result<(), String> {
             state: UiState::default(),
             settings: Settings::default(),
             items: Vec::new(),
+            saved_items: Vec::new(),
+            saved_ready: false,
+            query: String::new(),
+            result_scope: Scope::All,
             scope: Scope::All,
             target: HWND::default(),
             load_id: 0,
@@ -642,7 +651,9 @@ impl App {
             self.edit,
             EM_SETCUEBANNER,
             Some(WPARAM(0)),
-            Some(LPARAM(w!("搜索历史、文件夹、文档…").0 as isize)),
+            Some(LPARAM(
+                w!("搜索内容或功能，如 周报、设置、添加文件夹…").0 as isize,
+            )),
         );
         self.list = self.control(
             w!("LISTBOX"),
@@ -657,7 +668,7 @@ impl App {
         )?;
         self.footer = self.control(
             w!("STATIC"),
-            "↑↓ 选择  Enter 打开/粘贴  Ctrl+K 更多",
+            "↑↓ 选择  Enter 执行  Esc 关闭",
             WINDOW_STYLE::default(),
             109,
         )?;
@@ -805,63 +816,26 @@ impl App {
             .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default()),
             ..Default::default()
         };
-        let title = wide("快捷面板 · Ctrl+Alt+Space");
+        let key = format_hotkey(self.settings.hotkey_modifiers, self.settings.hotkey_key);
+        let title = wide(&if key.is_empty() {
+            "快捷面板 · 点击打开".into()
+        } else {
+            format!("快捷面板 · {key}")
+        });
         data.szTip[..title.len()].copy_from_slice(&title);
         let _ = Shell_NotifyIconW(operation, &data);
     }
     unsafe fn replace_hotkeys(&mut self, next: &Settings) -> Result<(), String> {
-        let old = [
-            (self.settings.hotkey_modifiers, self.settings.hotkey_key),
-            (
-                self.settings.clipboard_hotkey_modifiers,
-                self.settings.clipboard_hotkey_key,
-            ),
-        ];
-        let new = [
-            (next.hotkey_modifiers, next.hotkey_key),
-            (next.clipboard_hotkey_modifiers, next.clipboard_hotkey_key),
-        ];
-        // A second ID pair validates registrations while old bindings stay active.
-        // Unchanged keys retain their current IDs; swaps of our existing keys reuse IDs.
-        let fresh: Vec<_> = [11, 12, 21, 22, 31, 32]
-            .into_iter()
-            .filter(|id| !self.hotkey_ids.contains(id))
-            .take(2)
-            .collect();
-        let mut ids = [0i32; 2];
-        let mut registered = Vec::new();
-        for i in 0..2 {
-            if let Some(j) = old.iter().position(|key| *key == new[i])
-                && self.hotkey_registered[j]
-            {
-                ids[i] = self.hotkey_ids[j];
-                continue;
-            }
-            let id = fresh[i];
-            if RegisterHotKey(
-                Some(self.hwnd),
-                id,
-                HOT_KEY_MODIFIERS(new[i].0) | MOD_NOREPEAT,
-                new[i].1,
-            )
-            .is_err()
-            {
-                for id in registered {
-                    let _ = UnregisterHotKey(Some(self.hwnd), id);
-                }
-                return Err("快捷键已被占用，原快捷键保持不变。请打开设置选择其他组合。".into());
-            }
-            registered.push(id);
-            ids[i] = id;
-        }
-        for id in self.hotkey_ids {
-            if !ids.contains(&id) {
-                let _ = UnregisterHotKey(Some(self.hwnd), id);
-            }
-        }
-        self.hotkey_ids = ids;
-        self.hotkey_registered = [true, true];
-        Ok(())
+        let keys = settings_hotkeys(next)?;
+        let hwnd = self.hwnd;
+        self.hotkey_bindings.replace(
+            keys,
+            |id, key| {
+                RegisterHotKey(Some(hwnd), id, HOT_KEY_MODIFIERS(key.modifiers) | MOD_NOREPEAT, key.key)
+                    .map_err(|_| "快捷键注册失败，可能被占用或受系统限制。原快捷键保持不变，请在设置中换用其他组合或留空关闭。".into())
+            },
+            |id| { let _ = UnregisterHotKey(Some(hwnd), id); },
+        )
     }
     unsafe fn show(&mut self, scope: Option<Scope>) {
         self.show_panel(scope, true);
@@ -920,6 +894,9 @@ impl App {
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
     unsafe fn search(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
         self.cancel_actions();
         let current = match self.scope {
             Scope::All => 0,
@@ -935,12 +912,55 @@ impl App {
                 None,
             );
         }
+        let query = dialogs::text(self.edit);
+        if query != self.query || self.scope != self.result_scope {
+            self.saved_items.clear();
+            self.saved_ready = false;
+        }
+        self.query = query;
+        self.result_scope = self.scope;
         let id = self.state.next_request();
+        self.rebuild_results();
         self.send(Command::Search(SearchQuery {
-            text: dialogs::text(self.edit),
+            text: self.query.clone(),
             scope: self.scope,
             request_id: id,
         }));
+    }
+    unsafe fn rebuild_results(&mut self) {
+        self.items = palette::results(
+            &self.query,
+            self.saved_items.clone(),
+            PaletteContext {
+                capture_paused: self.settings.capture_paused,
+                preview_open: self.preview_open,
+                content_ready: self.saved_ready,
+            },
+        );
+        self.state.replace_ids(
+            self.items
+                .iter()
+                .map(|entry| entry.id().to_owned())
+                .collect(),
+        );
+        self.sync_render();
+        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
+        SendMessageW(self.list, LB_RESETCONTENT, None, None);
+        for item in &self.items {
+            let title = wide(item.title());
+            SendMessageW(
+                self.list,
+                LB_ADDSTRING,
+                None,
+                Some(LPARAM(title.as_ptr() as isize)),
+            );
+        }
+        if let Some(index) = self.state.selected_index() {
+            SendMessageW(self.list, LB_SETCURSEL, Some(WPARAM(index)), None);
+        }
+        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
+        let _ = InvalidateRect(Some(self.list), None, true);
+        self.selection();
     }
     unsafe fn capture(&mut self) {
         let sequence = clipboard::sequence_number();
@@ -1000,31 +1020,14 @@ impl App {
                             message: e,
                         });
                     }
+                    self.tray(NIM_MODIFY);
                     self.search();
                 }
                 Event::Results { request_id, items } => {
                     if self.state.is_current(request_id) {
-                        self.state
-                            .replace_ids(items.iter().map(|x| x.id.clone()).collect());
-                        self.items = items;
-                        self.sync_render();
-                        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
-                        SendMessageW(self.list, LB_RESETCONTENT, None, None);
-                        for item in &self.items {
-                            let t = wide(&item.title);
-                            SendMessageW(
-                                self.list,
-                                LB_ADDSTRING,
-                                None,
-                                Some(LPARAM(t.as_ptr() as isize)),
-                            );
-                        }
-                        if let Some(i) = self.state.selected_index() {
-                            SendMessageW(self.list, LB_SETCURSEL, Some(WPARAM(i)), None);
-                        }
-                        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
-                        let _ = InvalidateRect(Some(self.list), None, true);
-                        self.selection();
+                        self.saved_items = items;
+                        self.saved_ready = true;
+                        self.rebuild_results();
                     }
                 }
                 Event::Loaded { request_id, item } => {
@@ -1097,19 +1100,26 @@ impl App {
             self.state.select(i as usize);
         } else {
             self.state.select(usize::MAX);
-            self.status("没有匹配结果 · 可切换范围或添加收藏");
+            self.status(if self.saved_ready {
+                "没有匹配结果 · 可换个关键词或添加收藏"
+            } else {
+                "正在检索保存内容…"
+            });
             return;
         }
-        let clipboard = self
-            .items
-            .get(i.max(0) as usize)
-            .is_some_and(|i| i.kind == ItemKind::Clipboard);
-        self.status(if clipboard {
-            "Enter 粘贴 · Shift+Enter 纯文本 · Ctrl+C 复制 · Ctrl+K 更多"
+        let selected = self.items.get(i as usize);
+        let function = selected.is_some_and(|entry| entry.function().is_some());
+        let clipboard = selected
+            .and_then(PaletteEntry::saved)
+            .is_some_and(|item| item.kind == ItemKind::Clipboard);
+        self.status(if function {
+            "Enter 执行功能 · Esc 关闭"
+        } else if clipboard {
+            "Enter 粘贴 · Esc 关闭 · 右键更多"
         } else {
-            "Enter 打开 · Ctrl+C 复制路径 · Ctrl+K 更多"
+            "Enter 打开 · Esc 关闭 · 右键更多"
         });
-        if self.preview_open {
+        if self.preview_open && !function {
             self.request(Action::Preview);
         }
     }
@@ -1118,6 +1128,17 @@ impl App {
             return;
         }
         if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        if let Some(function) = self
+            .state
+            .selected_index()
+            .and_then(|index| self.items.get(index))
+            .and_then(PaletteEntry::function)
+        {
+            if matches!(action, Action::Open(_)) {
+                self.execute_function(function);
+            }
             return;
         }
         if let Some(id) = self.state.selected_id().map(str::to_owned) {
@@ -1364,15 +1385,15 @@ impl App {
             "2" => Theme::Dark,
             _ => Theme::System,
         };
-        let keys = parse_hotkey(&v[1]).zip(parse_hotkey(&v[2]));
-        let Some(((m, k), (cm, ck))) = keys else {
-            self.status("快捷键无效；请输入 Ctrl/Alt/Shift/Win + 字母、数字、Space 或 F1–F24");
-            return;
+        let keys = parse_hotkey(&v[1])
+            .and_then(|main| parse_hotkey(&v[2]).map(|clipboard| (main, clipboard)));
+        let ((m, k), (cm, ck)) = match keys {
+            Ok(keys) => keys,
+            Err(message) => {
+                self.status(&message);
+                return;
+            }
         };
-        if (m, k) == (cm, ck) || (m == 8 && k == 86) || (cm == 8 && ck == 86) {
-            self.status("两组快捷键须不同；Win+V 留给系统剪贴板");
-            return;
-        }
         settings.hotkey_modifiers = m;
         settings.hotkey_key = k;
         settings.clipboard_hotkey_modifiers = cm;
@@ -1393,7 +1414,9 @@ impl App {
         }
         self.settings = settings.clone();
         self.retheme();
+        self.tray(NIM_MODIFY);
         self.send(Command::SaveSettings(settings));
+        self.search();
     }
     unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
         let entries: Vec<(usize, &str)> = if tray {
@@ -1408,7 +1431,15 @@ impl App {
         } else if self
             .state
             .selected_index()
+            .and_then(|index| self.items.get(index))
+            .is_some_and(|entry| entry.function().is_some())
+        {
+            vec![(OPEN, "执行功能")]
+        } else if self
+            .state
+            .selected_index()
             .and_then(|i| self.items.get(i))
+            .and_then(PaletteEntry::saved)
             .is_some_and(|i| i.kind == ItemKind::Clipboard)
         {
             vec![
@@ -1435,7 +1466,31 @@ impl App {
             x,
             y,
             entries,
+            target: (!tray && !add).then(|| self.state.menu_target()),
         });
+    }
+    unsafe fn execute_function(&mut self, function: Function) {
+        self.cancel_actions();
+        if function != Function::Exit {
+            // Result commands return to browsing content. Scope and preview
+            // commands read the cleared native Edit through their normal handler.
+            let _ = SetWindowTextW(self.edit, w!(""));
+        }
+        match function {
+            Function::Settings => self.command(SETTINGS),
+            Function::AddFolder => self.command(223),
+            Function::AddDocument => self.command(224),
+            Function::PauseCapture if !self.settings.capture_paused => self.command(222),
+            Function::ResumeCapture if self.settings.capture_paused => self.command(222),
+            Function::ShowPreview if !self.preview_open => self.command(PREVIEW),
+            Function::HidePreview if self.preview_open => self.command(PREVIEW),
+            Function::All => self.command(300),
+            Function::Clipboard => self.command(301),
+            Function::Folders => self.command(302),
+            Function::Documents => self.command(303),
+            Function::Exit => self.command(EXIT),
+            _ => {}
+        }
     }
     unsafe fn command(&mut self, id: usize) {
         if self.state.lifecycle != Lifecycle::Running && id != EXIT {
@@ -1510,60 +1565,6 @@ impl App {
         }
     }
 }
-fn parse_hotkey(value: &str) -> Option<(u32, u32)> {
-    let mut mods = 0;
-    let mut key = None;
-    for part in value.split('+').map(str::trim) {
-        match part.to_ascii_uppercase().as_str() {
-            "CTRL" => mods |= 2,
-            "ALT" => mods |= 1,
-            "SHIFT" => mods |= 4,
-            "WIN" => mods |= 8,
-            "SPACE" => {
-                if key.replace(32).is_some() {
-                    return None;
-                }
-            }
-            s => {
-                let k = if s.len() == 1 && s.as_bytes()[0].is_ascii_alphanumeric() {
-                    s.as_bytes()[0] as u32
-                } else if let Some(f) = s
-                    .strip_prefix('F')
-                    .and_then(|n| n.parse::<u32>().ok())
-                    .filter(|n| (1..=24).contains(n))
-                {
-                    111 + f
-                } else {
-                    return None;
-                };
-                if key.replace(k).is_some() {
-                    return None;
-                }
-            }
-        }
-    }
-    if mods == 0 {
-        return None;
-    }
-    key.map(|k| (mods, k))
-}
-fn format_hotkey(mods: u32, key: u32) -> String {
-    let mut p = Vec::new();
-    for (bit, name) in [(2, "Ctrl"), (1, "Alt"), (4, "Shift"), (8, "Win")] {
-        if mods & bit != 0 {
-            p.push(name.to_owned());
-        }
-    }
-    p.push(if key == 32 {
-        "Space".into()
-    } else if (112..=135).contains(&key) {
-        format!("F{}", key - 111)
-    } else {
-        char::from_u32(key).unwrap_or('?').to_string()
-    });
-    p.join("+")
-}
-
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -1673,7 +1674,9 @@ unsafe fn app_message(
             return Some(LRESULT(0));
         }
         WM_HOTKEY => {
-            app.show((wp.0 as i32 == app.hotkey_ids[1]).then_some(Scope::Clipboard));
+            if let Some(action) = app.hotkey_bindings.action_for(wp.0 as i32) {
+                app.show((action == 1).then_some(Scope::Clipboard));
+            }
             return Some(LRESULT(0));
         }
         WM_CLOSE => {
@@ -1788,9 +1791,9 @@ unsafe fn app_message(
         WM_QUERYENDSESSION => return Some(LRESULT(1)),
         WM_DESTROY => {
             let _ = RemoveClipboardFormatListener(hwnd);
-            for id in app.hotkey_ids {
+            app.hotkey_bindings.clear(|id| {
                 let _ = UnregisterHotKey(Some(hwnd), id);
-            }
+            });
             app.tray(NIM_DELETE);
             let _ = RemoveWindowSubclass(app.preview, Some(preview_proc), 3);
             let _ = RemoveWindowSubclass(app.edit, Some(edit_proc), 1);
@@ -1839,15 +1842,11 @@ unsafe fn render_message(
                 let _ = DeleteObject(brush.into());
                 let _ = SetBkMode(draw.hDC, TRANSPARENT);
                 let _ = SelectObject(draw.hDC, render.font.into());
-                let kind = match item.kind {
-                    ItemKind::Clipboard => "▤ 剪贴板",
-                    ItemKind::Folder => "▣ 文件夹",
-                    ItemKind::Document => "▧ 文档",
-                };
+                let kind = item.kind_label();
                 let mut title = wide(&format!(
                     "{}{}",
-                    if item.pinned { "★ " } else { "" },
-                    item.title
+                    if item.pinned() { "★ " } else { "" },
+                    item.title()
                 ));
                 let mut rect = draw.rcItem;
                 rect.left += render.s(14);
@@ -1873,12 +1872,7 @@ unsafe fn render_message(
                     &mut type_rect,
                     DT_SINGLELINE | DT_NOPREFIX,
                 );
-                let subtitle = if item.alias.is_empty() {
-                    item.subtitle.clone()
-                } else {
-                    format!("{} · {}", item.alias, item.subtitle)
-                };
-                let mut subtitle = wide(&subtitle);
+                let mut subtitle = wide(&item.subtitle());
                 rect.top += render.s(26);
                 rect.bottom = rect.top + render.s(22);
                 rect.right = draw.rcItem.right - render.s(14);
@@ -2039,6 +2033,15 @@ impl Host {
         let key = msg.wParam.0 as u32;
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+        // WM_KEYDOWN bit 30 distinguishes auto-repeat from a fresh press. A
+        // function may clear the query before keyup; repeats must not activate
+        // the newly selected saved item, including after native menus return.
+        let repeated = msg.lParam.0 & (1 << 30) != 0;
+        if key == VK_RETURN.0 as u32
+            && app.state.key_down(PanelKey::Enter, repeated) == KeyAction::Ignore
+        {
+            return true;
+        }
         // Native IsDialogMessage handles Enter for a focused Button. Only the
         // search/list result surfaces activate the chosen stored item.
         if key == VK_RETURN.0 as u32 && app.buttons.contains(&msg.hwnd) {
@@ -2052,7 +2055,8 @@ impl Host {
             _ => None,
         };
         if let Some(panel_key) = panel_key {
-            match app.state.key(panel_key) {
+            match app.state.key_down(panel_key, repeated) {
+                KeyAction::Ignore => {}
                 KeyAction::NativeInput => return false,
                 KeyAction::Hide => app.hide(),
                 KeyAction::Activate => app.request(Action::Open(shift)),
@@ -2255,6 +2259,7 @@ impl Host {
                     x,
                     y,
                     entries,
+                    target,
                 } => {
                     if let Ok(menu) = CreatePopupMenu() {
                         for (id, title) in entries {
@@ -2292,7 +2297,14 @@ impl Host {
                         {
                             app.hide();
                         } else if command != 0 {
-                            app.command(command);
+                            if target
+                                .as_ref()
+                                .is_none_or(|target| app.state.menu_target_current(target))
+                            {
+                                app.command(command);
+                            } else {
+                                app.status("结果已更新，请重新选择后操作");
+                            }
                         }
                     } else {
                         self.app.borrow_mut().state.modal_open = false;
