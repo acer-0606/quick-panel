@@ -3,7 +3,8 @@ use quick_panel::{
     semantic::{IndexBatch, IndexCursor},
     semantic_ui::{
         IndexSession, QuerySession, cancel_semantic_view, finish_semantic_effect,
-        prepare_semantic_effect, resume_ordinary_query, sync_semantic_view,
+        finish_semantic_effect_with_revoke, prepare_semantic_effect, resume_ordinary_query,
+        sync_semantic_view,
     },
     ui_state::UiState,
 };
@@ -485,5 +486,108 @@ fn revoked_modal_return_during_shutdown_never_issues_query() {
         assert_eq!(state.lifecycle, lifecycle);
         assert!(saved.is_empty());
         assert!(session.local_query(90).is_none());
+    }
+}
+
+// The native completion contract must revoke Claude before returning its final token.
+#[test]
+fn adopted_claude_plan_modal_cancel_returns_current_ordinary_search_token() {
+    use quick_panel::{ai::AiPlan, ai_jobs::revoke_adopted_plan, model::ItemSummary};
+    let mut session = QuerySession::default();
+    let mut state = UiState::default();
+    state.visible = true;
+    let old = state.next_request();
+    state.replace_ids(vec!["old-ai-result".into()]);
+    let mut plan = Some(AiPlan {
+        queries: vec!["退款".into()],
+        ..AiPlan::default()
+    });
+    let mut saved: Vec<ItemSummary> = vec![];
+    let mut ready = true;
+    state.modal_open = true;
+    // General-settings cancellation forces ordinary restoration even without a semantic mode.
+    let search = finish_semantic_effect_with_revoke(
+        &mut session,
+        &mut state,
+        &mut saved,
+        &mut ready,
+        ("退款", Scope::Document, true),
+        |state, saved, ready| {
+            revoke_adopted_plan(&mut plan, state, saved, ready);
+        },
+    )
+    .expect("settings cancellation must send an ordinary search");
+    assert!(plan.is_none());
+    assert!(!state.is_current(old));
+    let Command::Search(sent) = Command::Search(search) else {
+        unreachable!()
+    };
+    assert!(
+        state.is_current(sent.request_id),
+        "final Search token was invalidated by Claude plan revocation"
+    );
+    assert_eq!(sent.text, "退款");
+    assert_eq!(sent.scope, Scope::Document);
+    // This is the same token predicate used by native Event::Results acceptance.
+    if state.is_current(sent.request_id) {
+        state.replace_ids(vec!["ordinary-result".into()]);
+    }
+    assert_eq!(state.selected_id(), Some("ordinary-result"));
+    assert!(!state.modal_open);
+}
+
+#[test]
+fn modal_completion_guards_do_not_revoke_claude_plan() {
+    use quick_panel::{
+        ai::AiPlan, ai_jobs::revoke_adopted_plan, model::ItemSummary, ui_state::Lifecycle,
+    };
+    for guarded in [
+        "menu",
+        "new semantic request",
+        "new semantic results",
+        "hidden",
+        "shutdown",
+    ] {
+        let mut session = QuerySession::default();
+        let mut state = UiState::default();
+        state.visible = true;
+        let old = state.next_request();
+        state.replace_ids(vec!["ai-result".into()]);
+        let mut plan = Some(AiPlan::default());
+        let mut saved: Vec<ItemSummary> = vec![];
+        let mut ready = true;
+        let revoked = guarded != "menu";
+        match guarded {
+            "new semantic request" => session.begin(9, "new", Scope::All, "p"),
+            "new semantic results" => {
+                session.begin(9, "new", Scope::All, "p");
+                assert!(session.finish(9, "new", Scope::All, "p", true, vec![1., 0.]));
+            }
+            "hidden" => state.hide(),
+            "shutdown" => state.lifecycle = Lifecycle::Saving,
+            _ => (),
+        }
+        state.modal_open = true;
+        assert!(
+            finish_semantic_effect_with_revoke(
+                &mut session,
+                &mut state,
+                &mut saved,
+                &mut ready,
+                ("退款", Scope::Document, revoked),
+                |state, saved, ready| {
+                    revoke_adopted_plan(&mut plan, state, saved, ready);
+                },
+            )
+            .is_none(),
+            "{guarded}"
+        );
+        assert!(
+            plan.is_some(),
+            "{guarded} must not revoke the adopted Claude plan"
+        );
+        assert!(state.is_current(old));
+        assert!(ready);
+        assert!(!state.modal_open);
     }
 }

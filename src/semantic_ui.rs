@@ -286,9 +286,37 @@ pub fn finish_semantic_effect<T>(
     scope: Scope,
     revoked: bool,
 ) -> Option<crate::model::SearchQuery> {
+    finish_semantic_effect_with_revoke(
+        session,
+        state,
+        saved,
+        ready,
+        (text, scope, revoked),
+        |_, _, _| {},
+    )
+}
+
+/// Complete the same modal contract while revoking any other adopted local query mode.
+pub fn finish_semantic_effect_with_revoke<T>(
+    session: &mut QuerySession,
+    state: &mut UiState,
+    saved: &mut Vec<T>,
+    ready: &mut bool,
+    view: (&str, Scope, bool),
+    revoke: impl FnOnce(&mut UiState, &mut Vec<T>, &mut bool),
+) -> Option<crate::model::SearchQuery> {
+    let (text, scope, revoked) = view;
     state.modal_open = false;
-    if !revoked || session.busy() || session.adopted() {
+    if !revoked
+        || session.busy()
+        || session.adopted()
+        || !state.visible
+        || state.lifecycle != crate::ui_state::Lifecycle::Running
+    {
         return None;
     }
+    // Other adopted modes may invalidate the request token when revoked.
+    // Allocate the final ordinary token only after those invalidations complete.
+    revoke(state, saved, ready);
     resume_ordinary_query(session, state, saved, ready, text, scope)
 }

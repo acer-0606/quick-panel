@@ -14,7 +14,7 @@ use crate::{
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
     semantic::{self, EmbeddingSettings, IndexScope},
     semantic_ui::{
-        IndexSession, QuerySession, finish_semantic_effect, prepare_semantic_effect,
+        IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
         sync_semantic_view,
     },
     ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
@@ -786,16 +786,17 @@ impl App {
     }
     unsafe fn restore_after_modal(&mut self, revoked: bool) {
         let text = dialogs::text(self.edit);
-        if let Some(query) = finish_semantic_effect(
+        if let Some(query) = finish_semantic_effect_with_revoke(
             &mut self.semantic_query,
             &mut self.state,
             &mut self.saved_items,
             &mut self.saved_ready,
-            &text,
-            self.scope,
-            revoked,
+            (&text, self.scope, revoked),
+            |state, saved, ready| {
+                revoke_adopted_plan(&mut self.ai_plan, state, saved, ready);
+            },
         ) {
-            self.cancel_ai();
+            self.stop_ai_request();
             self.query = text;
             self.result_scope = self.scope;
             self.cancel_actions();
