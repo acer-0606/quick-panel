@@ -393,3 +393,59 @@ fn all_control_clipboard_body_never_indexes_its_image_title() {
     assert!(candidate(&saved, IndexScope::AllText).is_none());
     assert!(candidate(&saved, IndexScope::PinnedAndFavorites).is_none());
 }
+
+#[test]
+fn truncated_whitespace_candidate_cannot_break_prepare_or_worker_batches() {
+    use quick_panel::embedding_jobs::{EmbeddingRequest, EmbeddingWorker};
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+
+    for prefix in [" ", "\n", "\t", "\u{3000}"] {
+        let mut bad = item(ItemKind::Clipboard);
+        bad.summary.title.clear();
+        bad.summary.alias.clear();
+        bad.summary.tags.clear();
+        bad.text = format!("{}正文", prefix.repeat(4096));
+        let original = bad.clone();
+        let mut good = bad.clone();
+        good.summary.id = "saved:valid".into();
+        good.text = "正文".into();
+        let inputs: Vec<String> = [&bad, &good]
+            .into_iter()
+            .filter_map(|item| candidate(item, IndexScope::AllText))
+            .map(|candidate| candidate.text)
+            .collect();
+        let prepared = embedding::prepare(&settings(), "fixture-key", &inputs);
+        let (completed, completions) = mpsc::channel();
+        let worker = EmbeddingWorker::start(
+            |request| {
+                assert_eq!(request.inputs, ["正文"]);
+                Ok(vec![vec![1.0]])
+            },
+            Arc::new(move || {
+                completed.send(()).unwrap();
+            }),
+        );
+        let admitted = worker.submit(EmbeddingRequest {
+            settings: settings(),
+            inputs,
+        });
+        assert!(
+            candidate(&bad, IndexScope::AllText).is_none(),
+            "pure whitespace after truncation must be skipped"
+        );
+        assert!(
+            prepared.is_ok(),
+            "unusable candidate rejected whole batch: {prepared:?}"
+        );
+        assert!(
+            admitted.is_ok(),
+            "unusable candidate rejected whole worker batch: {admitted:?}"
+        );
+        completions.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(worker.try_result().unwrap().id, admitted.unwrap());
+        assert_eq!(bad, original);
+    }
+}

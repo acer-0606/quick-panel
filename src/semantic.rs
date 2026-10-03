@@ -147,7 +147,7 @@ pub fn candidate(item: &StoredItem, scope: IndexScope) -> Option<EmbeddingCandid
             remaining -= 1;
         }
     }
-    if text.is_empty() {
+    if !has_input_text(&text) {
         return None;
     }
     let text_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
