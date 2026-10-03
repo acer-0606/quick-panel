@@ -98,3 +98,7 @@ Consume engine and native actions. Produce platform::windows::run() -> Result<()
 ## Completion — 2026-10-03
 
 All five implementation tasks are complete. Final product source is c12fae1. Root verification: 72 passing tests, macOS and Windows strict Clippy, Windows GNU Release build and package, core-check, and fresh 10k/100k query benchmarks. Two large Release regressions also passed separately. Independent final review and scoped fix reviews are clean. See [verification](../../verification.md) for measured numbers and the Windows runtime boundary. Windows GUI acceptance, MSVC execution and remote CI execution remain unverified; these are explicitly documented rather than treated as completed tests.
+
+## Approved follow-up — 2026-10-03
+
+The user approved one default global shortcut, editable and disableable in settings, and unified search for functions plus saved content. Implemented in 18587d1 with an in-memory typed function catalog, bounded merged results and native action reuse. Existing saved hotkey configuration is preserved. Final checks: 89 passing tests, macOS / Windows strict Clippy, Windows / macOS Release builds and core-check. Independent scoped review resolved modal-menu identity, Enter auto-repeat and loading-empty behavior. The current verification document distinguishes the new palette microbenchmark from the earlier core database benchmark; Windows actual GUI acceptance remains outstanding.
