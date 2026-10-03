@@ -318,3 +318,78 @@ fn vector_validation_and_cosine_handle_bounds_nonfinite_and_large_coordinates() 
     assert!(cosine_distance(&[1.0], &[1.0, 0.0]).is_err());
     assert!(cosine_distance(&[0.0], &[1.0]).is_err());
 }
+
+#[test]
+fn candidate_removes_unsupported_controls_before_prepare_and_worker_admission() {
+    use quick_panel::embedding_jobs::{EmbeddingRequest, EmbeddingWorker};
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+
+    let mut saved = item(ItemKind::Clipboard);
+    saved.summary.title = "标\0题".into();
+    saved.summary.alias = "别\u{7f}名".into();
+    saved.summary.tags = vec!["标\u{1b}签".into()];
+    saved.text = "甲\n乙\r丙\t丁\u{1}\u{c}尾".into();
+    let original = saved.clone();
+    let candidate = candidate(&saved, IndexScope::AllText).unwrap();
+    let prepared = embedding::prepare(&settings(), "fixture-key", &[candidate.text.clone()]);
+    let (completed, completions) = mpsc::channel();
+    let worker = EmbeddingWorker::start(
+        |request| {
+            assert_eq!(request.inputs, ["标题\n别名\n标签\n甲\n乙\r丙\t丁尾"]);
+            Ok(vec![vec![1.0, 0.0]])
+        },
+        Arc::new(move || {
+            completed.send(()).unwrap();
+        }),
+    );
+    let admitted = worker.submit(EmbeddingRequest {
+        settings: settings(),
+        inputs: vec![candidate.text.clone()],
+    });
+    assert!(
+        prepared.is_ok(),
+        "candidate rejected by prepare: {prepared:?}"
+    );
+    assert!(
+        admitted.is_ok(),
+        "candidate rejected by worker: {admitted:?}"
+    );
+    assert_eq!(candidate.text, "标题\n别名\n标签\n甲\n乙\r丙\t丁尾");
+    completions.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(worker.try_result().unwrap().id, admitted.unwrap());
+    assert_eq!(
+        saved, original,
+        "semantic input normalization changed saved original"
+    );
+}
+
+#[test]
+fn candidate_filters_controls_before_truncation_and_hashing() {
+    let mut saved = item(ItemKind::Clipboard);
+    saved.summary.title.clear();
+    saved.summary.alias.clear();
+    saved.summary.tags.clear();
+    saved.text = format!("{}正文", "\0".repeat(6000));
+    let filtered = candidate(&saved, IndexScope::AllText).unwrap();
+    assert_eq!(filtered.text, "正文");
+    saved.text = "正文".into();
+    assert_eq!(
+        filtered.text_hash,
+        candidate(&saved, IndexScope::AllText).unwrap().text_hash
+    );
+}
+
+#[test]
+fn all_control_clipboard_body_never_indexes_its_image_title() {
+    let mut saved = item(ItemKind::Clipboard);
+    saved.text = "\0\u{1}\u{7f}\u{1b}\n\r\t".into();
+    saved.representations = vec![Representation {
+        format: "PNG".into(),
+        data: vec![1, 2, 3],
+    }];
+    assert!(candidate(&saved, IndexScope::AllText).is_none());
+    assert!(candidate(&saved, IndexScope::PinnedAndFavorites).is_none());
+}

@@ -1,7 +1,7 @@
 //! OpenAI-compatible Embeddings protocol; only explicit bounded text batches.
 use crate::{
     claude::{Endpoint, HttpRequest},
-    semantic::{EmbeddingSettings, MAX_INPUT_CHARS, validate_vectors},
+    semantic::{EmbeddingSettings, MAX_INPUT_CHARS, sendable_character, validate_vectors},
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -40,7 +40,7 @@ pub(crate) fn validate_request(
             || input.chars().count() > MAX_INPUT_CHARS
             || input
                 .chars()
-                .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+                .any(|character| !sendable_character(character))
         {
             return Err("语义输入为空、过长或含无效字符".into());
         }

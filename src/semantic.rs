@@ -102,10 +102,19 @@ pub fn profile_id(settings: &EmbeddingSettings) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
+pub(crate) fn sendable_character(character: char) -> bool {
+    !character.is_control() || matches!(character, '\n' | '\r' | '\t')
+}
+
+fn has_input_text(text: &str) -> bool {
+    text.chars()
+        .any(|character| sendable_character(character) && !character.is_whitespace())
+}
+
 pub fn candidate(item: &StoredItem, scope: IndexScope) -> Option<EmbeddingCandidate> {
     let clipboard = item.summary.kind == ItemKind::Clipboard;
     if clipboard
-        && (item.text.trim().is_empty()
+        && (!has_input_text(&item.text)
             || (scope == IndexScope::PinnedAndFavorites && !item.summary.pinned))
     {
         return None;
@@ -121,7 +130,7 @@ pub fn candidate(item: &StoredItem, scope: IndexScope) -> Option<EmbeddingCandid
         .chain(std::iter::once(content));
     let mut text = String::new();
     let mut remaining = MAX_INPUT_CHARS;
-    for field in fields.filter(|field| !field.trim().is_empty()) {
+    for field in fields.filter(|field| has_input_text(field)) {
         if remaining == 0 {
             break;
         }
@@ -129,7 +138,11 @@ pub fn candidate(item: &StoredItem, scope: IndexScope) -> Option<EmbeddingCandid
             text.push('\n');
             remaining -= 1;
         }
-        for character in field.chars().take(remaining) {
+        for character in field
+            .chars()
+            .filter(|character| sendable_character(*character))
+            .take(remaining)
+        {
             text.push(character);
             remaining -= 1;
         }
