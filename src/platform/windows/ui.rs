@@ -14,7 +14,7 @@ use crate::{
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
     semantic::{self, EmbeddingSettings, IndexScope},
     semantic_ui::{
-        IndexSession, QuerySession, prepare_semantic_effect, resume_ordinary_query,
+        IndexSession, QuerySession, finish_semantic_effect, prepare_semantic_effect,
         sync_semantic_view,
     },
     ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
@@ -757,17 +757,18 @@ impl App {
     unsafe fn cancel_semantic(&mut self) {
         self.prepare_semantic_effect(false);
     }
-    unsafe fn prepare_semantic_effect(&mut self, preserve_results: bool) {
+    unsafe fn prepare_semantic_effect(&mut self, preserve_results: bool) -> bool {
         if let Some(worker) = &self.query_worker {
             worker.cancel();
         }
-        if prepare_semantic_effect(
+        let revoked = prepare_semantic_effect(
             &mut self.semantic_query,
             &mut self.state,
             &mut self.saved_items,
             &mut self.saved_ready,
             preserve_results,
-        ) {
+        );
+        if revoked {
             self.cancel_actions();
             self.items.clear();
             self.clear_preview();
@@ -781,18 +782,20 @@ impl App {
                 w!("语义查找")
             },
         );
+        revoked
     }
-    unsafe fn restore_after_settings(&mut self) {
-        self.cancel_ai();
+    unsafe fn restore_after_modal(&mut self, revoked: bool) {
         let text = dialogs::text(self.edit);
-        if let Some(query) = resume_ordinary_query(
+        if let Some(query) = finish_semantic_effect(
             &mut self.semantic_query,
             &mut self.state,
             &mut self.saved_items,
             &mut self.saved_ready,
             &text,
             self.scope,
+            revoked,
         ) {
+            self.cancel_ai();
             self.query = text;
             self.result_scope = self.scope;
             self.cancel_actions();
@@ -2851,6 +2854,7 @@ impl Host {
             return;
         }
         loop {
+            let mut semantic_revoked = false;
             let effect = {
                 let mut app = match self.app.try_borrow_mut() {
                     Ok(app) => app,
@@ -2876,7 +2880,8 @@ impl Host {
                     app.stop_ai_request();
                     // Menu targets are captured before the native pump; preserve their
                     // epoch/selection while suppressing in-flight network publication.
-                    app.prepare_semantic_effect(matches!(effect, UiEffect::Menu { .. }));
+                    semantic_revoked =
+                        app.prepare_semantic_effect(matches!(effect, UiEffect::Menu { .. }));
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
                 effect
@@ -2934,7 +2939,8 @@ impl Host {
                         app.apply_settings(values);
                     }
                     // Cancel and both validation/registration early returns also reload.
-                    app.restore_after_settings();
+                    app.restore_after_modal(true);
+                    semantic_revoked = false;
                 }
                 UiEffect::AiSettings { owner, settings } => {
                     let result = dialogs::ai_settings_form(owner, &settings);
@@ -2944,6 +2950,7 @@ impl Host {
                     // Opening this form revoked its adopted plan. Cancel and validation
                     // failure also need a fresh ordinary query rather than derived rows.
                     app.search();
+                    semantic_revoked = false;
                     if let Some(message) = error {
                         app.effects.push_back(UiEffect::Message { owner, message });
                     }
@@ -2955,6 +2962,7 @@ impl Host {
                     let error =
                         result.and_then(|values| app.apply_embedding_settings(values).err());
                     app.search();
+                    semantic_revoked = false;
                     if let Some(message) = error {
                         app.effects.push_back(UiEffect::Message { owner, message });
                     }
@@ -2975,6 +2983,7 @@ impl Host {
                         let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
                         app.search();
                         app.begin_semantic();
+                        semantic_revoked = false;
                     }
                 }
                 UiEffect::AiPrompt { owner } => {
@@ -2990,6 +2999,7 @@ impl Host {
                         let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
                         app.search();
                         app.begin_ai();
+                        semantic_revoked = false;
                     }
                 }
                 UiEffect::ExitError { owner, message } => {
@@ -3084,6 +3094,11 @@ impl Host {
                 UiEffect::Destroy(hwnd) => {
                     let _ = DestroyWindow(hwnd);
                 }
+            }
+            // One completion gate covers Picker/Favorite cancellation, errors,
+            // validation early returns, and other effects that revoked rows.
+            if semantic_revoked {
+                self.app.borrow_mut().restore_after_modal(true);
             }
         }
         self.effects_running.set(false);

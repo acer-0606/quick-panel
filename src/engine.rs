@@ -242,6 +242,20 @@ fn result_rank(summary: &ItemSummary, query: &str) -> i64 {
             0
         }
 }
+fn semantic_result_rank(item: &StoredItem, query: &str) -> i64 {
+    let rank = result_rank(&item.summary, query);
+    let needle = query.trim().to_lowercase();
+    if !needle.is_empty()
+        && item
+            .target
+            .as_ref()
+            .is_some_and(|target| target.to_lowercase().contains(&needle))
+    {
+        rank.max(600_000)
+    } else {
+        rank
+    }
+}
 fn scope_matches(kind: ItemKind, scope: Scope) -> bool {
     matches!(
         (kind, scope),
@@ -862,6 +876,78 @@ impl Actor {
         });
         Ok(())
     }
+    fn semantic_path_candidates(&self, query: &SearchQuery) -> Result<Vec<StoredItem>, String> {
+        let needle = query.text.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut items = Vec::new();
+        let mut cursor = i64::MAX;
+        loop {
+            let page = self.repo.path_page(query.scope, cursor)?;
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().unwrap().0;
+            let exhausted = page.len() < 128;
+            for (_, mut item) in page {
+                if self.deleted.contains(&item.summary.id)
+                    || self
+                        .pending
+                        .get(&item.summary.id)
+                        .is_some_and(|p| p.mutation == Mutation::Content)
+                {
+                    continue;
+                }
+                if let Some(pending) = self.pending.get(&item.summary.id) {
+                    item.summary = pending.item.summary.clone();
+                }
+                if item
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.to_lowercase().contains(&needle))
+                {
+                    items.push(item);
+                }
+            }
+            Self::trim_semantic_paths(&mut items, &query.text);
+            if exhausted {
+                break;
+            }
+        }
+        for pending in self.pending.values() {
+            let item = &pending.item;
+            if pending.mutation == Mutation::Content
+                && !self.deleted.contains(&item.summary.id)
+                && scope_matches(item.summary.kind, query.scope)
+                && item
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.to_lowercase().contains(&needle))
+            {
+                items.push(StoredItem {
+                    summary: item.summary.clone(),
+                    target: item.target.clone(),
+                    text: String::new(),
+                    representations: vec![],
+                    open_with: None,
+                });
+                Self::trim_semantic_paths(&mut items, &query.text);
+            }
+        }
+        Self::trim_semantic_paths(&mut items, &query.text);
+        Ok(items)
+    }
+    fn trim_semantic_paths(items: &mut Vec<StoredItem>, query: &str) {
+        items.sort_by(|a, b| {
+            semantic_result_rank(b, query)
+                .cmp(&semantic_result_rank(a, query))
+                .then(b.summary.pinned.cmp(&a.summary.pinned))
+                .then(b.summary.last_used_ms.cmp(&a.summary.last_used_ms))
+                .then(a.summary.id.cmp(&b.summary.id))
+        });
+        items.truncate(50);
+    }
     fn semantic_search(&self, query: crate::semantic::SemanticSearchQuery) -> Result<(), String> {
         if self.semantic_profile()? != query.profile {
             return Err("语义检索配置已变化".into());
@@ -872,20 +958,16 @@ impl Actor {
             scope: query.scope,
             request_id: query.request_id,
         };
-        let needle = query.text.trim().to_lowercase();
         let mut merged: HashMap<String, (ItemSummary, i64, Option<f32>)> = HashMap::new();
         for summary in self.collect_search(&lexical, None, None)? {
-            let mut rank = result_rank(&summary, &query.text);
-            if !needle.is_empty()
-                && let Some(item) = self.semantic_item(&summary.id)?
-                && item
-                    .target
-                    .as_ref()
-                    .is_some_and(|target| target.to_lowercase().contains(&needle))
-            {
-                rank = rank.max(600_000)
+            if let Some(item) = self.semantic_item(&summary.id)? {
+                let rank = semantic_result_rank(&item, &query.text);
+                merged.insert(summary.id.clone(), (summary, rank, None));
             }
-            merged.insert(summary.id.clone(), (summary, rank, None));
+        }
+        for item in self.semantic_path_candidates(&lexical)? {
+            let rank = semantic_result_rank(&item, &query.text);
+            merged.insert(item.summary.id.clone(), (item.summary, rank, None));
         }
         let mut excluded = self.deleted.clone();
         excluded.extend(
@@ -953,10 +1035,11 @@ impl Actor {
             let Some(item) = self.semantic_item(&id)? else {
                 continue;
             };
+            let rank = semantic_result_rank(&item, &query.text);
             merged
                 .entry(id)
                 .and_modify(|entry| entry.2 = Some(distance))
-                .or_insert((item.summary, 0, Some(distance)));
+                .or_insert((item.summary, rank, Some(distance)));
         }
         let mut items: Vec<_> = merged.into_values().collect();
         items.sort_by(|(a, ar, ad), (b, br, bd)| {

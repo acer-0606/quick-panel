@@ -1068,3 +1068,195 @@ fn vector_budget_accounts_for_map_expansion_at_4095_dimension_boundary() {
     shutdown(&engine);
     assert_eq!(vec_count(&db), 250);
 }
+
+// A literal path must survive both the lexical quota and 50 closer vec0 rows.
+#[test]
+fn explicit_path_priority_precedes_lexical_and_repository_candidate_limits() {
+    for interference in [51, 180] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("path-limit.db");
+        let engine = start(&path, 60_000);
+        configure(&engine, IndexScope::PinnedAndFavorites);
+        for i in 0..=interference {
+            let wanted = i == 0;
+            let id = if wanted {
+                "wanted".into()
+            } else {
+                format!("tagged:{i}")
+            };
+            engine
+                .send(Command::SaveFavorite(FavoriteInput {
+                    id: Some(id.clone()),
+                    kind: ItemKind::Document,
+                    title: "归档".into(),
+                    target: if wanted {
+                        "C:/退款说明.txt".into()
+                    } else {
+                        format!("C:/other/{i}.txt")
+                    },
+                    alias: String::new(),
+                    tags: if wanted {
+                        vec![]
+                    } else {
+                        vec!["退款说明".into()]
+                    },
+                    open_with: None,
+                }))
+                .unwrap();
+            wait(&engine, |e| matches!(e, Event::Saved(_)));
+            if !wanted {
+                engine.send(Command::Used(id)).unwrap();
+            }
+        }
+        let profile = index_all(&engine, |c| {
+            if c.id == "wanted" {
+                vec![0., 1.]
+            } else {
+                vec![1., 0.]
+            }
+        });
+        flush(&engine);
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(vec_count(&db), i64::from(interference + 1));
+        engine
+            .send(Command::Search(SearchQuery {
+                text: "退款说明".into(),
+                scope: Scope::Document,
+                request_id: 101,
+            }))
+            .unwrap();
+        let Event::Results {
+            items: ordinary, ..
+        } = wait(&engine, |e| {
+            matches!(
+                e,
+                Event::Results {
+                    request_id: 101,
+                    ..
+                }
+            )
+        })
+        else {
+            unreachable!()
+        };
+        assert_eq!(ordinary.len(), 50);
+        assert!(
+            ordinary.iter().all(|s| s.id.starts_with("tagged:")),
+            "ordinary search ranking remains compatible"
+        );
+        let items = query(&engine, &profile, Scope::Document, vec![1., 0.]);
+        assert_eq!(items.len(), 50);
+        assert_eq!(
+            items[0].id, "wanted",
+            "lost path behind {interference} tag-only matches"
+        );
+        assert_eq!(items.iter().filter(|s| s.id == "wanted").count(), 1);
+        assert!(query(&engine, &profile, Scope::Folder, vec![1., 0.]).is_empty());
+        shutdown(&engine);
+    }
+}
+
+// A nearest-only source still receives its real explicit heading rank.
+#[test]
+fn semantic_only_title_match_uses_same_explicit_rank_as_lexical_rows() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("semantic-heading.db");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::AllText);
+    let db = Connection::open(&path).unwrap();
+    insert(&db, "unposted-heading", ItemKind::Document, false, "");
+    // A saved source without FTS postings remains discoverable by native vectors.
+    db.execute("UPDATE items SET title='历史退款说明备份', last_used_ms=1, summary=json_set(summary,'$.title','历史退款说明备份','$.last_used_ms',1) WHERE id='unposted-heading'", []).unwrap();
+    for i in 0..180 {
+        let id = format!("tagged:{i}");
+        insert(&db, &id, ItemKind::Document, false, "");
+        db.execute("UPDATE items SET summary=json_set(summary,'$.tags',json_array('退款说明')) WHERE id=?1", [&id]).unwrap();
+    }
+    insert(&db, "literal-path", ItemKind::Document, false, "");
+    db.execute(
+        "UPDATE items SET target='C:/退款说明.txt' WHERE id='literal-path'",
+        [],
+    )
+    .unwrap();
+    let profile = index_all(&engine, |c| {
+        if c.id == "unposted-heading" {
+            vec![1., 0.]
+        } else {
+            vec![0., 1.]
+        }
+    });
+    flush(&engine);
+    engine
+        .send(Command::Search(SearchQuery {
+            text: "退款说明".into(),
+            scope: Scope::Document,
+            request_id: 101,
+        }))
+        .unwrap();
+    let Event::Results { items, .. } = wait(&engine, |e| {
+        matches!(
+            e,
+            Event::Results {
+                request_id: 101,
+                ..
+            }
+        )
+    }) else {
+        unreachable!()
+    };
+    assert!(items.iter().all(|s| s.id != "unposted-heading"));
+    let items = query(&engine, &profile, Scope::Document, vec![1., 0.]);
+    assert_eq!(items[0].id, "unposted-heading");
+    assert_eq!(items[1].id, "literal-path");
+    shutdown(&engine);
+}
+
+// Pending target replacements, additions and deletes must precede path truncation.
+#[test]
+fn explicit_path_lane_respects_pending_content_and_deletions() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("path-overlay.db");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::PinnedAndFavorites);
+    let original = FavoriteInput {
+        id: Some("old-path".into()),
+        kind: ItemKind::Document,
+        title: "归档".into(),
+        target: "C:/退款说明.txt".into(),
+        alias: String::new(),
+        tags: vec![],
+        open_with: None,
+    };
+    engine
+        .send(Command::SaveFavorite(original.clone()))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let profile = index_all(&engine, |_| vec![1., 0.]);
+    flush(&engine);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    engine
+        .send(Command::SaveFavorite(FavoriteInput {
+            target: "C:/changed.txt".into(),
+            ..original.clone()
+        }))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    assert!(query(&engine, &profile, Scope::Document, vec![1., 0.]).is_empty());
+    engine
+        .send(Command::SaveFavorite(FavoriteInput {
+            id: Some("pending-path".into()),
+            ..original
+        }))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    let items = query(&engine, &profile, Scope::Document, vec![1., 0.]);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].id, "pending-path");
+    assert!(query(&engine, &profile, Scope::Folder, vec![1., 0.]).is_empty());
+    engine.send(Command::Delete("pending-path".into())).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    assert!(query(&engine, &profile, Scope::Document, vec![1., 0.]).is_empty());
+    db.execute_batch("ROLLBACK").unwrap();
+    shutdown(&engine);
+}

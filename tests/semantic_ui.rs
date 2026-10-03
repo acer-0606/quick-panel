@@ -2,8 +2,8 @@ use quick_panel::{
     model::{Command, Scope},
     semantic::{IndexBatch, IndexCursor},
     semantic_ui::{
-        IndexSession, QuerySession, cancel_semantic_view, prepare_semantic_effect,
-        resume_ordinary_query, sync_semantic_view,
+        IndexSession, QuerySession, cancel_semantic_view, finish_semantic_effect,
+        prepare_semantic_effect, resume_ordinary_query, sync_semantic_view,
     },
     ui_state::UiState,
 };
@@ -313,5 +313,177 @@ fn general_settings_cancel_or_failure_resumes_fresh_ordinary_query() {
         assert!(session.local_query(99).is_none());
         // Delayed pre-dialog results cannot satisfy the restored request.
         assert!(restored.request_id > old);
+    }
+}
+
+// Restoring a modal must not reload a panel hidden during the native pump.
+#[test]
+fn modal_return_while_root_hidden_does_not_issue_ordinary_query() {
+    let mut session = QuerySession::default();
+    session.begin(7, "退款", Scope::Document, "p");
+    session.finish(7, "退款", Scope::Document, "p", true, vec![1., 0.]);
+    let mut state = UiState::default();
+    state.visible = true;
+    state.replace_ids(vec!["document".into()]);
+    let mut saved = vec!["document"];
+    let mut ready = true;
+    assert!(prepare_semantic_effect(
+        &mut session,
+        &mut state,
+        &mut saved,
+        &mut ready,
+        false
+    ));
+    state.modal_open = true;
+    state.hide();
+    assert!(
+        finish_semantic_effect(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            "退款",
+            Scope::Document,
+            true
+        )
+        .is_none()
+    );
+    assert!(!state.modal_open);
+    assert!(!state.visible);
+    assert!(!session.adopted());
+}
+
+// Picker cancel/error and Favorite cancel/blank validation all complete the same gate.
+#[test]
+fn revoked_picker_and_favorite_returns_resume_fresh_ordinary_query() {
+    for path in [
+        "picker cancelled",
+        "picker failed",
+        "favorite cancelled",
+        "blank name",
+        "blank path",
+    ] {
+        let mut session = QuerySession::default();
+        session.begin(7, "退款", Scope::Document, "p");
+        session.finish(7, "退款", Scope::Document, "p", true, vec![1., 0.]);
+        let mut state = UiState::default();
+        state.visible = true;
+        let old = state.next_request();
+        state.replace_ids(vec!["document".into()]);
+        let target = state.menu_target();
+        assert!(state.begin_action(90));
+        let mut saved = vec!["document"];
+        let mut ready = true;
+        assert!(prepare_semantic_effect(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            false
+        ));
+        state.modal_open = true;
+        let restored = finish_semantic_effect(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            "退款",
+            Scope::Document,
+            true,
+        )
+        .unwrap_or_else(|| panic!("{path}"));
+        assert_eq!(restored.text, "退款");
+        assert_eq!(restored.scope, Scope::Document);
+        assert!(state.is_current(restored.request_id));
+        assert!(!state.is_current(old));
+        assert!(!state.action_current(90));
+        assert!(!state.menu_target_current(&target));
+        assert!(!state.modal_open);
+        assert!(saved.is_empty());
+        assert!(!ready);
+        assert!(session.local_query(99).is_none());
+    }
+}
+
+#[test]
+fn modal_completion_preserves_menu_target_and_new_semantic_request() {
+    for menu in [true, false] {
+        let mut session = QuerySession::default();
+        session.begin(7, "query", Scope::All, "p");
+        session.finish(7, "query", Scope::All, "p", true, vec![1., 0.]);
+        let mut state = UiState::default();
+        state.visible = true;
+        let old = state.next_request();
+        state.replace_ids(vec!["real-id".into()]);
+        let target = state.menu_target();
+        let mut saved = vec!["real-id"];
+        let mut ready = true;
+        let revoked =
+            prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, menu);
+        state.modal_open = true;
+        if !menu {
+            session.begin(8, "new query", Scope::All, "p");
+        }
+        assert!(
+            finish_semantic_effect(
+                &mut session,
+                &mut state,
+                &mut saved,
+                &mut ready,
+                "query",
+                Scope::All,
+                revoked
+            )
+            .is_none()
+        );
+        assert!(!state.modal_open);
+        if menu {
+            assert!(state.menu_target_current(&target));
+            assert!(state.is_current(old));
+            assert_eq!(saved, ["real-id"]);
+            assert!(ready);
+            assert!(session.adopted());
+        } else {
+            assert!(session.current(8, "new query", Scope::All, "p", true));
+            assert!(!state.menu_target_current(&target));
+        }
+    }
+}
+
+#[test]
+fn revoked_modal_return_during_shutdown_never_issues_query() {
+    use quick_panel::ui_state::Lifecycle;
+    for lifecycle in [
+        Lifecycle::Draining,
+        Lifecycle::Saving,
+        Lifecycle::SaveFailed,
+    ] {
+        let mut session = QuerySession::default();
+        session.begin(7, "query", Scope::All, "p");
+        session.finish(7, "query", Scope::All, "p", true, vec![1., 0.]);
+        let mut state = UiState::default();
+        state.visible = true;
+        let mut saved = vec!["real-id"];
+        let mut ready = true;
+        let revoked =
+            prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, false);
+        state.modal_open = true;
+        state.lifecycle = lifecycle;
+        assert!(
+            finish_semantic_effect(
+                &mut session,
+                &mut state,
+                &mut saved,
+                &mut ready,
+                "query",
+                Scope::All,
+                revoked
+            )
+            .is_none()
+        );
+        assert!(!state.modal_open);
+        assert_eq!(state.lifecycle, lifecycle);
+        assert!(saved.is_empty());
+        assert!(session.local_query(90).is_none());
     }
 }

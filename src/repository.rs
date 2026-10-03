@@ -522,6 +522,46 @@ impl Repository {
         }
         Ok(summaries)
     }
+    /// A separate metadata-only lane keeps literal paths out of lexical quotas.
+    /// The actor filters overlays/deletions and retains at most 50 matches per page.
+    pub fn path_page(&self, scope: Scope, cursor: i64) -> Result<Vec<(i64, StoredItem)>, String> {
+        let scope = match scope {
+            Scope::All => "1",
+            Scope::Clipboard => "kind=0",
+            Scope::Folder => "kind=1",
+            Scope::Document => "kind=2",
+        };
+        let sql = format!(
+            "SELECT rowid,summary,target FROM items WHERE {scope} AND target IS NOT NULL AND rowid<?1 ORDER BY rowid DESC LIMIT 128"
+        );
+        let mut statement = self
+            .connection
+            .prepare_cached(&sql)
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([cursor], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (rowid, summary, target) = row.map_err(|e| e.to_string())?;
+            Ok((
+                rowid,
+                StoredItem {
+                    summary: serde_json::from_str(&summary).map_err(|e| e.to_string())?,
+                    target,
+                    text: String::new(),
+                    representations: vec![],
+                    open_with: None,
+                },
+            ))
+        })
+        .collect()
+    }
     pub fn commit(
         &mut self,
         pending: &HashMap<String, PendingItem>,

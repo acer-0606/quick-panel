@@ -251,7 +251,7 @@ pub fn prepare_semantic_effect<T>(
     active
 }
 
-/// Resume ordinary retrieval after every general-settings return path.
+/// Resume ordinary retrieval after a modal return while the panel is still active.
 pub fn resume_ordinary_query<T>(
     session: &mut QuerySession,
     state: &mut UiState,
@@ -261,7 +261,7 @@ pub fn resume_ordinary_query<T>(
     scope: Scope,
 ) -> Option<crate::model::SearchQuery> {
     state.modal_open = false;
-    if state.lifecycle != crate::ui_state::Lifecycle::Running {
+    if !state.visible || state.lifecycle != crate::ui_state::Lifecycle::Running {
         return None;
     }
     session.cancel();
@@ -273,4 +273,22 @@ pub fn resume_ordinary_query<T>(
         scope,
         request_id: state.next_request(),
     })
+}
+
+/// Pair a modal's semantic revocation with ordinary retrieval on every return path.
+/// A newly launched semantic query, a menu, hiding, or shutdown needs no restoration.
+pub fn finish_semantic_effect<T>(
+    session: &mut QuerySession,
+    state: &mut UiState,
+    saved: &mut Vec<T>,
+    ready: &mut bool,
+    text: &str,
+    scope: Scope,
+    revoked: bool,
+) -> Option<crate::model::SearchQuery> {
+    state.modal_open = false;
+    if !revoked || session.busy() || session.adopted() {
+        return None;
+    }
+    resume_ordinary_query(session, state, saved, ready, text, scope)
 }
