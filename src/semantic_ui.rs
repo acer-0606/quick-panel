@@ -230,3 +230,47 @@ pub fn sync_semantic_view<T>(
         false
     }
 }
+
+/// Menus preserve their captured target and derived rows; other effects revoke them.
+/// The native caller cancels the worker before applying this gate.
+pub fn prepare_semantic_effect<T>(
+    session: &mut QuerySession,
+    state: &mut UiState,
+    saved: &mut Vec<T>,
+    ready: &mut bool,
+    preserve_results: bool,
+) -> bool {
+    if preserve_results {
+        session.pending = None;
+        return false;
+    }
+    let active = session.busy() || session.adopted();
+    if active {
+        cancel_semantic_view(session, state, saved, ready);
+    }
+    active
+}
+
+/// Resume ordinary retrieval after every general-settings return path.
+pub fn resume_ordinary_query<T>(
+    session: &mut QuerySession,
+    state: &mut UiState,
+    saved: &mut Vec<T>,
+    ready: &mut bool,
+    text: &str,
+    scope: Scope,
+) -> Option<crate::model::SearchQuery> {
+    state.modal_open = false;
+    if state.lifecycle != crate::ui_state::Lifecycle::Running {
+        return None;
+    }
+    session.cancel();
+    saved.clear();
+    *ready = false;
+    state.replace_ids(Vec::new());
+    Some(crate::model::SearchQuery {
+        text: text.into(),
+        scope,
+        request_id: state.next_request(),
+    })
+}

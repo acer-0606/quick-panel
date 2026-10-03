@@ -304,3 +304,41 @@ fn semantic_saved_order_survives_exact_function_coexistence() {
         ["cosine-first", "lexical-later"]
     );
 }
+
+#[test]
+fn adopted_semantic_result_menu_preserves_real_row_identity_and_engine_order() {
+    use quick_panel::{
+        model::Scope,
+        semantic_ui::{QuerySession, prepare_semantic_effect},
+    };
+    let mut session = QuerySession::default();
+    session.begin(1, "设置", Scope::All, "p");
+    session.finish(1, "设置", Scope::All, "p", true, vec![1., 0.]);
+    let mut saved_rows = vec![
+        saved("semantic-first", "网络说明", ItemKind::Clipboard),
+        saved("lexical-next", "设置", ItemKind::Clipboard),
+    ];
+    let rows = palette::semantic_results("设置", saved_rows.clone(), Context::default());
+    let mut state = UiState::default();
+    state.visible = true;
+    state.replace_ids(rows.iter().map(|row| row.id().to_owned()).collect());
+    state.select(
+        rows.iter()
+            .position(|row| row.id() == "semantic-first")
+            .unwrap(),
+    );
+    assert_eq!(state.selected_id(), Some("semantic-first"));
+    let target = state.menu_target();
+    let mut ready = true;
+    prepare_semantic_effect(&mut session, &mut state, &mut saved_rows, &mut ready, true);
+    let rows = palette::semantic_results("设置", saved_rows, Context::default());
+    assert_eq!(
+        rows.iter()
+            .filter_map(|row| row.saved().map(|saved| saved.id.as_str()))
+            .collect::<Vec<_>>(),
+        ["semantic-first", "lexical-next"]
+    );
+    assert!(state.menu_target_current(&target));
+    assert!(session.adopted());
+    assert!(ready);
+}

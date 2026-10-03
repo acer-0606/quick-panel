@@ -1,7 +1,10 @@
 use quick_panel::{
     model::{Command, Scope},
     semantic::{IndexBatch, IndexCursor},
-    semantic_ui::{IndexSession, QuerySession, cancel_semantic_view, sync_semantic_view},
+    semantic_ui::{
+        IndexSession, QuerySession, cancel_semantic_view, prepare_semantic_effect,
+        resume_ordinary_query, sync_semantic_view,
+    },
     ui_state::UiState,
 };
 
@@ -214,4 +217,101 @@ fn hiding_query_preserves_user_started_index_and_original_input_hash() {
     assert!(index.acknowledge(id, 0).is_none());
     assert!(!index.active());
     assert_eq!(index.accepted(), 0);
+}
+
+#[test]
+fn result_menu_keeps_target_cache_and_adopted_mode_while_stopping_pending_network() {
+    for adopted in [false, true] {
+        let mut session = QuerySession::default();
+        session.begin(7, "query", Scope::All, "p");
+        if adopted {
+            session.finish(7, "query", Scope::All, "p", true, vec![1., 0.]);
+        }
+        let mut state = UiState::default();
+        state.visible = true;
+        let old_request = state.next_request();
+        state.replace_ids(vec!["real-id".into()]);
+        let target = state.menu_target();
+        let mut saved = vec!["real-id"];
+        let mut ready = true;
+        prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, true);
+        state.modal_open = true;
+        assert!(!state.menu_target_current(&target));
+        state.modal_open = false;
+        assert!(state.menu_target_current(&target));
+        assert!(state.is_current(old_request));
+        assert_eq!(state.selected_id(), Some("real-id"));
+        assert_eq!(saved, ["real-id"]);
+        assert!(ready);
+        assert_eq!(session.adopted(), adopted);
+        assert!(!session.busy());
+        assert!(!session.finish(7, "query", Scope::All, "p", true, vec![1., 0.]));
+        // The existing guard also gates the subsequent real load/action path.
+        assert!(state.begin_action(91));
+        assert!(state.action_current(91));
+    }
+}
+
+#[test]
+fn result_menu_still_rejects_target_after_selection_or_source_refresh() {
+    for source_refresh in [false, true] {
+        let mut session = QuerySession::default();
+        session.begin(7, "query", Scope::All, "p");
+        session.finish(7, "query", Scope::All, "p", true, vec![1., 0.]);
+        let mut state = UiState::default();
+        state.visible = true;
+        state.replace_ids(vec!["real-id".into(), "other-id".into()]);
+        let target = state.menu_target();
+        let mut saved = vec!["real-id", "other-id"];
+        let mut ready = true;
+        prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, true);
+        if source_refresh {
+            state.next_request();
+        } else {
+            state.select(1);
+        }
+        assert!(!state.menu_target_current(&target));
+    }
+}
+
+#[test]
+fn general_settings_cancel_or_failure_resumes_fresh_ordinary_query() {
+    for cancelled in [false, true] {
+        let mut session = QuerySession::default();
+        session.begin(7, "设置", Scope::Clipboard, "p");
+        session.finish(7, "设置", Scope::Clipboard, "p", true, vec![1., 0.]);
+        let mut state = UiState::default();
+        state.visible = true;
+        let old = state.next_request();
+        state.replace_ids(vec!["old-result".into()]);
+        let mut saved = vec!["old-result"];
+        let mut ready = true;
+        prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, false);
+        state.modal_open = true;
+        // Cancel yields no settings; a registration failure leaves existing scope/query.
+        let return_path = if cancelled {
+            "cancelled settings"
+        } else {
+            "failed settings apply"
+        };
+        let restored = resume_ordinary_query(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            "设置",
+            Scope::Clipboard,
+        )
+        .unwrap_or_else(|| panic!("{return_path} must issue local query"));
+        assert_eq!(restored.text, "设置");
+        assert_eq!(restored.scope, Scope::Clipboard);
+        assert!(state.is_current(restored.request_id));
+        assert!(!state.is_current(old));
+        assert!(!state.modal_open);
+        assert!(saved.is_empty());
+        assert!(!ready);
+        assert!(session.local_query(99).is_none());
+        // Delayed pre-dialog results cannot satisfy the restored request.
+        assert!(restored.request_id > old);
+    }
 }

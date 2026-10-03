@@ -13,7 +13,10 @@ use crate::{
     model::*,
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
     semantic::{self, EmbeddingSettings, IndexScope},
-    semantic_ui::{IndexSession, QuerySession, cancel_semantic_view, sync_semantic_view},
+    semantic_ui::{
+        IndexSession, QuerySession, prepare_semantic_effect, resume_ordinary_query,
+        sync_semantic_view,
+    },
     ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
 };
 use std::{
@@ -752,22 +755,51 @@ impl App {
         }
     }
     unsafe fn cancel_semantic(&mut self) {
+        self.prepare_semantic_effect(false);
+    }
+    unsafe fn prepare_semantic_effect(&mut self, preserve_results: bool) {
         if let Some(worker) = &self.query_worker {
             worker.cancel();
         }
-        if self.semantic_query.busy() || self.semantic_query.adopted() {
-            cancel_semantic_view(
-                &mut self.semantic_query,
-                &mut self.state,
-                &mut self.saved_items,
-                &mut self.saved_ready,
-            );
+        if prepare_semantic_effect(
+            &mut self.semantic_query,
+            &mut self.state,
+            &mut self.saved_items,
+            &mut self.saved_ready,
+            preserve_results,
+        ) {
             self.cancel_actions();
             self.items.clear();
             self.clear_preview();
             self.rebuild_results();
         }
-        let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+        let _ = SetWindowTextW(
+            self.semantic_button,
+            if self.semantic_query.adopted() {
+                w!("取消语义")
+            } else {
+                w!("语义查找")
+            },
+        );
+    }
+    unsafe fn restore_after_settings(&mut self) {
+        self.cancel_ai();
+        let text = dialogs::text(self.edit);
+        if let Some(query) = resume_ordinary_query(
+            &mut self.semantic_query,
+            &mut self.state,
+            &mut self.saved_items,
+            &mut self.saved_ready,
+            &text,
+            self.scope,
+        ) {
+            self.query = text;
+            self.result_scope = self.scope;
+            self.cancel_actions();
+            self.clear_preview();
+            self.rebuild_results();
+            self.send(Command::Search(query));
+        }
     }
     fn embedding_worker(&self) -> EmbeddingWorker {
         let handle = self.hwnd.0 as usize;
@@ -2064,7 +2096,6 @@ impl App {
         self.retheme();
         self.tray(NIM_MODIFY);
         self.send(Command::SaveSettings(settings));
-        self.search();
     }
     unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
         let entries: Vec<(usize, &str)> = if tray {
@@ -2843,7 +2874,9 @@ impl Host {
                         continue;
                     }
                     app.stop_ai_request();
-                    app.cancel_semantic();
+                    // Menu targets are captured before the native pump; preserve their
+                    // epoch/selection while suppressing in-flight network publication.
+                    app.prepare_semantic_effect(matches!(effect, UiEffect::Menu { .. }));
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
                 effect
@@ -2900,6 +2933,8 @@ impl Host {
                     if let Some(values) = result {
                         app.apply_settings(values);
                     }
+                    // Cancel and both validation/registration early returns also reload.
+                    app.restore_after_settings();
                 }
                 UiEffect::AiSettings { owner, settings } => {
                     let result = dialogs::ai_settings_form(owner, &settings);
