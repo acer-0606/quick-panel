@@ -14,4 +14,5 @@ pub mod platform;
 pub mod repository;
 pub mod search;
 pub mod semantic;
+mod semantic_store;
 pub mod ui_state;

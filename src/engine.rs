@@ -53,6 +53,7 @@ impl Engine {
                     options,
                     settings,
                     pending: HashMap::new(),
+                    vectors: crate::semantic_store::PendingVectors::default(),
                     deleted: HashSet::new(),
                     settings_dirty: false,
                     deadline: None,
@@ -118,6 +119,10 @@ impl Engine {
                     .map(|r| r.data.len())
                     .sum::<usize>(),
             ),
+            Command::StoreEmbeddings { items, .. } => items
+                .iter()
+                .map(crate::semantic_store::embedding_bytes)
+                .sum(),
             _ => 0,
         };
         let (command, bytes) = if bytes > state.max_item_bytes {
@@ -178,6 +183,7 @@ struct Actor {
     options: EngineOptions,
     settings: Settings,
     pending: HashMap<String, PendingItem>,
+    vectors: crate::semantic_store::PendingVectors,
     deleted: HashSet<String>,
     settings_dirty: bool,
     deadline: Option<Instant>,
@@ -254,7 +260,10 @@ impl Actor {
         });
     }
     fn dirty(&self) -> bool {
-        !self.pending.is_empty() || !self.deleted.is_empty() || self.settings_dirty
+        !self.pending.is_empty()
+            || !self.deleted.is_empty()
+            || self.settings_dirty
+            || !self.vectors.items.is_empty()
     }
     fn mark_dirty(&mut self) {
         if !self.exiting && self.deadline.is_none() {
@@ -309,9 +318,11 @@ impl Actor {
             self.settings_dirty.then_some(&self.settings),
             &self.settings,
             now,
+            &self.vectors,
         ) {
             Ok(()) => {
                 self.pending.clear();
+                self.vectors = crate::semantic_store::PendingVectors::default();
                 self.deleted.clear();
                 self.settings_dirty = false;
                 self.deadline = None;
@@ -594,6 +605,372 @@ impl Actor {
         });
         Ok(())
     }
+    fn semantic_profile(&self) -> Result<String, String> {
+        if !self.settings.embedding.enabled {
+            return Err("语义检索未启用".into());
+        }
+        crate::semantic::profile_id(&self.settings.embedding)
+    }
+    // Metadata-only actor changes intentionally omit text. Restore only text,
+    // never representations, and keep the current metadata overlay.
+    fn semantic_item(&self, id: &str) -> Result<Option<StoredItem>, String> {
+        if self.deleted.contains(id) {
+            return Ok(None);
+        }
+        if let Some(change) = self.pending.get(id) {
+            let mut item = StoredItem {
+                summary: change.item.summary.clone(),
+                text: change.item.text.clone(),
+                target: change.item.target.clone(),
+                open_with: change.item.open_with.clone(),
+                representations: vec![],
+            };
+            if change.mutation == Mutation::Metadata {
+                let Some(saved) = self.repo.load(id, false)? else {
+                    return Ok(None);
+                };
+                item.text = saved.text;
+            }
+            return Ok(Some(item));
+        }
+        self.repo.load(id, false)
+    }
+    fn needs_embedding(
+        &self,
+        profile: &str,
+        candidate: &crate::semantic::EmbeddingCandidate,
+    ) -> Result<bool, String> {
+        if self.vectors.profile == profile
+            && self
+                .vectors
+                .items
+                .get(&candidate.id)
+                .is_some_and(|v| v.text_hash == candidate.text_hash)
+        {
+            return Ok(false);
+        }
+        Ok(!crate::semantic_store::indexed(
+            &self.repo.connection,
+            profile,
+            &candidate.id,
+            &candidate.text_hash,
+        )?)
+    }
+    fn prepare_semantic_index(
+        &self,
+        request_id: u64,
+        mut cursor: crate::semantic::IndexCursor,
+    ) -> Result<(), String> {
+        let profile = self.semantic_profile()?;
+        let mut candidates = Vec::new();
+        if !cursor.disk_done {
+            let (last, done) = crate::semantic_store::page(
+                &self.repo.connection,
+                cursor.after_rowid,
+                |mut item| {
+                    // Pending content is scanned once in the memory stage instead.
+                    if self.deleted.contains(&item.summary.id)
+                        || self
+                            .pending
+                            .get(&item.summary.id)
+                            .is_some_and(|p| p.mutation == Mutation::Content)
+                    {
+                        return Ok(true);
+                    }
+                    if let Some(p) = self.pending.get(&item.summary.id) {
+                        item.summary = p.item.summary.clone()
+                    }
+                    if let Some(candidate) =
+                        crate::semantic::candidate(&item, self.settings.embedding.index_scope)
+                        && self.needs_embedding(&profile, &candidate)?
+                    {
+                        candidates.push(candidate)
+                    }
+                    Ok(candidates.len() < 16)
+                },
+            )?;
+            cursor.after_rowid = last;
+            cursor.disk_done = done;
+            // Disk pages inspect at most 128 sources per command, even if none
+            // need embeddings. The controller follows the returned cursor.
+            self.emit(Event::SemanticBatch(crate::semantic::IndexBatch {
+                request_id,
+                profile,
+                candidates,
+                cursor,
+                done: false,
+            }));
+            return Ok(());
+        }
+        let mut ids: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(id, p)| {
+                p.mutation == Mutation::Content
+                    && cursor
+                        .pending_after_id
+                        .as_ref()
+                        .is_none_or(|after| *id > after)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        let total = ids.len();
+        let mut visited = 0;
+        for id in ids.into_iter().take(128) {
+            cursor.pending_after_id = Some(id.clone());
+            visited += 1;
+            if let Some(item) = self.semantic_item(&id)?
+                && let Some(candidate) =
+                    crate::semantic::candidate(&item, self.settings.embedding.index_scope)
+                && self.needs_embedding(&profile, &candidate)?
+            {
+                candidates.push(candidate);
+                if candidates.len() == 16 {
+                    break;
+                }
+            }
+        }
+        let done = visited == total;
+        self.emit(Event::SemanticBatch(crate::semantic::IndexBatch {
+            request_id,
+            profile,
+            candidates,
+            cursor,
+            done,
+        }));
+        Ok(())
+    }
+    fn store_embeddings(
+        &mut self,
+        request_id: u64,
+        profile: String,
+        items: Vec<crate::semantic::IndexedEmbedding>,
+    ) -> Result<(), String> {
+        if self.exiting || self.semantic_profile()? != profile {
+            return Err("语义索引配置已变化".into());
+        }
+        if items.is_empty() {
+            self.emit(Event::EmbeddingsStored {
+                request_id,
+                accepted: 0,
+            });
+            return Ok(());
+        }
+        if items.len() > 16 {
+            return Err("语义索引批次过大".into());
+        }
+        // Validate every vector before even attempting a pressure commit, so a
+        // malformed later entry cannot admit or persist an earlier entry.
+        let dimensions = crate::semantic::validate_vectors(
+            &items.iter().map(|i| i.vector.clone()).collect::<Vec<_>>(),
+        )?;
+        let mut seen = HashSet::new();
+        if items.iter().any(|i| !seen.insert(&i.id)) {
+            return Err("语义索引批次包含重复条目".into());
+        }
+        if self.vectors.profile == profile
+            && !self.vectors.items.is_empty()
+            && self.vectors.dimensions != dimensions
+        {
+            return Err("语义向量维度不一致".into());
+        }
+        if crate::semantic_store::active(&self.repo.connection)?
+            .is_some_and(|(p, d)| p == profile && d != dimensions)
+        {
+            return Err("语义向量维度不一致".into());
+        }
+        let mut accepted = Vec::new();
+        for mut item in items {
+            if let Some(source) = self.semantic_item(&item.id)?
+                && crate::semantic::candidate(&source, self.settings.embedding.index_scope)
+                    .is_some_and(|c| c.text_hash == item.text_hash)
+            {
+                item.vector = crate::semantic_store::normalize(&item.vector);
+                accepted.push(item);
+            }
+        }
+        let bytes: usize = accepted
+            .iter()
+            .map(crate::semantic_store::embedding_bytes)
+            .sum();
+        if bytes > crate::semantic_store::MAX_PENDING_BYTES {
+            return Err("待保存语义缓存已满".into());
+        }
+        let replacing: usize = accepted
+            .iter()
+            .filter_map(|v| self.vectors.items.get(&v.id))
+            .map(crate::semantic_store::embedding_bytes)
+            .sum();
+        let pressure = !accepted.is_empty()
+            && (self
+                .vectors
+                .bytes()
+                .saturating_sub(replacing)
+                .saturating_add(bytes)
+                > crate::semantic_store::MAX_PENDING_BYTES
+                || (!self.vectors.items.is_empty() && self.vectors.profile != profile));
+        if pressure {
+            if self
+                .retry_not_before
+                .is_some_and(|when| Instant::now() < when)
+            {
+                return Err("待保存语义缓存已满，保存失败".into());
+            }
+            if !self.pressure_flush() {
+                // flush already emitted the storage failure. No receipt and no
+                // second error: the controller stops this indexing session.
+                return Ok(());
+            }
+            // Retention is part of a pressure transaction and may have removed
+            // sources that were valid before it. Recheck before the RAM change.
+            let mut survivors = Vec::new();
+            for item in accepted {
+                if let Some(source) = self.semantic_item(&item.id)?
+                    && crate::semantic::candidate(&source, self.settings.embedding.index_scope)
+                        .is_some_and(|c| c.text_hash == item.text_hash)
+                {
+                    survivors.push(item)
+                }
+            }
+            accepted = survivors;
+        }
+        let count = accepted.len();
+        if count > 0 {
+            self.vectors.profile = profile;
+            self.vectors.dimensions = dimensions;
+            for item in accepted {
+                self.vectors.items.insert(item.id.clone(), item);
+            }
+            self.mark_dirty();
+        }
+        self.emit(Event::EmbeddingsStored {
+            request_id,
+            accepted: count,
+        });
+        Ok(())
+    }
+    fn semantic_search(&self, query: crate::semantic::SemanticSearchQuery) -> Result<(), String> {
+        if self.semantic_profile()? != query.profile {
+            return Err("语义检索配置已变化".into());
+        }
+        crate::semantic::validate_vectors(std::slice::from_ref(&query.vector))?;
+        let lexical = SearchQuery {
+            text: query.text.clone(),
+            scope: query.scope,
+            request_id: query.request_id,
+        };
+        let needle = query.text.trim().to_lowercase();
+        let mut merged: HashMap<String, (ItemSummary, i64, Option<f32>)> = HashMap::new();
+        for summary in self.collect_search(&lexical, None, None)? {
+            let mut rank = result_rank(&summary, &query.text);
+            if !needle.is_empty()
+                && let Some(item) = self.semantic_item(&summary.id)?
+                && item
+                    .target
+                    .as_ref()
+                    .is_some_and(|target| target.to_lowercase().contains(&needle))
+            {
+                rank = rank.max(600_000)
+            }
+            merged.insert(summary.id.clone(), (summary, rank, None));
+        }
+        let mut excluded = self.deleted.clone();
+        excluded.extend(
+            self.pending
+                .iter()
+                .filter(|(_, p)| p.mutation == Mutation::Content)
+                .map(|(id, _)| id.clone()),
+        );
+        // RAM coordinates replace disk coordinates even when subsequently stale.
+        excluded.extend(self.vectors.items.keys().cloned());
+        let pins = self
+            .pending
+            .iter()
+            .map(|(id, p)| (id.clone(), p.item.summary.pinned))
+            .collect();
+        let mut nearest = crate::semantic_store::nearest(
+            &self.repo.connection,
+            &query.profile,
+            &query.vector,
+            query.scope,
+            self.settings.embedding.index_scope,
+            &excluded,
+            &pins,
+        )?;
+        // Content changes with the same embedding hash keep their disk vector.
+        // Read those coordinates individually and rank the current source shape;
+        // this also handles a changed kind/scope before the global result limit.
+        for (id, change) in &self.pending {
+            if change.mutation != Mutation::Content || self.vectors.items.contains_key(id) {
+                continue;
+            }
+            if let Some(item) = self.semantic_item(id)?
+                && scope_matches(item.summary.kind, query.scope)
+                && let Some(candidate) =
+                    crate::semantic::candidate(&item, self.settings.embedding.index_scope)
+                && let Some(vector) = crate::semantic_store::matching_vector(
+                    &self.repo.connection,
+                    &query.profile,
+                    id,
+                    &candidate.text_hash,
+                    query.vector.len(),
+                )?
+            {
+                nearest.push((
+                    id.clone(),
+                    crate::semantic::cosine_distance(&vector, &query.vector)?,
+                ));
+            }
+        }
+        if self.vectors.profile == query.profile && self.vectors.dimensions == query.vector.len() {
+            for vector in self.vectors.items.values() {
+                if let Some(item) = self.semantic_item(&vector.id)?
+                    && scope_matches(item.summary.kind, query.scope)
+                    && crate::semantic::candidate(&item, self.settings.embedding.index_scope)
+                        .is_some_and(|c| c.text_hash == vector.text_hash)
+                {
+                    nearest.push((
+                        vector.id.clone(),
+                        crate::semantic::cosine_distance(&vector.vector, &query.vector)?,
+                    ));
+                }
+            }
+        }
+        for (id, distance) in nearest {
+            let Some(item) = self.semantic_item(&id)? else {
+                continue;
+            };
+            merged
+                .entry(id)
+                .and_modify(|entry| entry.2 = Some(distance))
+                .or_insert((item.summary, 0, Some(distance)));
+        }
+        let mut items: Vec<_> = merged.into_values().collect();
+        items.sort_by(|(a, ar, ad), (b, br, bd)| {
+            // Explicit heading/path matches retain ordinary search precedence.
+            let ae = *ar >= 600_000;
+            let be = *br >= 600_000;
+            be.cmp(&ae)
+                .then_with(|| {
+                    if ae && be {
+                        br.cmp(ar)
+                    } else {
+                        ad.unwrap_or(2.).total_cmp(&bd.unwrap_or(2.))
+                    }
+                })
+                .then(br.cmp(ar))
+                .then(b.pinned.cmp(&a.pinned))
+                .then(b.last_used_ms.cmp(&a.last_used_ms))
+                .then(a.id.cmp(&b.id))
+        });
+        items.truncate(50);
+        self.emit(Event::Results {
+            request_id: query.request_id,
+            items: items.into_iter().map(|(s, _, _)| s).collect(),
+        });
+        Ok(())
+    }
     fn favorite(&mut self, favorite: FavoriteInput) -> Result<(), String> {
         if favorite.kind == ItemKind::Clipboard {
             return Err("收藏需要文件夹或文档类型".into());
@@ -722,6 +1099,15 @@ impl Actor {
                 Command::Capture(snapshot) => self.capture(snapshot),
                 Command::Search(query) => self.search(query),
                 Command::AiSearch(query) => self.ai_search(query),
+                Command::PrepareSemanticIndex { request_id, cursor } => {
+                    self.prepare_semantic_index(request_id, cursor)
+                }
+                Command::StoreEmbeddings {
+                    request_id,
+                    profile,
+                    items,
+                } => self.store_embeddings(request_id, profile, items),
+                Command::SemanticSearch(query) => self.semantic_search(query),
                 Command::Load { id, request_id } => self
                     .lookup(&id, true)
                     .map(|item| self.emit(Event::Loaded { request_id, item })),

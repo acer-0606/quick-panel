@@ -137,11 +137,27 @@ pub enum Command {
     Capture(ClipboardSnapshot),
     Search(SearchQuery),
     AiSearch(AiSearchQuery),
-    Load { id: String, request_id: u64 },
+    PrepareSemanticIndex {
+        request_id: u64,
+        cursor: crate::semantic::IndexCursor,
+    },
+    StoreEmbeddings {
+        request_id: u64,
+        profile: String,
+        items: Vec<crate::semantic::IndexedEmbedding>,
+    },
+    SemanticSearch(crate::semantic::SemanticSearchQuery),
+    Load {
+        id: String,
+        request_id: u64,
+    },
     SaveFavorite(FavoriteInput),
     SaveSettings(Settings),
     Delete(String),
-    Pin { id: String, pinned: bool },
+    Pin {
+        id: String,
+        pinned: bool,
+    },
     Used(String),
     Flush,
     Shutdown,
@@ -151,6 +167,11 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum Event {
     Ready(Settings),
+    SemanticBatch(crate::semantic::IndexBatch),
+    EmbeddingsStored {
+        request_id: u64,
+        accepted: usize,
+    },
     Results {
         request_id: u64,
         items: Vec<ItemSummary>,

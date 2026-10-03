@@ -39,7 +39,7 @@ pub(crate) struct PendingItem {
     pub mutation: Mutation,
 }
 pub(crate) struct Repository {
-    connection: Connection,
+    pub(crate) connection: Connection,
     wal_path: std::path::PathBuf,
     page_size: u64,
     // Field drop order keeps this Box alive until after Connection closes.
@@ -73,6 +73,7 @@ impl Repository {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
+        crate::semantic_store::register()?;
         let mut connection = Connection::open(path).map_err(|e| e.to_string())?;
         connection
             .busy_timeout(Duration::from_millis(100))
@@ -528,6 +529,7 @@ impl Repository {
         settings: Option<&Settings>,
         retention: &Settings,
         now_ms: i64,
+        vectors: &crate::semantic_store::PendingVectors,
     ) -> Result<(), String> {
         let tx = self.connection.transaction().map_err(|e| e.to_string())?;
         for id in deleted {
@@ -589,6 +591,7 @@ impl Repository {
         let max_history = i64::try_from(retention.max_history).unwrap_or(i64::MAX);
         tx.execute("DELETE FROM item_search WHERE rowid IN (SELECT rowid FROM items WHERE kind=0 AND pinned=0 ORDER BY last_used_ms DESC,id LIMIT -1 OFFSET ?1)", [max_history]).map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM items WHERE kind=0 AND pinned=0 AND rowid IN (SELECT rowid FROM items WHERE kind=0 AND pinned=0 ORDER BY last_used_ms DESC,id LIMIT -1 OFFSET ?1)", [max_history]).map_err(|e| e.to_string())?;
+        crate::semantic_store::commit(&tx, pending, vectors)?;
         tx.commit().map_err(|e| e.to_string())
     }
     pub fn wal_bytes(&self) -> u64 {
