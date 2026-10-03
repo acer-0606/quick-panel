@@ -997,3 +997,74 @@ fn content_tail_changes_beyond_input_bound_keep_existing_vector() {
     );
     shutdown(&engine);
 }
+
+// A source flush between RAM pages must not hide the remaining sources now on disk.
+#[test]
+fn pending_candidate_cursor_survives_source_flush_between_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("test.db");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::AllText);
+    for i in 0..20 {
+        capture(&engine, &format!("尚未保存的正文{i}"));
+    }
+    let first = batch(&engine, IndexCursor::default());
+    assert_eq!(first.candidates.len(), 16);
+    assert!(first.cursor.disk_done);
+    assert!(!first.done);
+    assert_eq!(store(&engine, &first, vec![vec![1., 0.]; 16]), 16);
+    flush(&engine);
+    let second = batch(&engine, first.cursor);
+    assert_eq!(
+        second.candidates.len(),
+        4,
+        "remaining RAM sources moved to disk, but must still be scanned"
+    );
+    assert!(
+        second
+            .candidates
+            .iter()
+            .all(|c| first.candidates.iter().all(|indexed| indexed.id != c.id))
+    );
+    assert_eq!(store(&engine, &second, vec![vec![1., 0.]; 4]), 4);
+    assert!(batch(&engine, second.cursor).done);
+    shutdown(&engine);
+    assert_eq!(vec_count(&Connection::open(&path).unwrap()), 20);
+}
+
+// At 250 entries, 69-byte IDs / 64-byte hashes / 4095 floats plus
+// HashMap(capacity 448)'s bucket allocation exceed 4 MiB: pressure must save
+// existing vectors before this last batch is accepted into the RAM cache.
+#[test]
+fn vector_budget_accounts_for_map_expansion_at_4095_dimension_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("test.db");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::AllText);
+    for i in 0..250 {
+        capture(&engine, &format!("扩容临界正文{i}"));
+    }
+    let db = Connection::open(&path).unwrap();
+    let mut cursor = IndexCursor::default();
+    for _ in 0..15 {
+        let b = batch(&engine, cursor);
+        assert_eq!(b.candidates.len(), 16);
+        assert!(
+            b.candidates
+                .iter()
+                .all(|c| c.id.len() == 69 && c.text_hash.len() == 64)
+        );
+        assert_eq!(store(&engine, &b, vec![vec![1.; 4095]; 16]), 16);
+        cursor = b.cursor;
+    }
+    assert_eq!(vec_count(&db), 0);
+    let last = batch(&engine, cursor);
+    assert_eq!(last.candidates.len(), 10);
+    assert_eq!(store(&engine, &last, vec![vec![1.; 4095]; 10]), 10);
+    assert!(
+        vec_count(&db) > 0,
+        "the expanded map plus owned allocations exceed 4 MiB and must trigger a pressure save"
+    );
+    shutdown(&engine);
+    assert_eq!(vec_count(&db), 250);
+}

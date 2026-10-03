@@ -54,6 +54,7 @@ impl Engine {
                     settings,
                     pending: HashMap::new(),
                     vectors: crate::semantic_store::PendingVectors::default(),
+                    semantic_scan: None,
                     deleted: HashSet::new(),
                     settings_dirty: false,
                     deadline: None,
@@ -184,6 +185,9 @@ struct Actor {
     settings: Settings,
     pending: HashMap<String, PendingItem>,
     vectors: crate::semantic_store::PendingVectors,
+    // Latest returned cursor and commit generation. Source commits can move
+    // unscanned RAM content into disk rows, including updates to old rowids.
+    semantic_scan: Option<(crate::semantic::IndexCursor, u64, String)>,
     deleted: HashSet<String>,
     settings_dirty: bool,
     deadline: Option<Instant>,
@@ -657,11 +661,25 @@ impl Actor {
         )?)
     }
     fn prepare_semantic_index(
-        &self,
+        &mut self,
         request_id: u64,
         mut cursor: crate::semantic::IndexCursor,
     ) -> Result<(), String> {
         let profile = self.semantic_profile()?;
+        let continuation = self
+            .semantic_scan
+            .as_ref()
+            .filter(|(previous, _, scanned_profile)| {
+                previous == &cursor && scanned_profile == &profile
+            });
+        if continuation.is_some_and(|(_, generation, _)| *generation != self.commits)
+            || (cursor.disk_done && continuation.is_none())
+        {
+            // A successful commit may have cleared unseen pending sources or
+            // updated earlier disk rowids. Restart the bounded disk scan; hashes
+            // skip completed vectors, so no completed inputs are sent again.
+            cursor = crate::semantic::IndexCursor::default();
+        }
         let mut candidates = Vec::new();
         if !cursor.disk_done {
             let (last, done) = crate::semantic_store::page(
@@ -693,6 +711,7 @@ impl Actor {
             cursor.disk_done = done;
             // Disk pages inspect at most 128 sources per command, even if none
             // need embeddings. The controller follows the returned cursor.
+            self.semantic_scan = Some((cursor.clone(), self.commits, profile.clone()));
             self.emit(Event::SemanticBatch(crate::semantic::IndexBatch {
                 request_id,
                 profile,
@@ -732,6 +751,7 @@ impl Actor {
             }
         }
         let done = visited == total;
+        self.semantic_scan = Some((cursor.clone(), self.commits, profile.clone()));
         self.emit(Event::SemanticBatch(crate::semantic::IndexBatch {
             request_id,
             profile,
@@ -790,24 +810,15 @@ impl Actor {
                 accepted.push(item);
             }
         }
-        let bytes: usize = accepted
-            .iter()
-            .map(crate::semantic_store::embedding_bytes)
-            .sum();
-        if bytes > crate::semantic_store::MAX_PENDING_BYTES {
+        if !accepted.is_empty()
+            && crate::semantic_store::PendingVectors::default()
+                .projected_bytes(profile.capacity(), &accepted)
+                > crate::semantic_store::MAX_PENDING_BYTES
+        {
             return Err("待保存语义缓存已满".into());
         }
-        let replacing: usize = accepted
-            .iter()
-            .filter_map(|v| self.vectors.items.get(&v.id))
-            .map(crate::semantic_store::embedding_bytes)
-            .sum();
         let pressure = !accepted.is_empty()
-            && (self
-                .vectors
-                .bytes()
-                .saturating_sub(replacing)
-                .saturating_add(bytes)
+            && (self.vectors.projected_bytes(profile.capacity(), &accepted)
                 > crate::semantic_store::MAX_PENDING_BYTES
                 || (!self.vectors.items.is_empty() && self.vectors.profile != profile));
         if pressure {
@@ -842,6 +853,7 @@ impl Actor {
             for item in accepted {
                 self.vectors.items.insert(item.id.clone(), item);
             }
+            debug_assert!(self.vectors.bytes() <= crate::semantic_store::MAX_PENDING_BYTES);
             self.mark_dirty();
         }
         self.emit(Event::EmbeddingsStored {

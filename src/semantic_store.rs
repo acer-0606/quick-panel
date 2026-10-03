@@ -55,12 +55,78 @@ pub(crate) struct PendingVectors {
 }
 impl PendingVectors {
     pub fn bytes(&self) -> usize {
-        self.items.values().map(embedding_bytes).sum()
+        self.items.iter().fold(
+            map_allocation_bytes(self.items.capacity()).saturating_add(self.profile.capacity()),
+            |bytes, (key, item)| {
+                bytes
+                    .saturating_add(key.capacity())
+                    .saturating_add(owned_bytes(item))
+            },
+        )
+    }
+    /// Predict the actual post-admission map capacity without growing the live
+    /// cache before the batch is admitted. This map only grows by insert and is
+    /// replaced by an empty map on successful commit; no reserve/remove paths.
+    pub fn projected_bytes(&self, profile_capacity: usize, items: &[IndexedEmbedding]) -> usize {
+        let new_keys = items
+            .iter()
+            .filter(|item| !self.items.contains_key(&item.id))
+            .count();
+        let length = self.items.len().saturating_add(new_keys);
+        let capacity = if length <= self.items.capacity() {
+            self.items.capacity()
+        } else {
+            HashMap::<String, IndexedEmbedding>::with_capacity(length).capacity()
+        };
+        let mut owned = self.items.iter().fold(0usize, |bytes, (key, item)| {
+            bytes
+                .saturating_add(key.capacity())
+                .saturating_add(owned_bytes(item))
+        });
+        for item in items {
+            if let Some(old) = self.items.get(&item.id) {
+                owned = owned.saturating_sub(owned_bytes(old))
+            } else {
+                owned = owned.saturating_add(item.id.len())
+            }
+            owned = owned.saturating_add(owned_bytes(item));
+        }
+        map_allocation_bytes(capacity)
+            .saturating_add(profile_capacity)
+            .saturating_add(owned)
     }
 }
+fn owned_bytes(item: &IndexedEmbedding) -> usize {
+    item.id
+        .capacity()
+        .saturating_add(item.text_hash.capacity())
+        .saturating_add(
+            item.vector
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f32>()),
+        )
+}
+fn map_allocation_bytes(capacity: usize) -> usize {
+    // std's hashbrown table uses power-of-two buckets with 7/8 usable slots
+    // (small tables reserve one slot). Recover a conservative bucket count
+    // from usable capacity, count every tuple and control byte, and allow 64
+    // bytes for the control group/alignment tail on supported desktop targets.
+    let buckets = if capacity == 0 {
+        0
+    } else {
+        capacity
+            .saturating_add(1)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+    };
+    buckets
+        .saturating_mul(std::mem::size_of::<(String, IndexedEmbedding)>() + 1)
+        .saturating_add(if buckets == 0 { 0 } else { 64 })
+        .saturating_add(std::mem::size_of::<PendingVectors>())
+}
 pub(crate) fn embedding_bytes(item: &IndexedEmbedding) -> usize {
-    // Include owned allocation capacities, the duplicated map key, and a
-    // conservative allowance for struct/bucket metadata at the map load factor.
+    // Command queue estimate only. The retained vector cache uses the actual
+    // and projected table capacities above, including its profile allocation.
     item.id
         .capacity()
         .saturating_add(item.id.len())
