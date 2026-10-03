@@ -78,6 +78,7 @@ pub struct FavoriteInput {
 #[serde(default)]
 pub struct Settings {
     pub ai: crate::ai::AiSettings,
+    pub embedding: crate::semantic::EmbeddingSettings,
     pub theme: Theme,
     pub hotkey_modifiers: u32,
     pub hotkey_key: u32,
@@ -93,6 +94,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             ai: crate::ai::AiSettings::default(),
+            embedding: crate::semantic::EmbeddingSettings::default(),
             theme: Theme::System,
             hotkey_modifiers: 3,
             hotkey_key: 32,

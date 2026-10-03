@@ -35,6 +35,10 @@ impl fmt::Debug for HttpRequest {
 }
 
 pub fn parse_endpoint(address: &str) -> Result<Endpoint, String> {
+    parse_endpoint_for(address, "messages")
+}
+
+pub(crate) fn parse_endpoint_for(address: &str, resource: &str) -> Result<Endpoint, String> {
     if address.len() > MAX_ADDRESS_BYTES
         || !address.is_ascii()
         || address.bytes().any(|byte| byte <= b' ' || byte == 0x7f)
@@ -83,12 +87,13 @@ pub fn parse_endpoint(address: &str) -> Result<Endpoint, String> {
     }
     validate_path(path)?;
     let path = format!("/{}", path.trim_end_matches('/'));
-    let path = if path.ends_with("/v1/messages") {
+    let suffix = format!("/v1/{resource}");
+    let path = if path.ends_with(&suffix) {
         path
     } else if path.ends_with("/v1") {
-        format!("{path}/messages")
+        format!("{path}/{resource}")
     } else {
-        format!("{}/v1/messages", path.trim_end_matches('/'))
+        format!("{}{suffix}", path.trim_end_matches('/'))
     };
     if path.len() > MAX_ADDRESS_BYTES {
         return Err("API 地址过长".into());
