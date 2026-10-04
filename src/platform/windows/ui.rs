@@ -12,6 +12,7 @@ use crate::{
     hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
     model::*,
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
+    query_feedback::{IndexReply, QueryReply, claude_reply, embedding_reply, index_reply},
     semantic::{self, EmbeddingSettings, IndexScope},
     semantic_ui::{
         IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
@@ -726,7 +727,7 @@ impl App {
                 let _ = SetWindowTextW(self.ai_button, w!("取消 AI"));
                 self.status("AI 正在理解查询…普通结果仍可使用");
             }
-            Err(message) => self.status(&message),
+            Err(_) => self.local_search_status(),
         }
     }
     unsafe fn ai_done(&mut self) {
@@ -744,14 +745,15 @@ impl App {
             return;
         }
         let _ = SetWindowTextW(self.ai_button, w!("按意思查找"));
-        match completion.result {
-            Ok(plan) => {
-                self.ai_plan = Some(plan);
-                self.saved_items.clear();
-                self.saved_ready = false;
-                self.search();
-            }
-            Err(message) => self.status(&format!("{message} · 本地检索仍可使用")),
+        match claude_reply(
+            completion.result,
+            &mut self.ai_plan,
+            &mut self.saved_items,
+            &mut self.saved_ready,
+        ) {
+            QueryReply::Applied => self.search(),
+            QueryReply::LocalFallback => self.local_search_status(),
+            QueryReply::Ignored => {}
         }
     }
     unsafe fn cancel_semantic(&mut self) {
@@ -842,8 +844,8 @@ impl App {
         }
         let profile = match semantic::profile_id(&self.settings.embedding) {
             Ok(profile) => profile,
-            Err(message) => {
-                self.status(&message);
+            Err(_) => {
+                self.local_search_status();
                 return;
             }
         };
@@ -865,7 +867,7 @@ impl App {
                 let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
                 self.status("语义查询处理中…普通结果仍可使用");
             }
-            Err(message) => self.status(&message),
+            Err(_) => self.local_search_status(),
         }
     }
     unsafe fn embedding_done(&mut self) {
@@ -880,61 +882,43 @@ impl App {
                 && self.state.visible
                 && !self.state.modal_open
                 && self.state.lifecycle == Lifecycle::Running;
-            if self
-                .semantic_query
-                .current(completion.id, &query, self.scope, &profile, active)
-            {
-                match completion.result {
-                    Ok(mut vectors) if vectors.len() == 1 => {
-                        if self.semantic_query.finish(
-                            completion.id,
-                            &query,
-                            self.scope,
-                            &profile,
-                            active,
-                            vectors.remove(0),
-                        ) {
-                            self.saved_items.clear();
-                            self.saved_ready = false;
-                            self.clear_preview();
-                            self.search();
-                            let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
-                        }
-                    }
-                    Ok(_) => {
-                        self.cancel_semantic();
-                        self.status("Embedding API 返回的查询向量无效");
-                    }
-                    Err(message) => {
-                        self.cancel_semantic();
-                        self.search();
-                        self.status(&message);
-                    }
+            match embedding_reply(
+                completion.result,
+                &mut self.semantic_query,
+                completion.id,
+                (&query, self.scope, &profile, active),
+            ) {
+                QueryReply::Applied => {
+                    self.saved_items.clear();
+                    self.saved_ready = false;
+                    self.clear_preview();
+                    self.search();
+                    let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
                 }
+                QueryReply::LocalFallback => {
+                    let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+                    self.local_search_status();
+                }
+                QueryReply::Ignored => {}
             }
         }
         if let Some(completion) = self
             .index_worker
             .as_ref()
             .and_then(EmbeddingWorker::try_result)
-            && self.semantic_index.network_current(completion.id, &profile)
         {
-            match completion.result {
-                Ok(vectors) => {
-                    if let Some(command) =
-                        self.semantic_index
-                            .network_result(completion.id, &profile, vectors)
-                    {
-                        self.send_index(command);
-                    } else {
-                        self.cancel_index();
-                        self.status("Embedding API 返回的索引向量无效");
-                    }
-                }
-                Err(message) => {
+            match index_reply(
+                completion.result,
+                &mut self.semantic_index,
+                completion.id,
+                &profile,
+            ) {
+                IndexReply::Store(command) => self.send_index(*command),
+                IndexReply::LocalFallback => {
                     self.cancel_index();
-                    self.status(&message);
+                    self.local_search_status();
                 }
+                IndexReply::Ignored => {}
             }
         }
     }
@@ -955,8 +939,8 @@ impl App {
         }
         let profile = match semantic::profile_id(&self.settings.embedding) {
             Ok(profile) => profile,
-            Err(message) => {
-                self.status(&message);
+            Err(_) => {
+                self.local_search_status();
                 return;
             }
         };
@@ -1011,9 +995,9 @@ impl App {
             inputs,
         }) {
             Ok(id) => self.semantic_index.network_started(id),
-            Err(message) => {
+            Err(_) => {
                 self.cancel_index();
-                self.status(&message);
+                self.local_search_status();
             }
         }
     }
@@ -1328,6 +1312,9 @@ impl App {
     unsafe fn status(&self, message: &str) {
         let text = wide(message);
         let _ = SetWindowTextW(self.footer, PCWSTR(text.as_ptr()));
+    }
+    unsafe fn local_search_status(&self) {
+        self.status("本地检索 · ↑↓ 选择  Enter 打开/粘贴");
     }
     unsafe fn tray(&self, operation: NOTIFY_ICON_MESSAGE) {
         let mut data = NOTIFYICONDATAW {

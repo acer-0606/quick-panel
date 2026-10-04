@@ -1,6 +1,7 @@
 //! Small native dialogs keep every editable field in a real Win32 Edit control.
-use super::theme;
-use std::cell::RefCell;
+use super::{ai_client, theme};
+use crate::connection_test::{ConnectionTestGate, ConnectionTestWorker};
+use std::{cell::RefCell, sync::Arc};
 use windows::{
     Win32::{
         Foundation::*,
@@ -67,6 +68,162 @@ struct Form {
     edits: Vec<HWND>,
     done: bool,
     accepted: bool,
+    test: Option<TestForm>,
+    test_gate: ConnectionTestGate,
+    test_button: Option<HWND>,
+    test_result: Option<HWND>,
+    save_button: Option<HWND>,
+}
+
+#[derive(Clone)]
+enum TestForm {
+    Ai(crate::ai::AiSettings),
+    Embedding(crate::semantic::EmbeddingSettings),
+}
+struct TestRequest {
+    config: TestForm,
+    key: ai_client::SecretString,
+    clear_key: bool,
+}
+enum TestSuccess {
+    Ai,
+    Embedding(usize),
+}
+const TEST_BUTTON: usize = 3;
+const TEST_TIMER: usize = 1;
+thread_local! {
+    // Shared across forms so closing one does not allow a second concurrent paid call.
+    // The worker creates its first thread only after an explicit click.
+    static TEST_WORKER: ConnectionTestWorker<TestRequest, TestSuccess> = ConnectionTestWorker::new(
+        |request: TestRequest| match request.config {
+            TestForm::Ai(settings) => ai_client::test_ai_connection_with_key(
+                &settings, request.key, request.clear_key,
+            ).map(|()| TestSuccess::Ai),
+            TestForm::Embedding(settings) => ai_client::test_embedding_connection_with_key(
+                &settings, request.key, request.clear_key,
+            ).map(TestSuccess::Embedding),
+        },
+        Arc::new(|| {}),
+    );
+}
+
+unsafe fn test_status(ptr: *const RefCell<Form>, message: &str) {
+    let output = unsafe { (*ptr).borrow().test_result };
+    if let Some(output) = output {
+        let message = wide(message);
+        unsafe {
+            let _ = SetWindowTextW(output, PCWSTR(message.as_ptr()));
+        }
+    }
+}
+
+unsafe fn test_controls(ptr: *const RefCell<Form>, running: bool) {
+    // EnableWindow can dispatch messages synchronously. Never keep a Form borrow across it.
+    let (edits, save, test) = unsafe {
+        let form = (*ptr).borrow();
+        (form.edits.clone(), form.save_button, form.test_button)
+    };
+    unsafe {
+        for edit in edits {
+            let _ = EnableWindow(edit, !running);
+        }
+        if let Some(save) = save {
+            let _ = EnableWindow(save, !running);
+        }
+        if let Some(test) = test {
+            let available = !running && !TEST_WORKER.with(|worker| worker.busy());
+            let _ = EnableWindow(test, available);
+        }
+    }
+}
+
+unsafe fn cancel_test(ptr: *const RefCell<Form>) {
+    let id = unsafe { (*ptr).borrow_mut().test_gate.cancel() };
+    if let Some(id) = id {
+        TEST_WORKER.with(|worker| worker.cancel(id));
+    }
+}
+
+unsafe fn begin_test(ptr: *const RefCell<Form>) {
+    let (config, edits) = unsafe {
+        let form = (*ptr).borrow();
+        if form.done || form.test_gate.busy() {
+            return;
+        }
+        (form.test.clone(), form.edits.clone())
+    };
+    let Some(mut config) = config else { return };
+    let (password_index, clear_index) = match config {
+        TestForm::Ai(_) => (4, 5),
+        TestForm::Embedding(_) => (3, 4),
+    };
+    // Password text enters an erasing owner immediately; no plain-text result vector is made.
+    let key = ai_client::SecretString(unsafe { text(edits[password_index]) });
+    let clear_key = unsafe { SendMessageW(edits[clear_index], BM_GETCHECK, None, None).0 == 1 };
+    unsafe {
+        match &mut config {
+            TestForm::Ai(settings) => {
+                settings.endpoint = text(edits[1]).trim().into();
+                settings.model = text(edits[2]).trim().into();
+                settings.auth = if SendMessageW(edits[3], CB_GETCURSEL, None, None).0 == 1 {
+                    crate::ai::AuthMethod::Bearer
+                } else {
+                    crate::ai::AuthMethod::ApiKey
+                };
+            }
+            TestForm::Embedding(settings) => {
+                settings.endpoint = text(edits[1]).trim().into();
+                settings.model = text(edits[2]).trim().into();
+            }
+        }
+    }
+    let request = TestRequest {
+        config,
+        key,
+        clear_key,
+    };
+    match TEST_WORKER.with(|worker| worker.submit(request)) {
+        Ok(id) => unsafe {
+            (*ptr).borrow_mut().test_gate.begin(id);
+            test_status(ptr, "正在测试连接… 仅发送内置测试文本");
+            test_controls(ptr, true);
+        },
+        Err(message) => unsafe { test_status(ptr, &format!("测试失败：{message}")) },
+    }
+}
+
+unsafe fn poll_test(ptr: *const RefCell<Form>) {
+    let done = unsafe { (*ptr).borrow().done };
+    if done {
+        return;
+    }
+    if let Some(completion) = TEST_WORKER.with(|worker| worker.try_result()) {
+        let adopted = unsafe { (*ptr).borrow_mut().test_gate.finish(completion.id) };
+        if adopted {
+            let elapsed = completion.elapsed.as_millis();
+            let message = match completion.result {
+                Ok(TestSuccess::Ai) => format!("连接成功 · 检索接口可用 · {elapsed} ms"),
+                Ok(TestSuccess::Embedding(dimensions)) => {
+                    format!("连接成功 · 向量维度 {dimensions} · {elapsed} ms")
+                }
+                Err(error) => format!("测试失败：{error} · {elapsed} ms"),
+            };
+            unsafe {
+                test_status(ptr, &message);
+                test_controls(ptr, false);
+            }
+        }
+    }
+    let (running, button) = unsafe {
+        let form = (*ptr).borrow();
+        (form.test_gate.busy(), form.test_button)
+    };
+    if let Some(button) = button {
+        let available = !running && !TEST_WORKER.with(|worker| worker.busy());
+        unsafe {
+            let _ = EnableWindow(button, available);
+        }
+    }
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
@@ -78,14 +235,47 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         if !ptr.is_null() {
             match msg {
                 WM_COMMAND if (wp.0 & 0xffff) == 1 || (wp.0 & 0xffff) == 2 => {
-                    let mut f = (*ptr).borrow_mut();
-                    f.accepted = (wp.0 & 0xffff) == 1;
-                    f.done = true;
+                    let accept = (wp.0 & 0xffff) == 1;
+                    if accept && (*ptr).borrow().test_gate.busy() {
+                        return LRESULT(0);
+                    }
+                    {
+                        let mut f = (*ptr).borrow_mut();
+                        f.accepted = accept;
+                        f.done = true;
+                    }
+                    cancel_test(ptr);
+                    return LRESULT(0);
+                }
+                WM_COMMAND if (wp.0 & 0xffff) == TEST_BUTTON => {
+                    begin_test(ptr);
+                    return LRESULT(0);
+                }
+                WM_COMMAND => {
+                    let changed = {
+                        let form = (*ptr).borrow();
+                        form.test.is_some()
+                            && !form.test_gate.busy()
+                            && form.edits.iter().any(|edit| edit.0 as isize == lp.0)
+                    };
+                    let notification = (wp.0 >> 16) as u32;
+                    if changed && [EN_CHANGE, CBN_SELCHANGE, BN_CLICKED].contains(&notification) {
+                        test_status(ptr, "配置已修改，请重新测试连接");
+                    }
+                }
+                WM_TIMER if wp.0 == TEST_TIMER => {
+                    poll_test(ptr);
                     return LRESULT(0);
                 }
                 WM_CLOSE => {
                     (*ptr).borrow_mut().done = true;
+                    cancel_test(ptr);
                     return LRESULT(0);
+                }
+                WM_NCDESTROY => {
+                    (*ptr).borrow_mut().done = true;
+                    cancel_test(ptr);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 _ => {}
             }
@@ -132,7 +322,7 @@ pub unsafe fn ai_settings_form(
     settings: &crate::ai::AiSettings,
 ) -> Option<Vec<String>> {
     unsafe {
-        form_fields(
+        form_fields_with_test(
             owner,
             "AI检索设置 · 仅发送查询与功能目录",
             &[
@@ -161,6 +351,7 @@ pub unsafe fn ai_settings_form(
                     Field::Switch(false, "清除已保存密钥（同时关闭 AI）"),
                 ),
             ],
+            Some(TestForm::Ai(settings.clone())),
         )
     }
 }
@@ -169,7 +360,7 @@ pub unsafe fn embedding_settings_form(
     settings: &crate::semantic::EmbeddingSettings,
 ) -> Option<Vec<String>> {
     unsafe {
-        form_fields(
+        form_fields_with_test(
             owner,
             "语义检索设置 · 独立 Embedding 服务",
             &[
@@ -200,10 +391,19 @@ pub unsafe fn embedding_settings_form(
                     )),
                 ),
             ],
+            Some(TestForm::Embedding(settings.clone())),
         )
     }
 }
 unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Option<Vec<String>> {
+    unsafe { form_fields_with_test(owner, title, fields, None) }
+}
+unsafe fn form_fields_with_test(
+    owner: HWND,
+    title: &str,
+    fields: &[(&str, Field)],
+    test: Option<TestForm>,
+) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
         let class = w!("QuickPanelForm");
@@ -216,10 +416,16 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             ..Default::default()
         };
         RegisterClassW(&wc);
+        let testing = test.is_some();
         let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
             done: false,
             accepted: false,
+            test,
+            test_gate: ConnectionTestGate::default(),
+            test_button: None,
+            test_result: None,
+            save_button: None,
         }));
         let title = wide(title);
         let owner_dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
@@ -232,11 +438,11 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             &mut monitor,
         );
         let work = monitor.rcWork;
-        let fit = ((work.bottom - work.top - 24).max(1) * 96 / (104 + fields.len() as i32 * 62))
-            .max(96) as u32;
+        let logical_height = 104 + fields.len() as i32 * 62 + if testing { 96 } else { 0 };
+        let fit = ((work.bottom - work.top - 24).max(1) * 96 / logical_height).max(96) as u32;
         let dpi = owner_dpi.min(fit);
         let scale = |v: i32| v * (dpi as i32) / 96;
-        let height = scale(104 + fields.len() as i32 * 62);
+        let height = scale(logical_height);
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             class,
@@ -349,6 +555,52 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             }
             state.borrow_mut().edits.push(e);
         }
+        if testing {
+            let y = scale(12 + fields.len() as i32 * 62);
+            let button = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BUTTON"),
+                w!("测试连接"),
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                scale(18),
+                y,
+                scale(136),
+                scale(30),
+                Some(hwnd),
+                Some(HMENU(TEST_BUTTON as *mut _)),
+                None,
+                None,
+            )
+            .ok()?;
+            let output = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("点击测试仅发送内置测试文本，不保存设置"),
+                WS_CHILD | WS_VISIBLE,
+                scale(18),
+                y + scale(36),
+                scale(470),
+                scale(42),
+                Some(hwnd),
+                None,
+                None,
+                None,
+            )
+            .ok()?;
+            SendMessageW(button, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            SendMessageW(output, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            {
+                let mut form = state.borrow_mut();
+                form.test_button = Some(button);
+                form.test_result = Some(output);
+            }
+            let available = !TEST_WORKER.with(|worker| worker.busy());
+            let _ = EnableWindow(button, available);
+            if SetTimer(Some(hwnd), TEST_TIMER, 50, None) == 0 {
+                let _ = EnableWindow(button, false);
+                test_status(&*state, "无法启动连接测试状态更新，请重新打开设置");
+            }
+        }
         for (id, label, x) in [(1, "保存", 300), (2, "取消", 398)] {
             let s = wide(label);
             let b = CreateWindowExW(
@@ -367,6 +619,9 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             )
             .ok()?;
             SendMessageW(b, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            if id == 1 {
+                state.borrow_mut().save_button = Some(b);
+            }
         }
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -400,12 +655,17 @@ unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Opt
             };
             if msg.message == WM_KEYDOWN && msg.wParam.0 == 27 && !composing {
                 state.borrow_mut().done = true;
+                cancel_test(&*state);
                 continue;
             }
             if composing || !IsDialogMessageW(hwnd, &msg).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
+        }
+        cancel_test(&*state);
+        if testing {
+            let _ = KillTimer(Some(hwnd), TEST_TIMER);
         }
         let (accepted, edits) = {
             let state = state.borrow();

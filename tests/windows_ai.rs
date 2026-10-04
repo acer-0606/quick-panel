@@ -4,7 +4,9 @@
 use quick_panel::{
     ai::{AiSettings, AuthMethod, FunctionDescriptor, Period},
     model::Scope,
-    platform::windows::ai_client::{interpret, protect_key, unprotect_key, validate_settings},
+    platform::windows::ai_client::{
+        interpret, protect_key, test_ai_connection, unprotect_key, validate_settings,
+    },
 };
 use serde_json::Value;
 use std::{
@@ -17,6 +19,77 @@ use std::{
 
 const DUMMY_KEY: &str = "fixture-api-key-not-a-real-credential";
 const PLAN_RESPONSE: &str = r#"{"id":"msg_fixture","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"{\"queries\":[\"连接超时\",\"connection timeout\"],\"scope\":\"clipboard\",\"period\":\"yesterday\",\"functions\":[\"pause_capture\"]}"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+const CONNECTION_RESPONSE: &str = r#"{"id":"msg_fixture","type":"message","role":"assistant","model":"fixture-model","content":[{"type":"text","text":"{\"queries\":[\"connection\"],\"scope\":null,\"period\":\"any\",\"functions\":[]}"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}"#;
+
+// Checking only HTTP 200 would accept an API that cannot supply a search plan.
+#[test]
+fn connection_test_uses_edited_disabled_config_and_validates_a_real_search_plan() {
+    let (endpoint, server) = serve(response("200 OK", "", CONNECTION_RESPONSE.as_bytes()));
+    let mut config = settings(endpoint, AuthMethod::Bearer);
+    config.enabled = false;
+    config.model = "unsaved-edited-model".into();
+    let original = config.clone();
+    test_ai_connection(&config, "unsaved-key".into(), false).unwrap();
+    assert_eq!(config, original);
+    let request = server.join().unwrap();
+    assert_eq!(request.line, "POST /v1/messages HTTP/1.1");
+    assert_eq!(request.headers["authorization"], "Bearer unsaved-key");
+    assert!(!request.headers.contains_key("x-api-key"));
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["model"], "unsaved-edited-model");
+    let payload: Value =
+        serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["query"], "Quick Panel connection test");
+    assert_eq!(payload["functions"], serde_json::json!([]));
+    assert_eq!(payload["scope"], "all");
+
+    let (endpoint, server) = serve(response("200 OK", "", PLAN_RESPONSE.as_bytes()));
+    let error = test_ai_connection(
+        &settings(endpoint, AuthMethod::ApiKey),
+        String::new(),
+        false,
+    )
+    .unwrap_err();
+    assert!(error.contains("检索计划无效")); // The undeclared function must be rejected.
+    let request = server.join().unwrap();
+    assert_eq!(request.headers["x-api-key"], DUMMY_KEY);
+}
+
+// Falling back to the saved key for clear-key would cause an unintended authenticated POST.
+#[test]
+fn connection_test_clear_key_and_invalid_password_fail_locally_without_posting() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = settings(
+        format!("http://{}", listener.local_addr().unwrap()),
+        AuthMethod::ApiKey,
+    );
+    for (password, clear) in [("", true), ("unsaved-key", true), ("key with space", false)] {
+        let error = test_ai_connection(&config, password.into(), clear).unwrap_err();
+        assert!(!error.contains(DUMMY_KEY));
+        assert!(!error.contains("unsaved-key"));
+        assert!(!error.contains("key with space"));
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
+    }
+}
+
+#[test]
+fn connection_test_service_failure_is_sanitized_and_not_retried() {
+    let (endpoint, server) = serve(response(
+        "429 Too Many Requests",
+        "",
+        b"private-provider-body unsaved-key",
+    ));
+    let error = test_ai_connection(
+        &settings(endpoint, AuthMethod::ApiKey),
+        "unsaved-key".into(),
+        false,
+    )
+    .unwrap_err();
+    assert!(!error.contains("private-provider-body"));
+    assert!(!error.contains("unsaved-key"));
+    server.join().unwrap();
+}
 
 struct ObservedRequest {
     line: String,

@@ -3,6 +3,7 @@ pub mod ai;
 pub mod ai_jobs;
 pub mod claude;
 pub mod clipboard_formats;
+pub mod connection_test;
 pub mod embedding;
 pub mod embedding_jobs;
 pub mod engine;
@@ -11,6 +12,7 @@ pub mod model;
 pub mod palette;
 #[cfg(windows)]
 pub mod platform;
+pub mod query_feedback;
 pub mod repository;
 pub mod search;
 pub mod semantic;

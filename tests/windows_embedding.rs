@@ -1,7 +1,9 @@
 //! Local WinHTTP/DPAPI fixtures; compile-only on non-Windows hosts.
 #![cfg(windows)]
 use quick_panel::{
-    platform::windows::ai_client::{embed, protect_key, validate_embedding_settings},
+    platform::windows::ai_client::{
+        embed, protect_key, test_embedding_connection, validate_embedding_settings,
+    },
     semantic::EmbeddingSettings,
 };
 use serde_json::Value;
@@ -13,6 +15,86 @@ use std::{
     time::{Duration, Instant},
 };
 const DUMMY_KEY: &str = "fixture-embedding-key";
+
+// Reusing saved settings or batching user data would change the observed POST here.
+#[test]
+fn connection_test_posts_one_fixed_text_with_unsaved_disabled_config_and_reports_dimension() {
+    let (endpoint, server) = serve(response(
+        "200 OK",
+        "",
+        br#"{"data":[{"index":0,"embedding":[1,0,0]}]}"#,
+    ));
+    let mut config = settings(endpoint);
+    config.enabled = false;
+    config.model = "unsaved-embedding-model".into();
+    let original = config.clone();
+    assert_eq!(
+        test_embedding_connection(&config, "unsaved-embedding-key".into(), false).unwrap(),
+        3
+    );
+    assert_eq!(config, original);
+    let request = server.join().unwrap();
+    assert_eq!(request.line, "POST /v1/embeddings HTTP/1.1");
+    assert_eq!(
+        request.headers["authorization"],
+        "Bearer unsaved-embedding-key"
+    );
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["model"], "unsaved-embedding-model");
+    assert_eq!(
+        body["input"],
+        serde_json::json!(["Quick Panel connection test"])
+    );
+    assert_eq!(body["encoding_format"], "float");
+}
+
+#[test]
+fn connection_test_empty_password_uses_saved_key_but_clear_never_posts() {
+    let (endpoint, server) = serve(response(
+        "200 OK",
+        "",
+        br#"{"data":[{"index":0,"embedding":[1,0]}]}"#,
+    ));
+    assert_eq!(
+        test_embedding_connection(&settings(endpoint), String::new(), false).unwrap(),
+        2
+    );
+    assert_eq!(
+        server.join().unwrap().headers["authorization"],
+        "Bearer fixture-embedding-key"
+    );
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = settings(format!("http://{}", listener.local_addr().unwrap()));
+    for password in ["", "unsaved-embedding-key"] {
+        let error = test_embedding_connection(&config, password.into(), true).unwrap_err();
+        assert!(!error.contains(DUMMY_KEY));
+        assert!(!error.contains("unsaved-embedding-key"));
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
+    }
+}
+
+#[test]
+fn connection_test_rejects_invalid_vector_and_redacts_service_failure() {
+    for (status, body) in [
+        (
+            "200 OK",
+            &br#"{"data":[{"index":0,"embedding":[0,0]}]}"#[..],
+        ),
+        (
+            "503 Service Unavailable",
+            &b"private-provider-body unsaved-embedding-key"[..],
+        ),
+    ] {
+        let (endpoint, server) = serve(response(status, "", body));
+        let error =
+            test_embedding_connection(&settings(endpoint), "unsaved-embedding-key".into(), false)
+                .unwrap_err();
+        assert!(!error.contains("private-provider-body"));
+        assert!(!error.contains("unsaved-embedding-key"));
+        server.join().unwrap();
+    }
+}
 struct ObservedRequest {
     line: String,
     headers: BTreeMap<String, String>,

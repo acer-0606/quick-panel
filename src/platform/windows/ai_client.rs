@@ -4,6 +4,7 @@
 use crate::{
     ai::{AiPlan, AiSettings, FunctionDescriptor},
     claude::{HttpRequest, parse_response, prepare},
+    connection_test::{CredentialSource, credential_source},
     model::Scope,
 };
 use std::{
@@ -33,6 +34,7 @@ const CONNECT_TIMEOUT_MS: i32 = 4000;
 const IO_TIMEOUT_MS: i32 = 8000;
 // Stable application separation, not an independently secret password.
 const KEY_ENTROPY: &[u8] = b"quick-panel:claude-api-key:v1";
+const CONNECTION_TEST_TEXT: &str = "Quick Panel connection test";
 
 fn clear_bytes(bytes: &mut [u8]) {
     for byte in bytes {
@@ -385,6 +387,16 @@ pub fn interpret(
         return Err("AI 检索尚未启用".into());
     }
     let key = SecretString(unprotect_key(&settings.encrypted_key)?);
+    interpret_with_key(settings, key, query, scope, functions)
+}
+
+fn interpret_with_key(
+    settings: &AiSettings,
+    key: SecretString,
+    query: &str,
+    scope: Scope,
+    functions: &[FunctionDescriptor],
+) -> Result<AiPlan, String> {
     let request = SensitiveRequest(prepare(settings, &key.0, query, scope, functions)?);
     drop(key);
     let (status, body) = exchange(
@@ -413,6 +425,14 @@ pub fn embed(
     inputs: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
     let key = SecretString(unprotect_key(&settings.encrypted_key)?);
+    embed_with_key(settings, key, inputs)
+}
+
+fn embed_with_key(
+    settings: &crate::semantic::EmbeddingSettings,
+    key: SecretString,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
     let request = SensitiveRequest(crate::embedding::prepare(settings, &key.0, inputs)?);
     drop(key);
     let (status, body) = exchange(
@@ -421,4 +441,57 @@ pub fn embed(
         "Embedding API 响应超过 2 MiB，已停止读取",
     )?;
     crate::embedding::parse_response(status, &body, inputs.len())
+}
+
+fn connection_test_key(
+    entered: SecretString,
+    clear_key: bool,
+    saved: &[u8],
+) -> Result<SecretString, String> {
+    match credential_source(!entered.0.is_empty(), clear_key, !saved.is_empty())? {
+        CredentialSource::Entered => Ok(entered),
+        CredentialSource::Saved => Ok(SecretString(unprotect_key(saved)?)),
+    }
+}
+
+/// One explicit real Messages POST with built-in text and an empty function catalogue.
+/// The configuration remains untouched, and a disabled feature can still be tested.
+pub fn test_ai_connection(
+    settings: &AiSettings,
+    entered_key: String,
+    clear_key: bool,
+) -> Result<(), String> {
+    test_ai_connection_with_key(settings, SecretString(entered_key), clear_key)
+}
+
+pub(crate) fn test_ai_connection_with_key(
+    settings: &AiSettings,
+    entered_key: SecretString,
+    clear_key: bool,
+) -> Result<(), String> {
+    let key = connection_test_key(entered_key, clear_key, &settings.encrypted_key)?;
+    let mut test_settings = settings.clone();
+    test_settings.enabled = true;
+    interpret_with_key(&test_settings, key, CONNECTION_TEST_TEXT, Scope::All, &[]).map(|_| ())
+}
+
+/// One explicit real Embeddings POST containing only built-in text; returns its dimension.
+pub fn test_embedding_connection(
+    settings: &crate::semantic::EmbeddingSettings,
+    entered_key: String,
+    clear_key: bool,
+) -> Result<usize, String> {
+    test_embedding_connection_with_key(settings, SecretString(entered_key), clear_key)
+}
+
+pub(crate) fn test_embedding_connection_with_key(
+    settings: &crate::semantic::EmbeddingSettings,
+    entered_key: SecretString,
+    clear_key: bool,
+) -> Result<usize, String> {
+    let key = connection_test_key(entered_key, clear_key, &settings.encrypted_key)?;
+    let mut test_settings = settings.clone();
+    test_settings.enabled = true;
+    let vectors = embed_with_key(&test_settings, key, &[CONNECTION_TEST_TEXT.into()])?;
+    Ok(vectors[0].len())
 }
