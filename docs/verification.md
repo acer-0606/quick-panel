@@ -1,10 +1,33 @@
 # 验证记录
 
-当前验证日期：2026-10-04。产品源码提交：`7768dba`。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
+当前验证日期：2026-10-05。产品源码提交：`e171b3e`。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
 
 首版已实现并生成 Windows x64 便携包。共享核心、Windows 源码编译与静态审查通过；Windows 原生界面的实际运行尚未在本机验证。
 
-## 当前可选 sqlite-vec 语义检索
+## AI 接口反馈与连接测试（当前版本）
+
+Claude 与 Embedding 接口的连接、认证、协议或网络任务入队失败，在搜索页安静恢复本地检索状态。普通结果、选择和排队中的本地检索请求仍可用；过期回复不能取消新请求。索引接口失败停止本次会话，不自动重试，保留已接收向量。存储和磁盘错误仍通过原有错误路径显示。
+
+两个原生 API 设置表单均提供“测试连接”，使用当前尚未保存的地址、模型、认证和输入密钥；密码留空复用已保存的 DPAPI 密钥，勾选清除密钥禁止发送。未启用功能也可以测试。每次显式点击只发送一次内置文本，不发送历史、路径或文档，不保存配置或写入索引。表单显示成功耗时、失败原因，以及 Embedding 向量维度；编辑配置后提示重新测试。
+
+测试在后台执行，两个表单共享一个实际在途槽。取消或关闭只撤销结果接收，不等待网络；旧请求结束前不叠加第二次测试，旧结果不显示到新表单。测试期间禁止修改和保存，取消保持可用。凭据和请求沿用已有擦除及错误脱敏流程。
+
+| 当前检查 | 结果 |
+|---|---|
+| 全套共享测试 | **201 项通过，0 失败，2 项既有大库测试默认忽略** |
+| `cargo fmt --check`、`git diff --check` | 通过 |
+| macOS / Windows `--all-targets` Clippy，`-D warnings` | 同源两者通过 |
+| Windows GNU Release | 构建通过；PE32+ GUI x86-64，仅系统 DLL / CRT 导入 |
+| 当前共享 `--core-check` | 内存可查、保存前磁盘无历史、退出后恢复，三项均通过 |
+| Windows-only fixtures | **24 项仅交叉 Clippy 编译检查，0 项执行**；Claude 16 项、Embedding 8 项 |
+
+新增共享测试 11 项：连接测试 worker / gate / 凭据策略 5 项，查询与索引反馈 6 项。采用真实线程和 channel 验证单在途、取消后保留实际占位、关闭不等待和旧回复隔离；成功检索及索引存储确认路径仍覆盖。便携测试经过红绿验证；6 项新增 Windows fixture 仅交叉编译。独立代码审查未发现需要修复的缺陷。
+
+最终全套命令为 `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --locked -- --test-threads=1`。验证期间宿主空间紧张，曾出现 `SQLITE_FULL` 和 `SQLITE_IOERR_SHMSIZE`；保留故障记录，清理本项目可再生成的构建缓存后，同源码最终全套通过，未修改存储代码来掩盖故障。两项既有大库测试本次未重复。没有调用真实服务或使用用户密钥。
+
+Windows 原生窗口、测试按钮键盘行为、关闭/重开、WinHTTP 和 DPAPI 均未在 macOS 实际执行；需要 Windows 实机验收。此次没有重新测量查询基准，前版测量保留如下。
+
+## 可选 sqlite-vec 语义检索（历史验证 7768dba，2026-10-04）
 
 已实现默认关闭、与 Claude 独立配置的 OpenAI 兼容 Embedding API。地址、模型和密钥独立保存，密钥使用当前 Windows 用户 DPAPI；配置验证不联网。用户明确执行建立/更新索引后，选定范围的保存文本和收藏元数据才会发送给该服务；语义查询仅在点击时发送描述。默认固定内容与收藏，可选全部文本；不解析文件正文、不发送图片或其他二进制表示。
 
@@ -12,13 +35,13 @@
 
 独立审查和定点复审完成。回归覆盖跨提交分页、HashMap 扩容预算、源删除/清理后的批次重验、极值坐标归一化、KNN 限额前的范围过滤、路径优先、菜单目标、收藏/设置取消，以及 Claude 与语义模式恢复查询编号的顺序。最后的顺序回归也经过红绿测试和复审。
 
-| 当前检查 | 结果 |
+| 该版本检查 | 结果 |
 |---|---|
 | 全套共享测试 | **190 项通过，0 失败，2 项既有大库测试默认忽略** |
 | `cargo fmt --check`、`git diff --check` | 通过 |
 | macOS / Windows `--all-targets` Clippy，`-D warnings` | 同源两者通过 |
 | macOS / Windows GNU Release | 两者构建通过，Windows PE32+ GUI x86-64，只有系统 DLL / CRT 导入 |
-| 当前 Release `--core-check` | 内存可查、保存前磁盘无历史、退出后恢复，三项均通过 |
+| 该版本 Release `--core-check` | 内存可查、保存前磁盘无历史、退出后恢复，三项均通过 |
 | Windows-only fixtures | **18 项仅交叉 check / Clippy 编译检查，0 项执行**；包括原 Claude 13 项及 Embedding 5 项 |
 
 最终全套命令为 `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --locked -- --test-threads=1`。最初并行运行在宿主磁盘耗尽时出现两处明确的 `SQLITE_FULL`；清理本项目可再生构建缓存、降低临时数据库并行度后，同源码全套成功，没有以代码修改掩盖环境故障。两项既有 100k/WAL 大库回归此次未重复，历史结果在下文保留。
@@ -152,13 +175,14 @@ Windows CI 配置已提交，但未触发远程运行。MSVC 构建和 PowerShel
 4. 拖入收藏、编辑别名和标签、打开及重新定位目标；设置里修改、交换或关闭热键，以及冲突时保留原绑定。
 5. 缓存期内正常退出再重开、保存失败后重试或取消，以及 Windows 注销 / 关机。
 6. 从搜索执行设置、添加、暂停和预览功能；长按回车、菜单等待期间刷新结果，不应激活其他保存内容；空查询加载不显示临时添加入口。
+7. 两个 API 设置页用未保存配置和未启用功能测试；留空/清除密钥、重复点击、测试中关闭再重开及修改配置后的状态。接口失败时本地结果应仍可操作；保存和磁盘错误应继续显示。
 
 ## 可执行文件识别
 
-当前 `QuickPanel.exe`：3,983,872 字节，SHA-256：
+当前 `QuickPanel.exe`：4,005,888 字节，SHA-256：
 
 ```
-5a17e0a355cf366bbaf05cf138d53c3359427b7932bbb061572fc788df0c04c4
+b8706209254fb2fa95b32ba6f3c18539bad0d0285e819650c07a52617165a956
 ```
 
 程序无需 WebView、Electron 或随包携带的 GCC 运行库。ZIP 同时包含使用说明、设计与实施文档、此验证记录、MIT 许可证及依赖版权声明。
