@@ -10,11 +10,13 @@ use std::cmp::Reverse;
 pub struct RowDetail {
     pub text: String,
     pub saved_at_ms: Option<i64>,
+    pub visited_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Function {
     Settings,
+    PathActivitySettings,
     AiSettings,
     AiSearch,
     SmartSearch,
@@ -38,6 +40,7 @@ impl Function {
     fn id(self) -> &'static str {
         match self {
             Self::Settings => "function:settings",
+            Self::PathActivitySettings => "function:path-activity-settings",
             Self::AiSettings => "function:ai-settings",
             Self::SmartSearch => "function:smart-search",
             Self::AiSearch => "function:ai-search",
@@ -91,9 +94,22 @@ pub struct FunctionResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuggestedEntry {
+    id: String,
+    path: crate::path_activity::PathSuggestion,
+}
+impl From<crate::path_activity::PathSuggestion> for SuggestedEntry {
+    fn from(path: crate::path_activity::PathSuggestion) -> Self {
+        use sha2::{Digest, Sha256};
+        let id = format!("path-suggestion:{:x}", Sha256::digest(path.key.as_bytes()));
+        Self { id, path }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
     Function(FunctionResult),
     Saved(ItemSummary),
+    Suggested(SuggestedEntry),
 }
 impl Entry {
     pub fn detail(&self, query: &str) -> RowDetail {
@@ -133,18 +149,21 @@ impl Entry {
         RowDetail {
             text,
             saved_at_ms: self.saved().map(|item| item.created_at_ms),
+            visited_at_ms: self.suggested().map(|path| path.last_seen_ms),
         }
     }
     pub fn id(&self) -> &str {
         match self {
             Self::Function(result) => result.action.id(),
             Self::Saved(item) => &item.id,
+            Self::Suggested(path) => &path.id,
         }
     }
     pub fn title(&self) -> &str {
         match self {
             Self::Function(result) => result.title,
             Self::Saved(item) => &item.title,
+            Self::Suggested(path) => &path.path.title,
         }
     }
     pub fn subtitle(&self) -> String {
@@ -163,11 +182,22 @@ impl Entry {
                 )
             }
             Self::Saved(item) => item.subtitle.clone(),
+            Self::Suggested(path) => format!(
+                "外部观察 · {} 次有效访问 · {}",
+                path.path.visits, path.path.path
+            ),
         }
     }
     pub fn kind_label(&self) -> &'static str {
         match self {
             Self::Function(_) => "⚙ 功能",
+            Self::Suggested(path) => {
+                if path.path.kind == ItemKind::Folder {
+                    "▣ 常用文件夹"
+                } else {
+                    "▧ 常用文档"
+                }
+            }
             Self::Saved(item) => match item.kind {
                 ItemKind::Clipboard => "▤ 剪贴板",
                 ItemKind::Folder => "▣ 文件夹",
@@ -184,6 +214,35 @@ impl Entry {
         } else {
             None
         }
+    }
+    pub fn suggested(&self) -> Option<&crate::path_activity::PathSuggestion> {
+        if let Self::Suggested(path) = self {
+            Some(&path.path)
+        } else {
+            None
+        }
+    }
+    /// Action-only adapter. Never load, pin, delete or persist this item as an ID.
+    pub fn suggestion_action(&self) -> Option<StoredItem> {
+        let path = self.suggested()?;
+        Some(StoredItem {
+            summary: ItemSummary {
+                id: self.id().into(),
+                kind: path.kind,
+                title: path.title.clone(),
+                subtitle: path.path.clone(),
+                alias: String::new(),
+                tags: vec![],
+                pinned: false,
+                created_at_ms: 0,
+                last_used_ms: path.last_seen_ms,
+                use_count: path.visits,
+            },
+            text: String::new(),
+            representations: vec![],
+            target: Some(path.path.clone()),
+            open_with: None,
+        })
     }
     pub fn function(&self) -> Option<Function> {
         if let Self::Function(result) = self {
@@ -202,6 +261,19 @@ struct Spec {
     keywords: &'static [&'static str],
 }
 const CATALOG: &[Spec] = &[
+    Spec {
+        action: Function::PathActivitySettings,
+        title: "常用推荐设置",
+        description: "可选观察外部资源管理器和 Recent，管理排除目录与统计",
+        alias: "常用路径设置",
+        keywords: &[
+            "常用文件夹设置",
+            "自动推荐",
+            "路径记录",
+            "资源管理器",
+            "Recent",
+        ],
+    },
     Spec {
         action: Function::SmartSearch,
         title: "智能查找",
@@ -274,16 +346,16 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::PauseCapture,
-        title: "暂停记录",
+        title: "暂停剪贴板记录",
         description: "暂停捕获新的剪贴板内容",
-        alias: "暂停剪贴板",
+        alias: "暂停记录",
         keywords: &["停止记录", "pause", "暂停捕获"],
     },
     Spec {
         action: Function::ResumeCapture,
-        title: "恢复记录",
+        title: "恢复剪贴板记录",
         description: "继续捕获新的剪贴板内容",
-        alias: "恢复剪贴板",
+        alias: "恢复记录",
         keywords: &["继续记录", "resume", "开启记录"],
     },
     Spec {
@@ -466,6 +538,7 @@ pub fn results(query: &str, saved: Vec<ItemSummary>, context: Context) -> Vec<En
         Reverse(match entry {
             Entry::Function(result) => result.score,
             Entry::Saved(item) => search::rank(item, query),
+            Entry::Suggested(_) => 0,
         })
     });
     entries.truncate(50);
@@ -489,4 +562,32 @@ pub fn semantic_results(query: &str, saved: Vec<ItemSummary>, context: Context) 
     entries.extend(saved.into_iter().map(Entry::Saved));
     entries.truncate(50);
     entries
+}
+
+pub fn with_suggestions(
+    query: &str,
+    mut rows: Vec<Entry>,
+    paths: Vec<crate::path_activity::PathSuggestion>,
+) -> Vec<Entry> {
+    let mut keys: std::collections::BTreeSet<_> = rows
+        .iter()
+        .filter_map(Entry::saved)
+        .filter(|item| item.kind != ItemKind::Clipboard)
+        .filter_map(|item| crate::path_activity::normalize_path(&item.subtitle).ok())
+        .collect();
+    let limit = if query.trim().is_empty() { 5 } else { 10 };
+    let mut added = 0;
+    for path in paths {
+        if rows.len() >= 50 || added >= limit {
+            break;
+        }
+        if let Ok(key) = crate::path_activity::normalize_path(&path.path)
+            && keys.insert(key)
+        {
+            rows.push(Entry::Suggested(path.into()));
+            added += 1;
+        }
+    }
+    rows.truncate(50);
+    rows
 }

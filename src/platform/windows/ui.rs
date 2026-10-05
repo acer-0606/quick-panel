@@ -3,6 +3,7 @@ use super::{
     actions, ai_client, ai_time, clipboard,
     dialogs::{self, wide},
     images::{self, Image},
+    path_monitor::PathMonitor,
     theme,
 };
 use crate::{
@@ -22,7 +23,7 @@ use crate::{
         sync_semantic_view,
     },
     smart_search::{ClipboardMetadataForm, SmartAction, SmartPreflight, SmartView, StatusCache},
-    ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
+    ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, PathResultBatches, UiState},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -58,6 +59,10 @@ const INDEX_STATUS: usize = 108;
 const EMBEDDING_SETTINGS: usize = 109;
 const INDEX_START: usize = 110;
 const INDEX_CANCEL: usize = 111;
+const PATH_SETTINGS: usize = 112;
+const PATH_TIMER: usize = 400;
+const FAVORITE_PATH: usize = 210;
+const SUPPRESS_PATH: usize = 211;
 const OPEN: usize = 200;
 const COPY: usize = 201;
 const PLAIN: usize = 202;
@@ -80,6 +85,8 @@ enum Action {
     Delete,
     CopyPath,
     Preview,
+    Favorite,
+    Suppress,
 }
 enum Work {
     Capture(u32),
@@ -250,6 +257,10 @@ enum UiEffect {
         owner: HWND,
         settings: Settings,
     },
+    PathSettings {
+        owner: HWND,
+        settings: crate::path_activity::PathActivitySettings,
+    },
     AiSettings {
         owner: HWND,
         settings: AiSettings,
@@ -389,6 +400,9 @@ struct App {
     items: Vec<PaletteEntry>,
     saved_items: Vec<ItemSummary>,
     saved_ready: bool,
+    suggested_items: Vec<crate::path_activity::PathSuggestion>,
+    path_batches: PathResultBatches,
+    path_monitor: Option<PathMonitor>,
     query: String,
     result_scope: Scope,
     ai_worker: Option<AiWorker>,
@@ -501,6 +515,9 @@ pub fn run() -> Result<(), String> {
             items: Vec::new(),
             saved_items: Vec::new(),
             saved_ready: false,
+            suggested_items: Vec::new(),
+            path_batches: PathResultBatches::default(),
+            path_monitor: None,
             query: String::new(),
             result_scope: Scope::All,
             ai_worker: None,
@@ -606,7 +623,8 @@ pub fn run() -> Result<(), String> {
         }));
         let notify = Arc::new(move || post(handle, WORK_WAKE));
         app.preview_worker = Some(BackgroundWorker::new(prepare_preview, notify.clone()));
-        app.action_worker = Some(BackgroundWorker::new(native_job, notify));
+        app.action_worker = Some(BackgroundWorker::new(native_job, notify.clone()));
+        app.path_monitor = Some(PathMonitor::new(notify));
         AddClipboardFormatListener(hwnd).map_err(|e| e.to_string())?;
         app.tray(NIM_ADD);
         DragAcceptFiles(hwnd, true);
@@ -638,6 +656,7 @@ pub fn run() -> Result<(), String> {
         app.action_permit.cancel();
         app.preview_worker.take();
         app.action_worker.take();
+        app.path_monitor.take();
         CoUninitialize();
         Ok(())
     }
@@ -654,10 +673,15 @@ impl App {
                         .items
                         .iter()
                         .map(|entry| {
-                            entry
-                                .detail(&self.query)
+                            let detail = entry.detail(&self.query);
+                            detail
                                 .saved_at_ms
                                 .map(local_saved_time)
+                                .or_else(|| {
+                                    detail
+                                        .visited_at_ms
+                                        .map(|time| format!("访 {}", local_saved_time(time)))
+                                })
                                 .unwrap_or_default()
                         })
                         .collect(),
@@ -1020,6 +1044,8 @@ impl App {
             self.cancel_actions();
             self.clear_preview();
             self.rebuild_results();
+            self.path_batches.begin(query.request_id);
+            self.suggested_items.clear();
             self.send(Command::Search(query));
         }
     }
@@ -1694,6 +1720,7 @@ impl App {
         self.query = query;
         self.result_scope = self.scope;
         let id = self.state.next_refresh_request();
+        self.path_batches.begin(id);
         if let Some(query) = self.semantic_query.local_query(id) {
             self.rebuild_results();
             self.send(Command::SemanticSearch(query));
@@ -1709,6 +1736,7 @@ impl App {
             };
             let scope = plan.scope.unwrap_or(self.scope);
             if plan.queries.is_empty() && scope == Scope::All && from_ms.is_none() {
+                self.suggested_items.clear();
                 self.saved_items.clear();
                 self.saved_ready = true;
                 self.rebuild_results();
@@ -1741,6 +1769,9 @@ impl App {
             embedding_enabled: self.settings.embedding.enabled,
             indexing: self.semantic_index.active(),
         };
+        if !self.saved_ready {
+            self.suggested_items.clear();
+        }
         let items = if let Some(plan) = self.ai_plan.as_ref() {
             palette::ai_results(plan, self.saved_items.clone(), context)
         } else if self.semantic_query.adopted() {
@@ -1748,6 +1779,15 @@ impl App {
         } else {
             palette::results(&self.query, self.saved_items.clone(), context)
         };
+        let items = palette::with_suggestions(
+            &self.query,
+            items,
+            if self.settings.path_activity.enabled {
+                self.suggested_items.clone()
+            } else {
+                vec![]
+            },
+        );
         if self.items == items {
             self.selection();
             return;
@@ -1817,6 +1857,15 @@ impl App {
         }
     }
     unsafe fn work_done(&mut self) {
+        let observations = self
+            .path_monitor
+            .as_mut()
+            .map(PathMonitor::receive)
+            .unwrap_or_default();
+        if !observations.is_empty() && self.state.lifecycle == Lifecycle::Running {
+            self.send(Command::ObservePaths(observations));
+        }
+        self.path_monitor_status();
         self.ai_done();
         self.embedding_done();
         if let Some(result) = self
@@ -1869,7 +1918,10 @@ impl App {
                         || matches!(action, Action::Open(_))
                             && item.summary.kind != ItemKind::Clipboard;
                     // Shell has already changed foreground; a successful launch still earns its receipt.
-                    if shell && matches!(result, Ok(true)) {
+                    if shell
+                        && matches!(result, Ok(true))
+                        && !item.summary.id.starts_with("path-suggestion:")
+                    {
                         self.send(Command::Used(item.summary.id.clone()));
                     }
                     if GetForegroundWindow() == self.hwnd && self.state.action_current(id) {
@@ -1877,7 +1929,10 @@ impl App {
                             self.state.finish_action(id);
                             if let Err(error) = result {
                                 self.status(&error);
-                                if missing && matches!(action, Action::Open(_)) {
+                                if missing
+                                    && matches!(action, Action::Open(_))
+                                    && !item.summary.id.starts_with("path-suggestion:")
+                                {
                                     self.perform(item, Action::Relink);
                                 }
                             }
@@ -1931,9 +1986,22 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
-                Event::PathSuggestions { .. } | Event::PathActivityChanged => {}
+                Event::PathSuggestions { request_id, items } => {
+                    if self.state.is_current(request_id)
+                        && let Some(paths) = self.path_batches.paths(request_id, items)
+                    {
+                        self.suggested_items = paths;
+                        self.rebuild_results();
+                    }
+                }
+                Event::PathActivityChanged => {
+                    if self.state.visible && self.state.lifecycle == Lifecycle::Running {
+                        self.search();
+                    }
+                }
                 Event::Ready(settings) => {
                     self.settings = settings;
+                    self.update_path_monitor();
                     self.retheme();
                     if let Err(e) = self.replace_hotkeys(&self.settings.clone()) {
                         self.show(None);
@@ -1992,6 +2060,8 @@ impl App {
                 Event::Results { request_id, items } => {
                     if self.state.is_current(request_id) {
                         self.saved_items = items;
+                        self.suggested_items =
+                            self.path_batches.results(request_id).unwrap_or_default();
                         self.saved_ready = true;
                         self.rebuild_results();
                     }
@@ -2091,10 +2161,12 @@ impl App {
                         self.search();
                     }
                 }
-                Event::Saved(_) => {
-                    self.semantic_status.mark_dirty();
-                    if self.state.visible {
-                        self.refresh_semantic_status();
+                Event::Saved(stats) => {
+                    if stats.semantic_status_changed {
+                        self.semantic_status.mark_dirty();
+                        if self.state.visible {
+                            self.refresh_semantic_status();
+                        }
                     }
                     if self.state.lifecycle == Lifecycle::Running {
                         self.status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
@@ -2184,6 +2256,65 @@ impl App {
         {
             if matches!(action, Action::Open(_)) {
                 self.execute_function(function);
+            }
+            return;
+        }
+        if let Some(entry) = self
+            .state
+            .selected_index()
+            .and_then(|index| self.items.get(index))
+            .filter(|entry| entry.suggested().is_some())
+            .cloned()
+        {
+            let path = entry.suggested().unwrap();
+            if matches!(action, Action::Preview) {
+                self.clear_preview();
+                let text = wide(&format!(
+                    "{}\n\n{}\n\n外部观察 · {} 次有效访问\n最近访问：{}",
+                    path.title,
+                    path.path,
+                    path.visits,
+                    local_saved_time(path.last_seen_ms)
+                ));
+                let _ = SetWindowTextW(self.preview, PCWSTR(text.as_ptr()));
+                return;
+            }
+            if self.action_loads.busy()
+                || self.pending_action.is_some()
+                || self.pending_paste.is_some()
+                || self
+                    .action_worker
+                    .as_ref()
+                    .is_some_and(BackgroundWorker::busy)
+            {
+                return;
+            }
+            self.load_id = self.load_id.wrapping_add(1);
+            if !self.state.begin_action(self.load_id) {
+                return;
+            }
+            match action {
+                Action::Open(_) | Action::Reveal => {
+                    self.start_native(entry.suggestion_action().unwrap(), action, self.load_id)
+                }
+                Action::Favorite => {
+                    if self.state.finish_action(self.load_id) {
+                        self.favorite_form(None, Some(path.path.clone()), path.kind);
+                    }
+                }
+                Action::Suppress => {
+                    if self.state.finish_action(self.load_id) {
+                        self.send(Command::SuppressPath(path.key.clone()));
+                    }
+                }
+                Action::Copy(_) | Action::CopyPath => {
+                    if self.state.finish_action(self.load_id) {
+                        self.perform(entry.suggestion_action().unwrap(), Action::CopyPath);
+                    }
+                }
+                _ => {
+                    self.state.finish_action(self.load_id);
+                }
             }
             return;
         }
@@ -2285,8 +2416,7 @@ impl App {
     }
     unsafe fn perform(&mut self, item: StoredItem, action: Action) {
         match action {
-            Action::Open(_) | Action::Reveal => { /* Load dispatches these to the guarded worker. */
-            }
+            Action::Open(_) | Action::Reveal | Action::Favorite | Action::Suppress => {}
             Action::Copy(_) => self.perform(item, Action::CopyPath),
             Action::Pin => self.send(Command::Pin {
                 id: item.summary.id,
@@ -2447,6 +2577,70 @@ impl App {
             item: None,
         });
     }
+    unsafe fn update_path_monitor(&mut self) {
+        if let Some(monitor) = &mut self.path_monitor {
+            monitor.configure(self.settings.path_activity.clone());
+        }
+        if self.settings.path_activity.enabled && self.state.lifecycle == Lifecycle::Running {
+            if SetTimer(Some(self.hwnd), PATH_TIMER, 2000, None) == 0 {
+                self.status("常用路径观察计时器不可用");
+            }
+            if let Some(monitor) = &mut self.path_monitor {
+                monitor.tick();
+            }
+        } else {
+            let _ = KillTimer(Some(self.hwnd), PATH_TIMER);
+            self.suggested_items.clear();
+        }
+        self.path_monitor_status();
+    }
+    unsafe fn stop_path_monitor(&mut self) {
+        let _ = KillTimer(Some(self.hwnd), PATH_TIMER);
+        if let Some(monitor) = &mut self.path_monitor {
+            monitor.stop();
+        }
+    }
+    unsafe fn path_monitor_status(&mut self) {
+        if let Some(message) = self
+            .path_monitor
+            .as_mut()
+            .and_then(PathMonitor::take_status)
+        {
+            self.status(&message);
+        }
+    }
+    unsafe fn path_settings(&mut self) {
+        self.effects.push_back(UiEffect::PathSettings {
+            owner: self.hwnd,
+            settings: self.settings.path_activity.clone(),
+        });
+    }
+    unsafe fn apply_path_settings(&mut self, values: Vec<String>) -> Result<(), String> {
+        if self.state.lifecycle != Lifecycle::Running {
+            return Ok(());
+        }
+        let exclusions = crate::path_observer::parse_exclusions(&values[2])?;
+        let next = crate::path_activity::PathActivitySettings {
+            enabled: values[0] == "1",
+            recent_documents: values[1] == "1",
+            excluded_paths: exclusions,
+        };
+        let changed = self.settings.path_activity != next;
+        self.settings.path_activity = next;
+        self.update_path_monitor();
+        if changed {
+            self.send(Command::SaveSettings(self.settings.clone()));
+        }
+        if values[3] == "1" {
+            if let Some(monitor) = &mut self.path_monitor {
+                monitor.clear();
+            }
+            self.suggested_items.clear();
+            self.send(Command::ClearPathActivity);
+        }
+        self.search();
+        Ok(())
+    }
     unsafe fn settings(&mut self) {
         self.effects.push_back(UiEffect::Settings {
             owner: self.hwnd,
@@ -2462,6 +2656,7 @@ impl App {
             y: rect.bottom,
             entries: vec![
                 (GENERAL_SETTINGS, "常规设置…"),
+                (PATH_SETTINGS, "常用推荐设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
             ],
@@ -2584,9 +2779,10 @@ impl App {
             vec![
                 (221, "打开面板"),
                 (GENERAL_SETTINGS, "常规设置…"),
+                (PATH_SETTINGS, "常用推荐设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
-                (222, "暂停 / 恢复记录"),
+                (222, "暂停 / 恢复剪贴板记录"),
                 (EXIT, "保存后退出"),
             ]
         } else if add {
@@ -2598,6 +2794,19 @@ impl App {
             .is_some_and(|entry| entry.function().is_some())
         {
             vec![(OPEN, "执行功能")]
+        } else if self
+            .state
+            .selected_index()
+            .and_then(|i| self.items.get(i))
+            .is_some_and(|entry| entry.suggested().is_some())
+        {
+            vec![
+                (OPEN, "打开"),
+                (REVEAL, "打开所在目录"),
+                (COPY_PATH, "复制路径"),
+                (FAVORITE_PATH, "收藏…"),
+                (SUPPRESS_PATH, "不再推荐此路径"),
+            ]
         } else if self
             .state
             .selected_index()
@@ -2655,6 +2864,7 @@ impl App {
         }
         match function {
             Function::Settings => self.settings(),
+            Function::PathActivitySettings => self.path_settings(),
             Function::AiSettings => self.ai_settings(),
             Function::AiSearch => self.begin_smart(Some(SmartSearchMode::Claude)),
             Function::EmbeddingSettings => self.embedding_settings(),
@@ -2705,6 +2915,9 @@ impl App {
             }
             SETTINGS => self.settings_menu(),
             GENERAL_SETTINGS => self.settings(),
+            PATH_SETTINGS => self.path_settings(),
+            FAVORITE_PATH => self.request(Action::Favorite),
+            SUPPRESS_PATH => self.request(Action::Suppress),
             AI_SETTINGS => self.ai_settings(),
             SMART_FIND => self.begin_smart(None),
             INDEX_STATUS if self.semantic_index.active() => self.cancel_index(),
@@ -2754,6 +2967,7 @@ impl App {
                 self.clear_preview();
                 self.state.visible = true;
                 let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+                self.stop_path_monitor();
                 self.status("正在保存后退出…");
                 if self.state.begin_exit() {
                     self.send(Command::Shutdown);
@@ -2863,6 +3077,15 @@ unsafe fn app_message(
         }
         ENGINE_WAKE => {
             app.events();
+            return Some(LRESULT(0));
+        }
+        WM_TIMER if wp.0 == PATH_TIMER => {
+            if app.state.lifecycle == Lifecycle::Running
+                && let Some(monitor) = &mut app.path_monitor
+            {
+                monitor.tick();
+            }
+            app.path_monitor_status();
             return Some(LRESULT(0));
         }
         WORK_WAKE => {
@@ -2988,6 +3211,7 @@ unsafe fn app_message(
         }
         WM_QUERYENDSESSION => return Some(LRESULT(1)),
         WM_DESTROY => {
+            app.stop_path_monitor();
             let _ = RemoveClipboardFormatListener(hwnd);
             app.hotkey_bindings.clear(|id| {
                 let _ = UnregisterHotKey(Some(hwnd), id);
@@ -3358,6 +3582,7 @@ impl Host {
     unsafe fn end_session(&self, hwnd: HWND) {
         {
             let mut app = self.app.borrow_mut();
+            app.stop_path_monitor();
             app.cancel_index();
             app.cancel_semantic();
             app.cancel_ai();
@@ -3492,6 +3717,18 @@ impl Host {
                     app.restore_after_modal(true);
                     semantic_revoked = false;
                 }
+                UiEffect::PathSettings { owner, settings } => {
+                    let appearance = self.app.borrow().settings.theme;
+                    let result = dialogs::path_settings_form(owner, &settings, appearance);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    let error = result.and_then(|values| app.apply_path_settings(values).err());
+                    app.restore_after_modal(true);
+                    semantic_revoked = false;
+                    if let Some(message) = error {
+                        app.status(&message);
+                    }
+                }
                 UiEffect::AiSettings { owner, settings } => {
                     let appearance = self.app.borrow().settings.theme;
                     let result = dialogs::ai_settings_form(owner, &settings, appearance);
@@ -3572,6 +3809,7 @@ impl Host {
                     } else {
                         app.send(Command::CancelShutdown);
                         app.state.cancel_exit();
+                        app.update_path_monitor();
                         app.last_capture_sequence = 0;
                         app.capture();
                         app.show(None);

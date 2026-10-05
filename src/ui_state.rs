@@ -219,3 +219,40 @@ impl UiState {
         self.lifecycle = Lifecycle::Running;
     }
 }
+
+/// Suggestions may precede main results. Publish only after the matching main batch.
+#[derive(Default)]
+pub struct PathResultBatches {
+    request: u64,
+    ready: bool,
+    pending: Option<Vec<crate::path_activity::PathSuggestion>>,
+}
+impl PathResultBatches {
+    pub fn begin(&mut self, request: u64) {
+        self.request = request;
+        self.ready = false;
+        self.pending = None;
+    }
+    pub fn paths(
+        &mut self,
+        request: u64,
+        paths: Vec<crate::path_activity::PathSuggestion>,
+    ) -> Option<Vec<crate::path_activity::PathSuggestion>> {
+        if request != self.request {
+            return None;
+        }
+        if self.ready {
+            Some(paths)
+        } else {
+            self.pending = Some(paths);
+            None
+        }
+    }
+    pub fn results(&mut self, request: u64) -> Option<Vec<crate::path_activity::PathSuggestion>> {
+        if request != self.request {
+            return None;
+        }
+        self.ready = true;
+        Some(self.pending.take().unwrap_or_default())
+    }
+}

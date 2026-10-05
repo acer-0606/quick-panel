@@ -288,3 +288,43 @@ fn removed_target_invalidates_action_before_selection_is_replaced() {
     assert_eq!(state.selected_id(), Some("b"));
     assert!(!state.action_current(77));
 }
+
+#[test]
+fn path_batches_wait_for_main_results_and_reject_late_query_events() {
+    use quick_panel::{
+        model::ItemKind, path_activity::PathSuggestion, ui_state::PathResultBatches,
+    };
+    let path = PathSuggestion {
+        key: "c:\\a".into(),
+        path: "C:\\A".into(),
+        title: "A".into(),
+        kind: ItemKind::Folder,
+        visits: 3,
+        last_seen_ms: 5,
+    };
+    let mut batches = PathResultBatches::default();
+    batches.begin(1);
+    assert!(batches.paths(1, vec![path.clone()]).is_none());
+    assert_eq!(batches.results(1), Some(vec![path.clone()]));
+    assert_eq!(batches.paths(1, vec![]), Some(vec![]));
+    batches.begin(2);
+    assert!(batches.paths(1, vec![path.clone()]).is_none());
+    assert!(batches.results(1).is_none());
+    assert_eq!(batches.results(2), Some(vec![]));
+    assert_eq!(batches.paths(2, vec![path.clone()]), Some(vec![path]));
+}
+#[test]
+fn automatic_identity_refresh_preserves_menu_and_action_then_removal_revokes_both() {
+    let mut state = UiState::default();
+    state.visible = true;
+    state.replace_ids(vec!["path-suggestion:a".into()]);
+    state.begin_action(12);
+    let menu = state.menu_target();
+    state.next_refresh_request();
+    state.replace_ids(vec!["saved:1".into(), "path-suggestion:a".into()]);
+    assert!(state.action_current(12));
+    assert!(state.menu_target_current(&menu));
+    state.replace_ids(vec!["saved:1".into()]);
+    assert!(!state.action_current(12));
+    assert!(!state.menu_target_current(&menu));
+}

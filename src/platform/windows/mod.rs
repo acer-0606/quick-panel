@@ -4,6 +4,7 @@ mod ai_time;
 pub mod clipboard;
 mod dialogs;
 pub mod images;
+mod path_monitor;
 mod theme;
 mod ui;
 pub use ui::run;

@@ -384,3 +384,70 @@ fn row_detail_keeps_body_hit_near_the_start_and_exposes_saved_time_without_loadi
     let functions = palette::results("设置", vec![], Context::default());
     assert_eq!(functions[0].detail("设置").saved_at_ms, None);
 }
+
+fn suggested(number: usize) -> quick_panel::path_activity::PathSuggestion {
+    quick_panel::path_activity::PathSuggestion {
+        key: format!("c:\\path{number}"),
+        path: format!("C:\\Path{number}"),
+        title: format!("Path{number}"),
+        kind: ItemKind::Folder,
+        visits: 7,
+        last_seen_ms: 999,
+    }
+}
+#[test]
+fn automatic_rows_have_independent_identity_actions_and_visit_time() {
+    let entry = Entry::Suggested(suggested(1).into());
+    assert!(entry.id().starts_with("path-suggestion:"));
+    assert_eq!(entry.id(), Entry::Suggested(suggested(1).into()).id());
+    assert!(entry.saved().is_none());
+    assert!(!entry.pinned());
+    assert_eq!(entry.suggested().unwrap().path, "C:\\Path1");
+    assert_eq!(entry.detail("").saved_at_ms, None);
+    assert_eq!(entry.detail("").visited_at_ms, Some(999));
+    assert!(entry.subtitle().contains("外部观察"));
+    let action = entry.suggestion_action().unwrap();
+    assert_eq!(action.target.as_deref(), Some("C:\\Path1"));
+    assert!(action.representations.is_empty());
+}
+#[test]
+fn suggestions_merge_after_manual_matches_deduplicate_and_obey_bounds() {
+    let mut favorite = saved("manual", "Name", ItemKind::Folder);
+    favorite.subtitle = "c:/PATH1".into();
+    favorite.pinned = true;
+    let rows = palette::with_suggestions(
+        "",
+        vec![Entry::Saved(favorite)],
+        (0..20).map(suggested).collect(),
+    );
+    assert_eq!(rows[0].id(), "manual");
+    assert_eq!(
+        rows.iter().filter(|row| row.suggested().is_some()).count(),
+        5
+    );
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.suggested().is_some_and(|path| path.key == "c:\\path1"))
+    );
+    let rows = palette::with_suggestions("Path", vec![], (0..20).map(suggested).collect());
+    assert_eq!(rows.len(), 10);
+    let rows = palette::with_suggestions(
+        "Path",
+        (0..49)
+            .map(|i| Entry::Saved(saved(&format!("s{i}"), "Path", ItemKind::Folder)))
+            .collect(),
+        (0..20).map(suggested).collect(),
+    );
+    assert_eq!(rows.len(), 50);
+    assert_eq!(rows[49].suggested().unwrap().key, "c:\\path0");
+}
+
+#[test]
+fn external_path_settings_are_reachable_before_any_saved_favorite() {
+    let rows = palette::results("常用推荐设置", vec![], Context::default());
+    assert!(
+        rows.iter()
+            .any(|row| row.id() == "function:path-activity-settings")
+    );
+}

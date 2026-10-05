@@ -10,7 +10,7 @@ use windows::{
             GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
         },
         System::{Com::*, LibraryLoader::GetModuleHandleW},
-        UI::{Shell::*, WindowsAndMessaging::*},
+        UI::{Controls::EM_SETLIMITTEXT, Shell::*, WindowsAndMessaging::*},
     },
     core::{PCWSTR, w},
 };
@@ -46,8 +46,41 @@ pub unsafe fn pick(owner: HWND, folder: bool) -> Result<Option<String>, String> 
         result.map(Some)
     }
 }
+pub unsafe fn path_settings_form(
+    owner: HWND,
+    settings: &crate::path_activity::PathActivitySettings,
+    appearance: Theme,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            "常用推荐设置",
+            &[
+                (
+                    "外部资源管理器的常用路径（本机排名）",
+                    Field::Switch(settings.enabled, "启用常用推荐（默认关闭）"),
+                ),
+                (
+                    "Recent 仅补充变更目标，不回放已有链接",
+                    Field::Switch(settings.recent_documents, "同时观察最近文档"),
+                ),
+                (
+                    "排除目录（每行一条绝对路径，最多 128 条）",
+                    Field::Multiline(settings.excluded_paths.join("\r\n")),
+                ),
+                (
+                    "统计清空后，后续的新访问可重新记录",
+                    Field::Switch(false, "保存时清空常用路径统计"),
+                ),
+            ],
+            None,
+            appearance,
+        )
+    }
+}
 enum Field {
     Text(String),
+    Multiline(String),
     Password(String),
     Choice(usize),
     AuthChoice(usize),
@@ -422,7 +455,7 @@ pub unsafe fn settings_form(
                     "剪贴板专用快捷键（留空关闭）",
                     Field::Text(clipboard_hotkey),
                 ),
-                ("记录状态", Field::Toggle(paused)),
+                ("剪贴板记录状态", Field::Toggle(paused)),
                 ("排除应用（exe 名称，逗号分隔）", Field::Text(excluded)),
                 (
                     "智能查找首选能力",
@@ -593,7 +626,13 @@ unsafe fn form_fields_with_test_theme(
             &mut monitor,
         );
         let work = monitor.rcWork;
-        let logical_height = 104 + fields.len() as i32 * 62 + if testing { 96 } else { 0 };
+        let multiline_extra = fields
+            .iter()
+            .filter(|(_, field)| matches!(field, Field::Multiline(_)))
+            .count() as i32
+            * 92;
+        let logical_height =
+            104 + fields.len() as i32 * 62 + multiline_extra + if testing { 96 } else { 0 };
         let fit = ((work.bottom - work.top - 24).max(1) * 96 / logical_height).max(96) as u32;
         let dpi = owner_dpi.min(fit);
         let scale = |v: i32| v * (dpi as i32) / 96;
@@ -622,10 +661,11 @@ unsafe fn form_fields_with_test_theme(
         }
         let dark = state.borrow().colors.dark;
         theme::apply(hwnd, dark);
+        let mut field_y = 12;
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
             let value = wide(match value {
-                Field::Text(t) | Field::Password(t) => t,
+                Field::Text(t) | Field::Password(t) | Field::Multiline(t) => t,
                 Field::Choice(_)
                 | Field::AuthChoice(_)
                 | Field::IndexChoice(_)
@@ -633,7 +673,13 @@ unsafe fn form_fields_with_test_theme(
                 Field::Toggle(_) => "暂停剪贴板记录",
                 Field::Switch(_, label) => label,
             });
-            let y = scale(12 + i as i32 * 62);
+            let y = scale(field_y);
+            field_y += 62
+                + if matches!(fields[i].1, Field::Multiline(_)) {
+                    92
+                } else {
+                    0
+                };
             let l = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
@@ -652,7 +698,7 @@ unsafe fn form_fields_with_test_theme(
             let e = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 match fields[i].1 {
-                    Field::Text(_) | Field::Password(_) => w!("EDIT"),
+                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) => w!("EDIT"),
                     Field::Choice(_)
                     | Field::AuthChoice(_)
                     | Field::IndexChoice(_)
@@ -667,6 +713,9 @@ unsafe fn form_fields_with_test_theme(
                     | WS_TABSTOP
                     | WINDOW_STYLE(match fields[i].1 {
                         Field::Text(_) => ES_AUTOHSCROLL as u32,
+                        Field::Multiline(_) => {
+                            (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32 | WS_VSCROLL.0
+                        }
                         Field::Password(_) => (ES_AUTOHSCROLL | ES_PASSWORD) as u32,
                         Field::Choice(_)
                         | Field::AuthChoice(_)
@@ -686,6 +735,8 @@ unsafe fn form_fields_with_test_theme(
                             | Field::SmartChoice(_)
                     ) {
                         150
+                    } else if matches!(fields[i].1, Field::Multiline(_)) {
+                        120
                     } else {
                         28
                     },
@@ -730,6 +781,9 @@ unsafe fn form_fields_with_test_theme(
                 Field::Toggle(checked) | Field::Switch(checked, _) => {
                     SendMessageW(e, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None);
                 }
+                Field::Multiline(_) => {
+                    SendMessageW(e, EM_SETLIMITTEXT, Some(WPARAM(128 * 2050)), None);
+                }
                 Field::Text(_) | Field::Password(_) => {}
             }
             {
@@ -739,7 +793,7 @@ unsafe fn form_fields_with_test_theme(
             }
         }
         if testing {
-            let y = scale(12 + fields.len() as i32 * 62);
+            let y = scale(field_y);
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
@@ -861,7 +915,7 @@ unsafe fn form_fields_with_test_theme(
                 .iter()
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
-                    Field::Text(_) | Field::Password(_) => text(*e),
+                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) => text(*e),
                     Field::Choice(_)
                     | Field::AuthChoice(_)
                     | Field::IndexChoice(_)

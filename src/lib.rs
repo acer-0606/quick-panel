@@ -13,6 +13,7 @@ pub mod model;
 pub mod palette;
 pub mod path_activity;
 mod path_activity_store;
+pub mod path_observer;
 #[cfg(windows)]
 pub mod platform;
 pub mod preview;
