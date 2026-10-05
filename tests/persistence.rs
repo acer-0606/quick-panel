@@ -1480,3 +1480,231 @@ fn final_rereview_v3_upgrade_adds_prefix_postings_without_touching_blobs() {
             .ends_with(" migrationkept")
     );
 }
+
+#[test]
+fn blocked_writer_coalesces_queries_across_modes_without_losing_save() {
+    use std::sync::{
+        Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("coalesce.sqlite");
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let entered = Arc::new(AtomicBool::new(false));
+    let armed = Arc::new(AtomicBool::new(false));
+    let engine = Engine::start(EngineOptions::new(path.clone()), {
+        let gate = gate.clone();
+        let entered = entered.clone();
+        let armed = armed.clone();
+        Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                entered.store(true, Ordering::SeqCst);
+                let (lock, ready) = &*gate;
+                let mut open = lock.lock().unwrap();
+                while !*open {
+                    open = ready.wait(open).unwrap();
+                }
+            }
+        })
+    })
+    .unwrap();
+    wait(&engine, |e| matches!(e, Event::Ready(_)));
+    armed.store(true, Ordering::SeqCst);
+    engine.send(Command::Capture(snapshot("最新内容"))).unwrap();
+    while !entered.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    for request_id in 1..=30 {
+        if request_id == 15 {
+            engine
+                .send(Command::SaveSettings(Settings::default()))
+                .unwrap();
+        }
+        if request_id % 3 == 0 {
+            engine
+                .send(Command::Search(SearchQuery {
+                    text: "最新".into(),
+                    request_id,
+                    ..Default::default()
+                }))
+                .unwrap();
+        } else if request_id % 3 == 2 {
+            engine
+                .send(Command::SemanticSearch(
+                    quick_panel::semantic::SemanticSearchQuery {
+                        text: "最新".into(),
+                        scope: Scope::All,
+                        request_id,
+                        profile: "superseded".into(),
+                        vector: vec![1., 0.],
+                    },
+                ))
+                .unwrap();
+        } else {
+            engine
+                .send(Command::AiSearch(AiSearchQuery {
+                    queries: vec!["最新".into()],
+                    request_id,
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+    }
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_one();
+    let mut results = Vec::new();
+    let mut saved = false;
+    wait(&engine, |event| matches!(event, Event::Changed));
+    let until = Instant::now() + Duration::from_secs(5);
+    while !results.contains(&30) {
+        match engine.try_recv() {
+            Ok(Event::Results { request_id, .. }) => results.push(request_id),
+            Ok(Event::Saved(_)) => saved = true,
+            Ok(Event::Error { message, .. }) => panic!("{message}"),
+            _ => {
+                assert!(Instant::now() < until);
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    assert_eq!(results, vec![30]);
+    assert!(saved);
+    assert_eq!(count(&path), 1);
+    // A second blocked batch proves a pending query cannot cross Shutdown.
+    *gate.0.lock().unwrap() = false;
+    entered.store(false, Ordering::SeqCst);
+    armed.store(true, Ordering::SeqCst);
+    engine
+        .send(Command::Capture(snapshot("退出前内容")))
+        .unwrap();
+    while !entered.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    engine
+        .send(Command::Search(SearchQuery {
+            request_id: 77,
+            ..Default::default()
+        }))
+        .unwrap();
+    engine.send(Command::Shutdown).unwrap();
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_one();
+    wait(&engine, |event| {
+        assert!(!matches!(event, Event::Results { .. }));
+        assert!(!matches!(event, Event::Error { .. }));
+        matches!(event, Event::ExitReady)
+    });
+    assert_eq!(count(&path), 2);
+}
+
+#[test]
+fn cjk_body_snippet_is_bounded_and_never_persisted() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let text = format!("标题\n{}目标片段\n后面的内容", "前文".repeat(100));
+    engine.send(Command::Capture(snapshot(&text))).unwrap();
+    let pending = search(&engine, "目标片段");
+    assert!(pending[0].subtitle.contains("目标片段"));
+    assert!(pending[0].subtitle.contains("editor.exe"));
+    assert!(!pending[0].subtitle.contains('\n'));
+    assert!(pending[0].subtitle.chars().count() <= 220);
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(search(&engine, "目标片段")[0].subtitle, pending[0].subtitle);
+    let db = Connection::open(path).unwrap();
+    let raw: (String, String) = db
+        .query_row("SELECT summary,text FROM items", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<ItemSummary>(&raw.0)
+            .unwrap()
+            .subtitle,
+        "editor.exe"
+    );
+    assert_eq!(raw.1, text);
+    shutdown(&engine);
+}
+
+#[test]
+fn pinned_clipboard_metadata_keeps_identity_formats_on_restart_and_recapture() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    let original = snapshot("原始正文\n完整格式");
+    engine.send(Command::Capture(original.clone())).unwrap();
+    let id = search(&engine, "原始")[0].id.clone();
+    engine
+        .send(Command::Pin {
+            id: id.clone(),
+            pinned: true,
+        })
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TRIGGER no_blob_update BEFORE DELETE ON representations BEGIN SELECT RAISE(ABORT,'metadata rewrote blob'); END;").unwrap();
+    engine
+        .send(Command::EditClipboardMetadata(ClipboardMetadataInput {
+            id: id.clone(),
+            title: "我的模板".into(),
+            alias: "custom".into(),
+            tags: vec!["重要".into()],
+        }))
+        .unwrap();
+    wait(&engine, |e| {
+        matches!(e, Event::Saved(_) | Event::Error { .. })
+    });
+    assert_eq!(search(&engine, "custom")[0].title, "我的模板");
+    assert_eq!(search(&engine, "重要")[0].id, id);
+    shutdown(&engine);
+    drop(engine);
+    let engine = Engine::start(EngineOptions::new(path), Arc::new(|| {})).unwrap();
+    wait(&engine, |e| matches!(e, Event::Ready(_)));
+    engine.send(Command::Capture(original.clone())).unwrap();
+    assert_eq!(search(&engine, "custom")[0].title, "我的模板");
+    engine
+        .send(Command::Load {
+            id: id.clone(),
+            request_id: 99,
+        })
+        .unwrap();
+    match wait(&engine, |e| {
+        matches!(e, Event::Loaded { request_id: 99, .. })
+    }) {
+        Event::Loaded {
+            item: Some(item), ..
+        } => {
+            assert_eq!(item.summary.id, id);
+            assert_eq!(item.text, original.text);
+            assert_eq!(item.representations, original.representations);
+        }
+        _ => panic!("missing original"),
+    }
+    shutdown(&engine);
+}
+
+#[test]
+fn small_settings_commit_skips_retention_until_policy_changes() {
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine.send(Command::Capture(snapshot("维护探针"))).unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let db = Connection::open(&path).unwrap();
+    db.execute("UPDATE items SET last_used_ms=1", []).unwrap();
+    let mut settings = Settings {
+        theme: Theme::Dark,
+        ..Default::default()
+    };
+    engine
+        .send(Command::SaveSettings(settings.clone()))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(
+        count(&path),
+        1,
+        "theme-only save must not run full retention"
+    );
+    settings.max_history = 0;
+    engine.send(Command::SaveSettings(settings)).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(count(&path), 0);
+    shutdown(&engine);
+}

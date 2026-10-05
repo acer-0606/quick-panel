@@ -163,7 +163,7 @@ pub(crate) fn indexed(
         return Ok(false);
     }
     db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM semantic_map WHERE item_id=?1 AND text_hash=?2)",
+        "SELECT EXISTS(SELECT 1 FROM semantic_map m JOIN semantic_vectors v ON v.rowid=m.rowid WHERE m.item_id=?1 AND m.text_hash=?2)",
         params![id, hash],
         |r| r.get(0),
     )
@@ -208,6 +208,8 @@ pub(crate) fn commit(
     db: &Connection,
     changes: &HashMap<String, PendingItem>,
     vectors: &PendingVectors,
+    deleted: &HashSet<String>,
+    repair: bool,
 ) -> Result<(), String> {
     let mut current = active(db)?;
     // A completed first batch determines profile/dimension. Replacement is atomic
@@ -223,16 +225,29 @@ pub(crate) fn commit(
     if current.is_none() {
         return Ok(());
     }
-    // Orphan cleanup covers explicit deletion and both retention policies.
-    db.execute("DELETE FROM semantic_vectors WHERE rowid IN (SELECT m.rowid FROM semantic_map m LEFT JOIN items i ON i.id=m.item_id WHERE i.id IS NULL)",[]).map_err(|e|e.to_string())?;
-    db.execute(
-        "DELETE FROM semantic_map WHERE item_id NOT IN (SELECT id FROM items)",
-        [],
-    )
-    .map_err(|e| e.to_string())?;
+    if repair {
+        // Orphan cleanup covers explicit deletion and both retention policies.
+        db.execute("DELETE FROM semantic_vectors WHERE rowid IN (SELECT m.rowid FROM semantic_map m LEFT JOIN items i ON i.id=m.item_id WHERE i.id IS NULL)",[]).map_err(|e|e.to_string())?;
+        db.execute(
+            "DELETE FROM semantic_map WHERE item_id NOT IN (SELECT id FROM items)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for id in deleted {
+        remove(db, id)?;
+    }
     for (id, change) in changes {
-        if change.mutation == crate::repository::Mutation::Content {
-            let hash = semantic::candidate(&change.item, IndexScope::AllText).map(|c| c.text_hash);
+        if change.mutation != crate::repository::Mutation::Metadata {
+            let mut source = change.item.clone();
+            if change.mutation == crate::repository::Mutation::SearchMetadata {
+                source.text = db
+                    .query_row("SELECT text FROM items WHERE id=?1", [id], |r| r.get(0))
+                    .optional()
+                    .map_err(|e| e.to_string())?
+                    .unwrap_or_default();
+            }
+            let hash = semantic::candidate(&source, IndexScope::AllText).map(|c| c.text_hash);
             let stored: Option<String> = db
                 .query_row(
                     "SELECT text_hash FROM semantic_map WHERE item_id=?1",
@@ -307,15 +322,27 @@ pub(crate) fn nearest(
         Scope::Document => 2,
     };
     let excluded = serde_json::to_string(excluded).map_err(|e| e.to_string())?;
-    let pins = serde_json::to_string(pins).map_err(|e| e.to_string())?;
-    let mut stmt=db.prepare("SELECT m.item_id,v.distance FROM semantic_vectors v JOIN semantic_map m ON m.rowid=v.rowid WHERE v.embedding MATCH ?1 AND k=50 AND v.rowid IN (SELECT m.rowid FROM semantic_map m JOIN items i ON i.id=m.item_id WHERE (?2=-1 OR i.kind=?2) AND (?3=1 OR i.kind<>0 OR coalesce((SELECT value FROM json_each(?5) WHERE key=i.id),i.pinned)=1) AND i.id NOT IN (SELECT value FROM json_each(?4))) ORDER BY v.distance,m.item_id").map_err(|e|e.to_string())?;
+    let pinned: Vec<_> = pins
+        .iter()
+        .filter(|(_, value)| **value)
+        .map(|(id, _)| id)
+        .collect();
+    let unpinned: Vec<_> = pins
+        .iter()
+        .filter(|(_, value)| !**value)
+        .map(|(id, _)| id)
+        .collect();
+    let pinned = serde_json::to_string(&pinned).map_err(|e| e.to_string())?;
+    let unpinned = serde_json::to_string(&unpinned).map_err(|e| e.to_string())?;
+    let mut stmt=db.prepare("SELECT m.item_id,v.distance FROM semantic_vectors v JOIN semantic_map m ON m.rowid=v.rowid WHERE v.embedding MATCH ?1 AND k=50 AND v.rowid IN (SELECT m.rowid FROM semantic_map m JOIN items i ON i.id=m.item_id WHERE (?2=-1 OR i.kind=?2) AND (?3=1 OR i.kind<>0 OR (i.id IN (SELECT value FROM json_each(?5)) OR (i.pinned=1 AND i.id NOT IN (SELECT value FROM json_each(?6))))) AND i.id NOT IN (SELECT value FROM json_each(?4))) ORDER BY v.distance,m.item_id").map_err(|e|e.to_string())?;
     stmt.query_map(
         params![
             blob(&normalize(vector)),
             kind,
             index_scope == IndexScope::AllText,
             excluded,
-            pins
+            pinned,
+            unpinned
         ],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )

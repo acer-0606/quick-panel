@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 /// Persisted FTS contents must be rebuilt when the token representation changes.
 pub const INDEX_VERSION: u32 = 4;
 
-fn normalize(text: &str) -> String {
+pub(crate) fn normalize(text: &str) -> String {
     text.chars()
         .flat_map(char::to_lowercase)
         .map(|ch| if ch == '\\' { '/' } else { ch })
@@ -148,11 +148,13 @@ pub fn query_expression(query: &str) -> Option<String> {
 }
 
 pub fn matches(item: &StoredItem, query: &str) -> bool {
-    let query = normalize(query.trim());
+    matches_normalized(item, &normalize(query.trim()))
+}
+pub(crate) fn matches_normalized(item: &StoredItem, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
-    if normalize(&item.text).contains(&query) {
+    if normalize(&item.text).contains(query) {
         return true;
     }
     summary_fields(&item.summary)
@@ -160,16 +162,18 @@ pub fn matches(item: &StoredItem, query: &str) -> bool {
         .chain(item.target.as_deref())
         .any(|field| {
             let field_normalized = normalize(field);
-            if field_normalized.contains(&query) {
+            if field_normalized.contains(query) {
                 return true;
             }
             let (full, initials) = phonetic(field);
-            full.contains(&query) || initials.contains(&query)
+            full.contains(query) || initials.contains(query)
         })
 }
 
 pub fn rank(summary: &ItemSummary, query: &str) -> i64 {
-    let query = normalize(query.trim());
+    rank_normalized(summary, &normalize(query.trim()))
+}
+pub(crate) fn rank_normalized(summary: &ItemSummary, query: &str) -> i64 {
     let alias = normalize(&summary.alias);
     let title = normalize(&summary.title);
     let relevance = if query.is_empty() {
@@ -178,17 +182,17 @@ pub fn rank(summary: &ItemSummary, query: &str) -> i64 {
         1_000_000
     } else if title == query {
         900_000
-    } else if !alias.is_empty() && alias.starts_with(&query) {
+    } else if !alias.is_empty() && alias.starts_with(query) {
         800_000
-    } else if title.starts_with(&query) {
+    } else if title.starts_with(query) {
         700_000
-    } else if title.contains(&query) {
+    } else if title.contains(query) {
         600_000
     } else {
         let (full, initials) = phonetic(&summary.title);
-        if full.starts_with(&query) || initials.starts_with(&query) {
+        if full.starts_with(query) || initials.starts_with(query) {
             500_000
-        } else if full.contains(&query) || initials.contains(&query) {
+        } else if full.contains(query) || initials.contains(query) {
             400_000
         } else {
             100_000
@@ -250,4 +254,55 @@ pub fn index_phonetic_prefix(summary: &ItemSummary) -> String {
 
 pub fn phonetic_prefix_expression(query: &str) -> String {
     format!("\"{}\"", prefix_token(&normalize(query.trim()), 3))
+}
+
+/// Presentation-only excerpt. Original summaries and bodies remain untouched.
+pub(crate) fn body_subtitle(item: &StoredItem, needle: &str) -> String {
+    if needle.is_empty() {
+        return item.summary.subtitle.clone();
+    }
+    let normalized = normalize(&item.text);
+    let Some(position) = normalized.find(needle) else {
+        return item.summary.subtitle.clone();
+    };
+    let preceding = normalized[..position].chars().count();
+    // Lowercasing can expand a scalar (İ); map back to original scalar positions.
+    let mut normalized_chars = 0;
+    let start_match = item
+        .text
+        .chars()
+        .position(|c| {
+            let at = normalized_chars;
+            normalized_chars += c.to_lowercase().count();
+            at >= preceding
+        })
+        .unwrap_or(0);
+    let start = start_match.saturating_sub(32);
+    let excerpt: String = item
+        .text
+        .chars()
+        .skip(start)
+        .take(120)
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let source: String = item
+        .summary
+        .subtitle
+        .chars()
+        .take(80)
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!("{source} · {}{excerpt}", if start > 0 { "…" } else { "" })
 }

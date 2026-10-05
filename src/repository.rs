@@ -33,6 +33,7 @@ unsafe extern "C" fn observe_wal(
 pub(crate) enum Mutation {
     Content,
     Metadata,
+    SearchMetadata,
 }
 pub(crate) struct PendingItem {
     pub item: StoredItem,
@@ -44,6 +45,10 @@ pub(crate) struct Repository {
     page_size: u64,
     // Field drop order keeps this Box alive until after Connection closes.
     wal_progress: Box<WalProgress>,
+    retention_policy: Option<(u32, usize)>,
+    maintenance_due_ms: i64,
+    repair_vectors: bool,
+    observed_rowid: i64,
 }
 
 fn period_predicate(
@@ -152,11 +157,18 @@ impl Repository {
                 (&*wal_progress as *const WalProgress).cast_mut().cast(),
             );
         }
+        let observed_rowid = connection
+            .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
         let repo = Self {
             connection,
             wal_path: wal_path.into(),
             page_size,
             wal_progress,
+            retention_policy: None,
+            maintenance_due_ms: 0,
+            repair_vectors: true,
+            observed_rowid,
         };
         if repo.wal_bytes() >= 64 * 1024 * 1024 {
             repo.checkpoint();
@@ -327,9 +339,6 @@ impl Repository {
             open_with,
         })
     }
-    pub fn summaries(&self, query: &SearchQuery) -> Result<Vec<ItemSummary>, String> {
-        self.summaries_in_period(query, None, None)
-    }
     /// Time predicates precede every candidate quota. `until_ms` is exclusive.
     /// Omitting both bounds leaves the ordinary-search SQL unchanged.
     pub fn summaries_in_period(
@@ -337,7 +346,9 @@ impl Repository {
         query: &SearchQuery,
         from_ms: Option<i64>,
         until_ms: Option<i64>,
+        mut checkpoint: impl FnMut() -> Result<(), String>,
     ) -> Result<Vec<ItemSummary>, String> {
+        let needle = search::normalize(query.text.trim());
         let expression = search::query_expression(&query.text);
         let nonempty = !query.text.trim().is_empty();
         let scope = match query.scope {
@@ -369,6 +380,7 @@ impl Repository {
                 let mut cursor = i64::MAX;
                 let mut accepted = 0;
                 loop {
+                    checkpoint()?;
                     let (period, bounds) = period_predicate(from_ms, until_ms, 3);
                     let sql = format!(
                         "SELECT item_search.rowid FROM item_search CROSS JOIN items ON items.rowid=item_search.rowid WHERE item_search MATCH ?1 AND item_search.rowid<?2 AND {scope}{period} ORDER BY item_search.rowid DESC LIMIT 128"
@@ -386,13 +398,14 @@ impl Repository {
                     cursor = *page.iter().min().unwrap();
                     let exhausted = page.len() < 128;
                     for rowid in page {
+                        checkpoint()?;
                         let mut item = self.candidate_metadata(rowid)?;
                         if minimum_rank > 0
-                            && search::rank(&item.summary, &query.text) < minimum_rank
+                            && search::rank_normalized(&item.summary, &needle) < minimum_rank
                         {
                             continue;
                         }
-                        if !search::matches(&item, &query.text) {
+                        if !search::matches_normalized(&item, &needle) {
                             if minimum_rank > 0 {
                                 continue;
                             }
@@ -403,7 +416,7 @@ impl Repository {
                                 .query_row([rowid], |r| r.get(0))
                                 .map_err(|e| e.to_string())?;
                         }
-                        if search::matches(&item, &query.text) {
+                        if search::matches_normalized(&item, &needle) {
                             accepted += 1;
                             fts_ids.insert(rowid);
                             confirmed.insert(rowid, item.summary);
@@ -453,6 +466,7 @@ impl Repository {
         let mut summaries: Vec<_> = confirmed.values().cloned().collect();
         let mut body_candidates = Vec::new();
         for rowid in ids {
+            checkpoint()?;
             if confirmed.contains_key(&rowid) {
                 continue;
             }
@@ -482,7 +496,7 @@ impl Repository {
             ) {
                 continue;
             }
-            if !nonempty || search::matches(&item, &query.text) {
+            if !nonempty || search::matches_normalized(&item, &needle) {
                 summaries.push(item.summary);
                 continue;
             }
@@ -501,6 +515,7 @@ impl Repository {
             HashSet::new()
         };
         for (rowid, mut item) in body_candidates {
+            checkpoint()?;
             if expression.is_some() && !fts_ids.contains(&rowid) && !auxiliary.contains(&rowid) {
                 continue;
             }
@@ -515,7 +530,7 @@ impl Repository {
                 // Metadata was already loaded above. Avoid another statement prepare,
                 // a string-ID lookup and duplicate summary JSON parsing for FTS collisions.
                 item.text = text;
-                if search::matches(&item, &query.text) {
+                if search::matches_normalized(&item, &needle) {
                     summaries.push(item.summary);
                 }
             }
@@ -571,39 +586,64 @@ impl Repository {
         now_ms: i64,
         vectors: &crate::semantic_store::PendingVectors,
     ) -> Result<(), String> {
+        let policy = (retention.retention_days, retention.max_history);
+        let policy_changed = self.retention_policy != Some(policy);
         let tx = self.connection.transaction().map_err(|e| e.to_string())?;
-        for id in deleted {
-            tx.execute(
-                "DELETE FROM item_search WHERE rowid=(SELECT rowid FROM items WHERE id=?1)",
-                [id],
-            )
+        let disk_rowid: i64 = tx
+            .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
-            tx.execute("DELETE FROM items WHERE id=?1", [id])
-                .map_err(|e| e.to_string())?;
+        let mut added_history = disk_rowid > self.observed_rowid;
+        for (id, p) in pending {
+            if p.mutation == Mutation::Content
+                && p.item.summary.kind == ItemKind::Clipboard
+                && !tx
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM items WHERE id=?1)",
+                        [id],
+                        |r| r.get::<_, bool>(0),
+                    )
+                    .map_err(|e| e.to_string())?
+            {
+                added_history = true;
+            }
         }
+        let maintain = policy_changed || added_history || now_ms >= self.maintenance_due_ms;
+        let mut removed = deleted.clone();
         for (id, change) in pending {
-            let item = &change.item;
+            let mut indexed_item;
+            let item = if change.mutation == Mutation::SearchMetadata {
+                indexed_item = change.item.clone();
+                indexed_item.text = tx
+                    .query_row("SELECT text FROM items WHERE id=?1", [id], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
+                &indexed_item
+            } else {
+                &change.item
+            };
             let s = &item.summary;
             let summary = serde_json::to_string(s).map_err(|e| e.to_string())?;
-            if change.mutation == Mutation::Metadata {
-                tx.execute("UPDATE items SET pinned=?2,last_used_ms=?3,use_count=?4,summary=?5 WHERE id=?1",params![id,s.pinned,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary]).map_err(|e|e.to_string())?;
-                continue;
-            }
-            let kind = match s.kind {
-                ItemKind::Clipboard => 0,
-                ItemKind::Folder => 1,
-                ItemKind::Document => 2,
-            };
-            tx.execute("INSERT INTO items(id,kind,title,pinned,created_at_ms,last_used_ms,use_count,summary,text,target,open_with) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,pinned=excluded.pinned,created_at_ms=excluded.created_at_ms,last_used_ms=excluded.last_used_ms,use_count=excluded.use_count,summary=excluded.summary,text=excluded.text,target=excluded.target,open_with=excluded.open_with", params![id,kind,s.title,s.pinned,s.created_at_ms,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary,item.text,item.target,item.open_with]).map_err(|e| e.to_string())?;
-            if change.mutation == Mutation::Content {
-                tx.execute("DELETE FROM representations WHERE item_id=?1", [id])
-                    .map_err(|e| e.to_string())?;
-                for repr in &item.representations {
-                    tx.execute(
-                        "INSERT INTO representations(item_id,format,data) VALUES(?1,?2,?3)",
-                        params![id, repr.format, repr.data],
-                    )
-                    .map_err(|e| e.to_string())?;
+            if change.mutation != Mutation::Content {
+                tx.execute("UPDATE items SET pinned=?2,last_used_ms=?3,use_count=?4,summary=?5,title=?6 WHERE id=?1",params![id,s.pinned,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary,s.title]).map_err(|e|e.to_string())?;
+                if change.mutation == Mutation::Metadata {
+                    continue;
+                }
+            } else {
+                let kind = match s.kind {
+                    ItemKind::Clipboard => 0,
+                    ItemKind::Folder => 1,
+                    ItemKind::Document => 2,
+                };
+                tx.execute("INSERT INTO items(id,kind,title,pinned,created_at_ms,last_used_ms,use_count,summary,text,target,open_with) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,pinned=excluded.pinned,created_at_ms=excluded.created_at_ms,last_used_ms=excluded.last_used_ms,use_count=excluded.use_count,summary=excluded.summary,text=excluded.text,target=excluded.target,open_with=excluded.open_with", params![id,kind,s.title,s.pinned,s.created_at_ms,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary,item.text,item.target,item.open_with]).map_err(|e| e.to_string())?;
+                if change.mutation == Mutation::Content {
+                    tx.execute("DELETE FROM representations WHERE item_id=?1", [id])
+                        .map_err(|e| e.to_string())?;
+                    for repr in &item.representations {
+                        tx.execute(
+                            "INSERT INTO representations(item_id,format,data) VALUES(?1,?2,?3)",
+                            params![id, repr.format, repr.data],
+                        )
+                        .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             tx.execute(
@@ -620,19 +660,38 @@ impl Repository {
         if let Some(settings) = settings {
             tx.execute("INSERT INTO settings(key,value) VALUES('settings',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(settings).map_err(|e| e.to_string())?]).map_err(|e| e.to_string())?;
         }
-        // Retention runs in a real dirty batch, never from an idle timer. Pinned history and favorites survive.
-        let cutoff = now_ms.saturating_sub(i64::from(retention.retention_days) * 86_400_000);
-        tx.execute("DELETE FROM item_search WHERE rowid IN (SELECT rowid FROM items WHERE kind=0 AND pinned=0 AND last_used_ms<?1)", [cutoff]).map_err(|e| e.to_string())?;
-        tx.execute(
-            "DELETE FROM items WHERE kind=0 AND pinned=0 AND last_used_ms<?1",
-            [cutoff],
-        )
-        .map_err(|e| e.to_string())?;
-        let max_history = i64::try_from(retention.max_history).unwrap_or(i64::MAX);
-        tx.execute("DELETE FROM item_search WHERE rowid IN (SELECT rowid FROM items WHERE kind=0 AND pinned=0 ORDER BY last_used_ms DESC,id LIMIT -1 OFFSET ?1)", [max_history]).map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM items WHERE kind=0 AND pinned=0 AND rowid IN (SELECT rowid FROM items WHERE kind=0 AND pinned=0 ORDER BY last_used_ms DESC,id LIMIT -1 OFFSET ?1)", [max_history]).map_err(|e| e.to_string())?;
-        crate::semantic_store::commit(&tx, pending, vectors)?;
-        tx.commit().map_err(|e| e.to_string())
+        if maintain {
+            let cutoff = now_ms.saturating_sub(i64::from(retention.retention_days) * 86_400_000);
+            let max_history = i64::try_from(retention.max_history).unwrap_or(i64::MAX);
+            let mut stmt = tx.prepare("SELECT id FROM items WHERE kind=0 AND pinned=0 AND last_used_ms<?1 UNION SELECT id FROM (SELECT id FROM items WHERE kind=0 AND pinned=0 ORDER BY last_used_ms DESC,id LIMIT -1 OFFSET ?2)").map_err(|e|e.to_string())?;
+            let ids = stmt
+                .query_map(params![cutoff, max_history], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for id in ids {
+                removed.insert(id.map_err(|e| e.to_string())?);
+            }
+        }
+        for id in &removed {
+            tx.execute(
+                "DELETE FROM item_search WHERE rowid=(SELECT rowid FROM items WHERE id=?1)",
+                [id],
+            )
+            .map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM items WHERE id=?1", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        crate::semantic_store::commit(&tx, pending, vectors, &removed, self.repair_vectors)?;
+        let observed_rowid = tx
+            .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.observed_rowid = observed_rowid;
+        self.retention_policy = Some(policy);
+        if maintain {
+            self.maintenance_due_ms = now_ms.saturating_add(3_600_000);
+        }
+        self.repair_vectors = false;
+        Ok(())
     }
     pub fn wal_bytes(&self) -> u64 {
         std::fs::metadata(&self.wal_path).map_or(0, |metadata| metadata.len())
@@ -683,5 +742,78 @@ impl Repository {
             }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    #[test]
+    fn collision_pages_can_yield_release_reads_and_resume_complete_recall() {
+        let mut repo = Repository::open(Path::new(":memory:")).unwrap();
+        for i in 0..400 {
+            let summary = ItemSummary {
+                id: format!("page:{i}"),
+                kind: ItemKind::Clipboard,
+                title: "标题".into(),
+                subtitle: "来源".into(),
+                alias: String::new(),
+                tags: vec![],
+                pinned: false,
+                created_at_ms: 1,
+                last_used_ms: 1,
+                use_count: 0,
+            };
+            repo.connection
+                .execute(
+                    "INSERT INTO items VALUES(?1,0,?2,0,1,1,0,?3,?4,NULL,NULL)",
+                    params![
+                        summary.id,
+                        summary.title,
+                        serde_json::to_string(&summary).unwrap(),
+                        if i == 0 { "abcde" } else { "abc bcd cde" }
+                    ],
+                )
+                .unwrap();
+            repo.connection
+                .execute(
+                    "INSERT INTO item_search(rowid,content) VALUES(?1,'abc bcd cde')",
+                    [i + 1],
+                )
+                .unwrap();
+        }
+        let query = SearchQuery {
+            text: "abcde".into(),
+            ..Default::default()
+        };
+        let mut pages = 0;
+        let interrupted = repo.summaries_in_period(&query, None, None, || {
+            pages += 1;
+            if pages == 300 {
+                Err("due save".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(interrupted.unwrap_err(), "due save");
+        // The aborted reader must release its statement/transaction for due writes.
+        let settings = Settings {
+            retention_days: u32::MAX,
+            ..Default::default()
+        };
+        repo.commit(
+            &HashMap::new(),
+            &HashSet::new(),
+            Some(&settings),
+            &settings,
+            1,
+            &crate::semantic_store::PendingVectors::default(),
+        )
+        .unwrap();
+        let complete = repo
+            .summaries_in_period(&query, None, None, || Ok(()))
+            .unwrap();
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].id, "page:0");
     }
 }

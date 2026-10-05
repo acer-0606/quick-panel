@@ -1597,6 +1597,7 @@ impl App {
                     self.tray(NIM_MODIFY);
                     self.search();
                 }
+                Event::SemanticStatus { .. } => {}
                 Event::SemanticBatch(batch) => self.index_batch(batch),
                 Event::EmbeddingsStored {
                     request_id,

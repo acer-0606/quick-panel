@@ -74,12 +74,34 @@ pub struct FavoriteInput {
     pub open_with: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SmartSearchMode {
+    #[default]
+    Auto,
+    Claude,
+    Semantic,
+}
+#[derive(Clone, Debug)]
+pub struct ClipboardMetadataInput {
+    pub id: String,
+    pub title: String,
+    pub alias: String,
+    pub tags: Vec<String>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticIndexStatus {
+    pub profile: String,
+    pub indexed: usize,
+    pub needs_update: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub ai: crate::ai::AiSettings,
     pub embedding: crate::semantic::EmbeddingSettings,
     pub theme: Theme,
+    pub smart_search: SmartSearchMode,
     pub hotkey_modifiers: u32,
     pub hotkey_key: u32,
     pub clipboard_hotkey_modifiers: u32,
@@ -96,6 +118,7 @@ impl Default for Settings {
             ai: crate::ai::AiSettings::default(),
             embedding: crate::semantic::EmbeddingSettings::default(),
             theme: Theme::System,
+            smart_search: SmartSearchMode::Auto,
             hotkey_modifiers: 3,
             hotkey_key: 32,
             clipboard_hotkey_modifiers: 0,
@@ -152,6 +175,10 @@ pub enum Command {
         request_id: u64,
     },
     SaveFavorite(FavoriteInput),
+    EditClipboardMetadata(ClipboardMetadataInput),
+    SemanticStatus {
+        request_id: u64,
+    },
     SaveSettings(Settings),
     Delete(String),
     Pin {
@@ -167,6 +194,10 @@ pub enum Command {
 #[derive(Clone, Debug)]
 pub enum Event {
     Ready(Settings),
+    SemanticStatus {
+        request_id: u64,
+        status: SemanticIndexStatus,
+    },
     SemanticBatch(crate::semantic::IndexBatch),
     EmbeddingsStored {
         request_id: u64,

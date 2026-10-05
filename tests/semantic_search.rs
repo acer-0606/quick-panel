@@ -1260,3 +1260,181 @@ fn explicit_path_lane_respects_pending_content_and_deletions() {
     db.execute_batch("ROLLBACK").unwrap();
     shutdown(&engine);
 }
+
+#[test]
+fn semantic_status_reads_ram_disk_dirty_profile_and_deletion_without_committing() {
+    fn status(engine: &Engine) -> SemanticIndexStatus {
+        engine
+            .send(Command::SemanticStatus { request_id: 81 })
+            .unwrap();
+        match wait(engine, |e| {
+            matches!(e, Event::SemanticStatus { request_id: 81, .. })
+        }) {
+            Event::SemanticStatus { status, .. } => status,
+            _ => unreachable!(),
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("status.sqlite");
+    let engine = start(&path, 60_000);
+    let mut settings = configure(&engine, IndexScope::AllText);
+    assert_eq!(status(&engine).indexed, 0);
+    assert!(!status(&engine).needs_update);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='semantic_map'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    capture(&engine, "可索引正文");
+    assert!(status(&engine).needs_update);
+    let b = batch(&engine, IndexCursor::default());
+    assert_eq!(store(&engine, &b, vec![vec![1., 0.]]), 1);
+    assert_eq!(status(&engine).indexed, 1);
+    assert!(!status(&engine).needs_update);
+    assert_eq!(vec_count(&db), 0);
+    flush(&engine);
+    assert_eq!(status(&engine).indexed, 1);
+    settings.embedding.model = "other-profile".into();
+    engine.send(Command::SaveSettings(settings)).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(status(&engine).indexed, 0);
+    assert!(status(&engine).needs_update);
+    engine
+        .send(Command::Delete(b.candidates[0].id.clone()))
+        .unwrap();
+    assert_eq!(status(&engine).indexed, 0);
+    assert!(!status(&engine).needs_update);
+    shutdown(&engine);
+}
+
+#[test]
+fn pure_vector_commits_do_not_restart_source_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("cursor.sqlite");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::AllText);
+    let db = Connection::open(&path).unwrap();
+    for i in 0..64 {
+        insert(
+            &db,
+            &format!("source:{i:03}"),
+            ItemKind::Clipboard,
+            false,
+            "正文",
+        );
+    }
+    let first = one_page(&engine, IndexCursor::default());
+    assert_eq!(first.candidates.len(), 16);
+    // Partial success is valid: failed embedding inputs may remain unindexed.
+    assert_eq!(store(&engine, &first, vec![vec![1., 0.]]), 1);
+    flush(&engine);
+    let second = one_page(&engine, first.cursor.clone());
+    assert!(
+        second
+            .candidates
+            .iter()
+            .all(|c| !first.candidates.iter().any(|old| old.id == c.id)),
+        "pure vector flush revisited scanned sources"
+    );
+    assert!(second.cursor.after_rowid > first.cursor.after_rowid);
+    shutdown(&engine);
+}
+
+#[test]
+fn large_pending_metadata_pin_filter_keeps_top_fifty_eligible() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("pins.sqlite");
+    let engine = start(&path, 60_000);
+    let mut settings = configure(&engine, IndexScope::AllText);
+    let db = Connection::open(&path).unwrap();
+    for i in 0..320 {
+        insert(
+            &db,
+            &format!("source:{i:03}"),
+            ItemKind::Clipboard,
+            i >= 260,
+            "正文",
+        );
+    }
+    let profile = index_all(&engine, |c| {
+        if c.id.as_str() < "source:260" {
+            vec![1., 0.]
+        } else {
+            vec![0., 1.]
+        }
+    });
+    flush(&engine);
+    settings.embedding.index_scope = IndexScope::PinnedAndFavorites;
+    engine.send(Command::SaveSettings(settings)).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    for i in 0..320 {
+        engine
+            .send(Command::Used(format!("source:{i:03}")))
+            .unwrap();
+    }
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    engine
+        .send(Command::Pin {
+            id: "source:000".into(),
+            pinned: true,
+        })
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    let items = query(&engine, &profile, Scope::Clipboard, vec![1., 0.]);
+    assert_eq!(items.len(), 50);
+    assert_eq!(items[0].id, "source:000");
+    assert!(items.iter().all(|i| i.pinned));
+    db.execute_batch("ROLLBACK").unwrap();
+    shutdown(&engine);
+}
+
+#[test]
+fn renamed_clipboard_invalidates_status_and_completed_source_cursor() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("rename.sqlite");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::PinnedAndFavorites);
+    let db = Connection::open(&path).unwrap();
+    insert(&db, "fixed", ItemKind::Clipboard, true, "正文");
+    index_all(&engine, |_| vec![1., 0.]);
+    flush(&engine);
+    let mut complete = one_page(&engine, IndexCursor::default());
+    while !complete.done {
+        complete = one_page(&engine, complete.cursor);
+    }
+    engine
+        .send(Command::EditClipboardMetadata(ClipboardMetadataInput {
+            id: "fixed".into(),
+            title: "新名称".into(),
+            alias: "新别名".into(),
+            tags: vec![],
+        }))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    engine
+        .send(Command::SemanticStatus { request_id: 98 })
+        .unwrap();
+    assert!(matches!(
+        wait(&engine, |e| matches!(
+            e,
+            Event::SemanticStatus { request_id: 98, .. }
+        )),
+        Event::SemanticStatus {
+            status: SemanticIndexStatus {
+                indexed: 0,
+                needs_update: true,
+                ..
+            },
+            ..
+        }
+    ));
+    let dirty = batch(&engine, complete.cursor);
+    assert_eq!(dirty.candidates.len(), 1);
+    assert!(dirty.candidates[0].text.contains("新名称"));
+    shutdown(&engine);
+}

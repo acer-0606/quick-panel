@@ -264,3 +264,27 @@ fn engine_pending_and_saved_searches_return_the_same_substring_items() {
     engine.send(Command::Shutdown).unwrap();
     wait(&engine, |event| matches!(event, Event::ExitReady));
 }
+
+#[test]
+fn legacy_settings_default_smart_mode_and_roundtrip_explicit_modes() {
+    assert_eq!(
+        serde_json::from_str::<Settings>("{}").unwrap().smart_search,
+        SmartSearchMode::Auto
+    );
+    for smart_search in [
+        SmartSearchMode::Auto,
+        SmartSearchMode::Claude,
+        SmartSearchMode::Semantic,
+    ] {
+        let settings = Settings {
+            smart_search,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_str::<Settings>(&serde_json::to_string(&settings).unwrap())
+                .unwrap()
+                .smart_search,
+            smart_search
+        );
+    }
+}
