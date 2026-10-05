@@ -26,7 +26,26 @@ struct Queries {
     latest: Mutex<Option<(u64, Command)>>,
     generation: AtomicU64,
     revision: AtomicU64,
+    semantic_revision: AtomicU64,
     reliable_pending: AtomicUsize,
+}
+impl Queries {
+    fn note_reliable(&self, command: &Command) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        if matches!(
+            command,
+            Command::Capture(_)
+                | Command::StoreEmbeddings { .. }
+                | Command::SaveFavorite(_)
+                | Command::EditClipboardMetadata(_)
+                | Command::SaveSettings(_)
+                | Command::Delete(_)
+                | Command::Pin { .. }
+                | Command::Used(_)
+        ) {
+            self.semantic_revision.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 }
 const QUERY_YIELDED: &str = "internal: query yielded";
 struct Commands {
@@ -181,7 +200,7 @@ impl Engine {
         } else {
             0
         };
-        state.queries.revision.fetch_add(1, Ordering::AcqRel);
+        state.queries.note_reliable(&command);
         if matches!(command, Command::Shutdown) {
             state.queries.generation.fetch_add(1, Ordering::AcqRel);
             *state
@@ -287,7 +306,7 @@ impl Drop for Engine {
 struct SemanticStatusWork {
     request_id: u64,
     revision: u64,
-    commits: u64,
+
     source_generation: u64,
     profile: String,
     scope: crate::semantic::IndexScope,
@@ -494,6 +513,11 @@ impl Actor {
         ) {
             Ok(effects) => {
                 let semantic_status_changed = semantic_status_changed || effects.sources_removed;
+                if semantic_status_changed {
+                    self.queries
+                        .semantic_revision
+                        .fetch_add(1, Ordering::AcqRel);
+                }
                 if self
                     .pending
                     .values()
@@ -837,8 +861,7 @@ impl Actor {
     fn new_status_work(&self, request_id: u64) -> Result<SemanticStatusWork, String> {
         Ok(SemanticStatusWork {
             request_id,
-            revision: self.queries.revision.load(Ordering::Acquire),
-            commits: self.commits,
+            revision: self.queries.semantic_revision.load(Ordering::Acquire),
             source_generation: self.source_generation,
             profile: crate::semantic::profile_id(&self.settings.embedding)?,
             scope: self.settings.embedding.index_scope,
@@ -857,7 +880,7 @@ impl Actor {
     fn status_should_yield(&self, work: &SemanticStatusWork) -> bool {
         self.exiting
             || self.queries.reliable_pending.load(Ordering::Acquire) > 0
-            || self.queries.revision.load(Ordering::Acquire) != work.revision
+            || self.queries.semantic_revision.load(Ordering::Acquire) != work.revision
             || self
                 .deadline
                 .is_some_and(|deadline| deadline <= Instant::now())
@@ -883,10 +906,9 @@ impl Actor {
         if self.exiting {
             return Ok(());
         }
-        // Even vector-only commits can change valid counts or apply retention.
-        // Reliable command revisions also cover RAM vectors and pending deletes.
-        if work.revision != self.queries.revision.load(Ordering::Acquire)
-            || work.commits != self.commits
+        // RAM source/vector changes and commits with semantic effects invalidate
+        // counts. Path-only reliable work yields scheduling without losing pages.
+        if work.revision != self.queries.semantic_revision.load(Ordering::Acquire)
             || work.source_generation != self.source_generation
             || work.scope != self.settings.embedding.index_scope
             || work.profile != crate::semantic::profile_id(&self.settings.embedding)?
@@ -1837,7 +1859,7 @@ mod status_scheduling_tests {
             .collect()
     }
     fn queue(sender: &Sender<QueuedCommand>, queries: &Queries, command: Command) {
-        queries.revision.fetch_add(1, Ordering::AcqRel);
+        queries.note_reliable(&command);
         queries.reliable_pending.fetch_add(1, Ordering::AcqRel);
         sender
             .send(QueuedCommand {
@@ -1959,6 +1981,73 @@ mod status_scheduling_tests {
         assert_eq!(
             actor.commits, 1,
             "only the final Shutdown may persist this test's data"
+        );
+    }
+    #[test]
+    fn path_commands_and_commits_keep_partial_status_progress() {
+        use crate::path_activity::{ObservationSource, PathObservation};
+        let (mut actor, events) = actor_fixture();
+        actor.settings.path_activity.enabled = true;
+        seed_sources(&mut actor, &events, 96, true, true);
+        actor.semantic_status(95).unwrap();
+        actor.status_step().unwrap();
+        assert_eq!(actor.status_work.as_ref().unwrap().indexed, 16);
+        let (sender, received) = mpsc::channel();
+        for command in [
+            Command::ObservePaths(vec![PathObservation {
+                path: "C:/StatusFixture".into(),
+                kind: ItemKind::Folder,
+                observed_at_ms: now_ms(),
+                source: ObservationSource::Explorer,
+            }]),
+            Command::SuppressPath("C:/StatusFixture".into()),
+            Command::ClearPathActivity,
+        ] {
+            let indexed = actor.status_work.as_ref().unwrap().indexed;
+            queue(&sender, &actor.queries, command);
+            actor.status_step().unwrap();
+            assert_eq!(
+                actor.status_work.as_ref().unwrap().indexed,
+                indexed,
+                "pending path commands must yield without resetting completed pages"
+            );
+            let queued = received.recv().unwrap();
+            actor
+                .queries
+                .reliable_pending
+                .fetch_sub(1, Ordering::AcqRel);
+            match queued.command.unwrap().unwrap() {
+                Command::ObservePaths(paths) => {
+                    assert!(actor.repo.paths.observe(
+                        paths,
+                        &actor.settings.path_activity,
+                        now_ms()
+                    ));
+                }
+                Command::SuppressPath(path) => {
+                    assert!(actor.repo.paths.suppress(&path).unwrap());
+                }
+                Command::ClearPathActivity => {
+                    assert!(actor.repo.paths.clear());
+                }
+                _ => unreachable!(),
+            }
+            assert!(actor.flush());
+            assert!(
+                matches!(events.recv().unwrap(), Event::Saved(stats) if !stats.semantic_status_changed)
+            );
+            actor.status_step().unwrap();
+            assert_eq!(
+                actor.status_work.as_ref().unwrap().indexed,
+                indexed + 16,
+                "path-only commits must resume the next status page"
+            );
+        }
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 96 && !status.needs_update)
         );
     }
     #[test]
