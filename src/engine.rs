@@ -492,12 +492,14 @@ impl Actor {
             now,
             &self.vectors,
         ) {
-            Ok(()) => {
+            Ok(effects) => {
+                let semantic_status_changed = semantic_status_changed || effects.sources_removed;
                 if self
                     .pending
                     .values()
                     .any(|p| p.mutation == Mutation::Content)
                     || !self.deleted.is_empty()
+                    || effects.sources_removed
                 {
                     self.source_generation += 1;
                 }

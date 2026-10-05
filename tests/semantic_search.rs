@@ -1601,3 +1601,64 @@ fn queued_status_yields_to_favorite_and_profile_saves_then_reports_current_data(
     );
     shutdown(&engine);
 }
+
+#[test]
+fn path_only_commit_reports_retention_removing_semantic_sources() {
+    use quick_panel::path_activity::{ObservationSource, PathObservation};
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("path-retention.sqlite");
+    let engine = start(&path, 60_000);
+    let mut settings = configure(&engine, IndexScope::AllText);
+    settings.path_activity.enabled = true;
+    engine.send(Command::SaveSettings(settings)).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    capture(&engine, "expired semantic fixture");
+    let input = batch(&engine, IndexCursor::default());
+    assert_eq!(store(&engine, &input, vec![vec![1., 0.]]), 1);
+    flush(&engine);
+    shutdown(&engine);
+    let db = Connection::open(&path).unwrap();
+    assert_eq!(vec_count(&db), 1);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    db.execute("UPDATE items SET last_used_ms=?1", [now - 31 * 86_400_000])
+        .unwrap();
+    let engine = start(&path, 60_000);
+    engine
+        .send(Command::ObservePaths(vec![PathObservation {
+            path: "C:/FreshPath".into(),
+            kind: ItemKind::Folder,
+            observed_at_ms: now,
+            source: ObservationSource::Explorer,
+        }]))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    let Event::Saved(stats) = wait(&engine, |e| matches!(e, Event::Saved(_))) else {
+        unreachable!()
+    };
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(vec_count(&db), 0);
+    assert!(
+        stats.semantic_status_changed,
+        "retention removed a real indexed source during path-only commit"
+    );
+    engine
+        .send(Command::ObservePaths(vec![PathObservation {
+            path: "C:/NextPath".into(),
+            kind: ItemKind::Folder,
+            observed_at_ms: now,
+            source: ObservationSource::Explorer,
+        }]))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    assert!(
+        matches!(wait(&engine, |e| matches!(e, Event::Saved(_))), Event::Saved(stats) if !stats.semantic_status_changed)
+    );
+    shutdown(&engine);
+}

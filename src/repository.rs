@@ -39,6 +39,9 @@ pub(crate) struct PendingItem {
     pub item: StoredItem,
     pub mutation: Mutation,
 }
+pub(crate) struct CommitEffects {
+    pub sources_removed: bool,
+}
 pub(crate) struct Repository {
     pub(crate) paths: crate::path_activity_store::PathActivityStore,
     pub(crate) connection: Connection,
@@ -588,7 +591,10 @@ impl Repository {
         retention: &Settings,
         now_ms: i64,
         vectors: &crate::semantic_store::PendingVectors,
-    ) -> Result<(), String> {
+    ) -> Result<CommitEffects, String> {
+        // A real dirty commit is the only persistence maintenance boundary.
+        // Cache eviction remains pending if this transaction fails.
+        self.paths.expire(now_ms);
         let policy = (retention.retention_days, retention.max_history);
         let policy_changed = self.retention_policy != Some(policy);
         let tx = self.connection.transaction().map_err(|e| e.to_string())?;
@@ -696,7 +702,9 @@ impl Repository {
             self.maintenance_due_ms = now_ms.saturating_add(3_600_000);
         }
         self.repair_vectors = false;
-        Ok(())
+        Ok(CommitEffects {
+            sources_removed: !removed.is_empty(),
+        })
     }
     pub fn wal_bytes(&self) -> u64 {
         std::fs::metadata(&self.wal_path).map_or(0, |metadata| metadata.len())

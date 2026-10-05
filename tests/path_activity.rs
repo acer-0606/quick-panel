@@ -328,11 +328,11 @@ fn ranking_decays_and_clock_anomalies_do_not_poison_deduplication() {
         query(&engine, "", Scope::All);
     }
     let items = query(&engine, "", Scope::All);
-    assert_eq!(items[0].path, r"c:\future");
+    assert_eq!(items[0].key, r"c:\future");
     assert_eq!(items[0].visits, 3);
     assert!(items[0].last_seen_ms <= now());
-    assert_eq!(items[1].path, r"c:\recent");
-    assert_eq!(items[2].path, r"c:\old");
+    assert_eq!(items[1].key, r"c:\recent");
+    assert_eq!(items[2].key, r"c:\old");
     shutdown(&engine);
 }
 #[test]
@@ -441,7 +441,7 @@ fn ai_and_semantic_queries_publish_matching_local_candidates_without_embedding_s
         matches!(e, Event::PathSuggestions { request_id: 51, .. })
     });
     assert!(
-        matches!(event, Event::PathSuggestions { items, .. } if items.len() == 1 && items[0].path == "c:\\资料\\预算.txt")
+        matches!(event, Event::PathSuggestions { items, .. } if items.len() == 1 && items[0].key == "c:\\资料\\预算.txt")
     );
     assert!(
         matches!(wait(&engine, |e| matches!(e, Event::Results { request_id: 51, .. })), Event::Results {items, ..} if items.is_empty())
@@ -518,7 +518,7 @@ fn suppression_limit_preserves_all_hidden_records_and_clear_recovers_capacity() 
         .unwrap();
     let items = query(&engine, "", Scope::All);
     assert_eq!(items.len(), 1);
-    assert_eq!(items[0].path, r"c:\overflow");
+    assert_eq!(items[0].key, r"c:\overflow");
     engine.send(Command::ClearPathActivity).unwrap();
     wait(&engine, |e| matches!(e, Event::Saved(_)));
     shutdown(&engine);
@@ -586,9 +586,9 @@ fn repeated_batch_and_equal_scores_are_deterministic_across_reopen() {
         ]))
         .unwrap();
     let items = query(&engine, "", Scope::All);
-    assert_eq!(items[0].path, r"c:\a");
+    assert_eq!(items[0].key, r"c:\a");
     assert_eq!(items[0].visits, 1);
-    assert_eq!(items[1].path, r"c:\z");
+    assert_eq!(items[1].key, r"c:\z");
     shutdown(&engine);
     let engine = open(&path, 60_000);
     assert_eq!(query(&engine, "", Scope::All), items);
@@ -859,4 +859,241 @@ fn windows_dos_devices_are_not_accepted_as_filesystem_observations() {
         assert!(normalize_path(path).is_err(), "accepted device {path}");
     }
     assert_eq!(normalize_path("C:/COM10.txt").unwrap(), r"c:\com10.txt");
+}
+
+#[test]
+fn executable_targets_and_titles_keep_case_in_memory_and_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let engine = open(&path, 60_000);
+    enable(&engine);
+    engine
+        .send(Command::ObservePaths(vec![
+            observe(
+                "C:/Repo/./ReadMe.md",
+                ItemKind::Document,
+                now(),
+                ObservationSource::Explorer,
+            ),
+            observe(
+                r"\\Server\CaseShare\Docs\Report.PDF",
+                ItemKind::Document,
+                now(),
+                ObservationSource::RecentDocuments,
+            ),
+        ]))
+        .unwrap();
+    let disk = Connection::open(&path).unwrap();
+    assert_eq!(count(&disk, "path_activity"), 0);
+    let items = query(&engine, "readme", Scope::All);
+    assert_eq!(items[0].key, r"c:\repo\readme.md");
+    assert_eq!(items[0].path, r"C:\Repo\ReadMe.md");
+    assert_eq!(items[0].title, "ReadMe.md");
+    let unc = query(&engine, "report", Scope::All);
+    assert_eq!(unc[0].key, r"\\server\caseshare\docs\report.pdf");
+    assert_eq!(unc[0].path, r"\\Server\CaseShare\Docs\Report.PDF");
+    assert_eq!(unc[0].title, "Report.PDF");
+    shutdown(&engine);
+    let engine = open(&path, 60_000);
+    assert_eq!(query(&engine, "readme", Scope::All), items);
+    assert_eq!(query(&engine, "report", Scope::All), unc);
+    shutdown(&engine);
+}
+#[test]
+fn legacy_path_table_migrates_targets_only_on_a_path_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE path_activity(path TEXT PRIMARY KEY,kind INTEGER NOT NULL,visits INTEGER NOT NULL,last_seen_ms INTEGER NOT NULL,weight REAL NOT NULL,hidden INTEGER NOT NULL)").unwrap();
+    db.execute(
+        "INSERT INTO path_activity VALUES('c:\\repo\\readme.md',2,1,?1,1,0)",
+        [now() - 60_000],
+    )
+    .unwrap();
+    let engine = open(&path, 60_000);
+    enable(&engine);
+    assert_eq!(
+        query(&engine, "readme", Scope::All)[0].path,
+        r"c:\repo\readme.md"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM pragma_table_info('path_activity') WHERE name='target'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    engine
+        .send(Command::ObservePaths(vec![observe(
+            "C:/Repo/ReadMe.md",
+            ItemKind::Document,
+            now(),
+            ObservationSource::Explorer,
+        )]))
+        .unwrap();
+    shutdown(&engine);
+    let engine = open(&path, 60_000);
+    assert_eq!(
+        query(&engine, "readme", Scope::All)[0].path,
+        r"C:\Repo\ReadMe.md"
+    );
+    shutdown(&engine);
+}
+
+fn seed_old_paths(path: &std::path::Path, count: usize, long: bool) {
+    let mut db = Connection::open(path).unwrap();
+    db.execute_batch("CREATE TABLE IF NOT EXISTS path_activity(path TEXT PRIMARY KEY,kind INTEGER NOT NULL,visits INTEGER NOT NULL,last_seen_ms INTEGER NOT NULL,weight REAL NOT NULL,hidden INTEGER NOT NULL,target TEXT)").unwrap();
+    let tx = db.transaction().unwrap();
+    for i in 0..count {
+        let target = if long {
+            format!("C:/{}Old{i:04}", "长".repeat(1900))
+        } else {
+            format!("C:/Old{i:04}")
+        };
+        tx.execute("INSERT INTO path_activity(path,kind,visits,last_seen_ms,weight,hidden,target) VALUES(?1,1,1,?2,1,0,?3)", rusqlite::params![normalize_path(&target).unwrap(), now()-91*86_400_000, target]).unwrap();
+    }
+    tx.execute("INSERT INTO path_activity(path,kind,visits,last_seen_ms,weight,hidden,target) VALUES('c:\\hidden',1,0,0,0,1,'C:\\Hidden')", []).unwrap();
+    tx.commit().unwrap();
+}
+#[test]
+fn expired_full_count_is_hidden_without_writes_and_new_observations_reclaim_capacity() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let engine = open(&path, 60_000);
+    enable(&engine);
+    engine
+        .send(Command::SaveFavorite(FavoriteInput {
+            id: Some("manual".into()),
+            kind: ItemKind::Folder,
+            title: "Manual".into(),
+            target: "C:/Old0000".into(),
+            alias: String::new(),
+            tags: vec![],
+            open_with: None,
+        }))
+        .unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    shutdown(&engine);
+    seed_old_paths(&path, 1024, false);
+    let engine = open(&path, 60_000);
+    let db = Connection::open(&path).unwrap();
+    assert!(query(&engine, "old", Scope::All).is_empty());
+    assert_eq!(count(&db, "path_activity"), 1025);
+    engine
+        .send(Command::ObservePaths(vec![
+            observe(
+                "C:/Fresh/KeepCase",
+                ItemKind::Folder,
+                now(),
+                ObservationSource::Explorer,
+            ),
+            observe(
+                "C:/Hidden",
+                ItemKind::Folder,
+                now(),
+                ObservationSource::Explorer,
+            ),
+        ]))
+        .unwrap();
+    let items = query(&engine, "", Scope::All);
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].path, r"C:\Fresh\KeepCase");
+    assert_eq!(count(&db, "path_activity"), 1025);
+    shutdown(&engine);
+    assert_eq!(count(&db, "path_activity"), 2);
+    assert_eq!(count(&db, "items"), 1);
+    let engine = open(&path, 60_000);
+    assert_eq!(query(&engine, "", Scope::All), items);
+    engine
+        .send(Command::ObservePaths(vec![observe(
+            "C:/Hidden",
+            ItemKind::Folder,
+            now(),
+            ObservationSource::Explorer,
+        )]))
+        .unwrap();
+    assert_eq!(query(&engine, "", Scope::All).len(), 1);
+    shutdown(&engine);
+}
+#[test]
+fn expired_byte_budget_recovers_and_failed_deletes_preserve_new_rows_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let engine = open(&path, 60_000);
+    enable(&engine);
+    shutdown(&engine);
+    seed_old_paths(&path, 100, true);
+    let engine = open(&path, 60_000);
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_expire BEFORE DELETE ON path_activity BEGIN SELECT RAISE(ABORT,'expiry fixture'); END").unwrap();
+    let fresh = format!("C:/{}NewCase", "新".repeat(1900));
+    engine
+        .send(Command::ObservePaths(vec![observe(
+            &fresh,
+            ItemKind::Folder,
+            now(),
+            ObservationSource::Explorer,
+        )]))
+        .unwrap();
+    assert_eq!(query(&engine, "NewCase", Scope::All).len(), 1);
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    assert_eq!(count(&db, "path_activity"), 101);
+    assert_eq!(query(&engine, "NewCase", Scope::All).len(), 1);
+    db.execute_batch("DROP TRIGGER fail_expire; BEGIN IMMEDIATE")
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Error { .. }));
+    for i in 0..100 {
+        engine
+            .send(Command::ObservePaths(vec![observe(
+                &format!("C:/Stale{i}"),
+                ItemKind::Folder,
+                now() - 100 * 86_400_000,
+                ObservationSource::Explorer,
+            )]))
+            .unwrap();
+    }
+    assert!(query(&engine, "Stale", Scope::All).is_empty());
+    assert_eq!(query(&engine, "NewCase", Scope::All).len(), 1);
+    db.execute_batch("ROLLBACK").unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(count(&db, "path_activity"), 2);
+    shutdown(&engine);
+    let engine = open(&path, 60_000);
+    assert_eq!(
+        query(&engine, "NewCase", Scope::All)[0].path,
+        fresh.replace('/', "\\")
+    );
+    assert!(query(&engine, "Old", Scope::All).is_empty());
+    shutdown(&engine);
+}
+#[test]
+fn unrelated_dirty_commit_expires_automatic_rows_without_removing_hidden_preferences() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let engine = open(&path, 60_000);
+    enable(&engine);
+    shutdown(&engine);
+    seed_old_paths(&path, 1, false);
+    let engine = open(&path, 60_000);
+    let db = Connection::open(&path).unwrap();
+    assert!(query(&engine, "old", Scope::All).is_empty());
+    assert_eq!(count(&db, "path_activity"), 2);
+    engine
+        .send(Command::Capture(ClipboardSnapshot {
+            text: "expiry commit fixture".into(),
+            representations: vec![],
+            source_app: "fixture".into(),
+            captured_at_ms: now(),
+        }))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert_eq!(count(&db, "path_activity"), 1);
+    assert_eq!(count(&db, "items"), 1);
+    shutdown(&engine);
 }

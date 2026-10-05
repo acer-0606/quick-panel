@@ -45,11 +45,19 @@ pub(crate) const MAX_BATCH: usize = 32;
 pub(crate) const MAX_QUEUE_BYTES: usize = 256 * 1024;
 
 pub fn normalize_path(path: &str) -> Result<String, String> {
+    let key = normalize_target(path)?.to_lowercase();
+    if key.encode_utf16().count() > MAX_PATH_UNITS {
+        return Err("路径超过长度上限".into());
+    }
+    Ok(key)
+}
+/// Syntax-normalized execution target; unlike the lookup key it preserves case.
+pub(crate) fn normalize_target(path: &str) -> Result<String, String> {
     let invalid = || "需要有效的 Windows 绝对路径".to_string();
     if path.encode_utf16().count() > MAX_PATH_UNITS || path.chars().any(char::is_control) {
         return Err(invalid());
     }
-    let path = path.replace('/', "\\").to_lowercase();
+    let path = path.replace('/', "\\");
     if path.starts_with(r"\\?\") || path.starts_with(r"\\.\") {
         return Err(invalid());
     }
@@ -86,7 +94,9 @@ pub fn normalize_path(path: &str) -> Result<String, String> {
             ".." => {
                 components.pop().ok_or_else(invalid)?;
             }
-            value if valid_component(value) && !device_component(value) => components.push(value),
+            value if valid_component(value) && !device_component(&value.to_lowercase()) => {
+                components.push(value)
+            }
             _ => return Err(invalid()),
         }
     }
