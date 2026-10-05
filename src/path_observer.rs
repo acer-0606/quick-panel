@@ -238,3 +238,77 @@ pub fn recent_target(
         },
     ))
 }
+
+/// Same-generation Recent watcher recovery, separate from actual worker occupancy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatcherTicket {
+    generation: u64,
+    revision: u64,
+    serial: u64,
+}
+#[derive(Default)]
+pub struct RecentRecovery {
+    enabled: bool,
+    generation: u64,
+    revision: u64,
+    serial: u64,
+    retry_at: Option<u64>,
+    ready: bool,
+    inflight: Option<WatcherTicket>,
+}
+impl RecentRecovery {
+    /// Cancel publication but retain the real initialization's occupied receipt.
+    pub fn reset(&mut self, enabled: bool, generation: u64, now: u64) {
+        self.enabled = enabled;
+        self.generation = generation;
+        self.revision = self.revision.wrapping_add(1);
+        self.ready = false;
+        self.retry_at = enabled.then_some(now);
+    }
+    pub fn lost(&mut self, now: u64) {
+        self.revision = self.revision.wrapping_add(1);
+        self.ready = false;
+        self.retry_at = self.enabled.then(|| now.saturating_add(30_000));
+    }
+    pub fn due(&self, now: u64) -> bool {
+        self.enabled
+            && !self.ready
+            && self.inflight.is_none()
+            && self.retry_at.is_some_and(|retry| now >= retry)
+    }
+    pub fn begin(&mut self, now: u64) -> Option<WatcherTicket> {
+        if !self.due(now) {
+            return None;
+        }
+        self.serial = self.serial.wrapping_add(1);
+        let ticket = WatcherTicket {
+            generation: self.generation,
+            revision: self.revision,
+            serial: self.serial,
+        };
+        self.inflight = Some(ticket);
+        self.retry_at = None;
+        Some(ticket)
+    }
+    /// True only for this live generation/revision. Late receipts release only
+    /// their own initialization slot and can never restore an obsolete watcher.
+    pub fn complete(&mut self, ticket: WatcherTicket, success: bool, now: u64) -> bool {
+        if self.inflight != Some(ticket) {
+            return false;
+        }
+        self.inflight = None;
+        if !self.enabled || ticket.generation != self.generation || ticket.revision != self.revision
+        {
+            return false;
+        }
+        self.ready = success;
+        self.retry_at = (!success).then(|| now.saturating_add(30_000));
+        true
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}

@@ -288,3 +288,78 @@ fn recent_raw_targets_reject_truncation_variables_and_ambiguous_type_without_io(
     assert!(recent_target(&format!("C:/{}", "a".repeat(256)), false, true).is_none());
     assert!(recent_target("relative/file.txt", false, true).is_none());
 }
+
+#[test]
+fn recent_initialization_failure_retries_only_after_thirty_seconds() {
+    use quick_panel::path_observer::RecentRecovery;
+    let mut recovery = RecentRecovery::default();
+    recovery.reset(true, 1, 0);
+    let first = recovery.begin(0).unwrap();
+    assert!(recovery.begin(2000).is_none());
+    assert!(recovery.complete(first, false, 1000));
+    for tick in (2000..31000).step_by(2000) {
+        assert!(!recovery.due(tick));
+        assert!(recovery.begin(tick).is_none());
+    }
+    assert!(!recovery.due(30999));
+    assert!(recovery.due(31000));
+    let second = recovery.begin(31000).unwrap();
+    assert!(recovery.complete(second, false, 32000));
+    assert!(recovery.begin(61999).is_none());
+    assert!(recovery.begin(62000).is_some());
+}
+
+#[test]
+fn recent_renewal_failure_rebuilds_after_backoff_and_success_restores_notifications() {
+    use quick_panel::path_observer::RecentRecovery;
+    let mut recovery = RecentRecovery::default();
+    recovery.reset(true, 3, 0);
+    let initial = recovery.begin(0).unwrap();
+    assert!(recovery.complete(initial, true, 10));
+    assert!(recovery.ready());
+    assert!(!recovery.due(5000));
+    let revision = recovery.revision();
+    recovery.lost(5000);
+    assert_ne!(recovery.revision(), revision);
+    assert!(!recovery.ready());
+    assert!(recovery.begin(34999).is_none());
+    let rebuilt = recovery.begin(35000).unwrap();
+    assert!(recovery.complete(rebuilt, true, 35001));
+    assert!(recovery.ready());
+    assert!(recovery.begin(100000).is_none());
+}
+
+#[test]
+fn cancelled_recent_setup_cannot_restore_a_watcher_or_release_a_new_attempt() {
+    use quick_panel::path_observer::RecentRecovery;
+    for enabled_after_cancel in [false, true] {
+        let mut recovery = RecentRecovery::default();
+        recovery.reset(true, 1, 0);
+        let old = recovery.begin(0).unwrap();
+        recovery.reset(enabled_after_cancel, 2, 100);
+        assert!(recovery.begin(1000).is_none());
+        assert!(!recovery.complete(old, true, 1000));
+        assert!(!recovery.ready());
+        let next = recovery.begin(1000);
+        assert_eq!(next.is_some(), enabled_after_cancel);
+        if let Some(next) = next {
+            assert!(!recovery.complete(old, true, 1001));
+            assert!(recovery.begin(1002).is_none());
+            assert!(recovery.complete(next, true, 1003));
+            assert!(recovery.ready());
+        }
+    }
+}
+
+#[test]
+fn recent_backoff_does_not_block_explorer_visits() {
+    use quick_panel::path_observer::RecentRecovery;
+    let mut recovery = RecentRecovery::default();
+    recovery.reset(true, 1, 0);
+    let ticket = recovery.begin(0).unwrap();
+    assert!(recovery.complete(ticket, false, 0));
+    let mut observer = enabled();
+    assert!(observe(&mut observer, "C:/Explorer", 0).is_empty());
+    assert_eq!(observe(&mut observer, "C:/Explorer", 2000).len(), 1);
+    assert!(!recovery.due(2000));
+}

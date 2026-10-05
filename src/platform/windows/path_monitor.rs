@@ -5,8 +5,8 @@ use crate::{
     model::ItemKind,
     path_activity::{self, ObservationSource, PathActivitySettings, PathObservation},
     path_observer::{
-        PathObserver, ProbeTicket, RecentBaseline, RecentLink, ShellViewIdentity,
-        select_active_view,
+        PathObserver, ProbeTicket, RecentBaseline, RecentLink, RecentRecovery, ShellViewIdentity,
+        WatcherTicket, select_active_view,
     },
 };
 use std::{
@@ -71,12 +71,16 @@ struct Probe {
     settings: PathActivitySettings,
     recent_dir: Option<PathBuf>,
     initialize_recent: bool,
+    recent_attempt: Option<WatcherTicket>,
+    recent_revision: u64,
 }
 struct Receipt {
     ticket: ProbeTicket,
     observations: Vec<PathObservation>,
     error: Option<String>,
     recent_setup: Option<(PathBuf, ChangeWatch)>,
+    recent_attempt: Option<WatcherTicket>,
+    recent_revision: u64,
 }
 /// One bounded worker for the monitor's entire lifetime. Reconfiguration retains it.
 pub struct PathMonitor {
@@ -87,6 +91,7 @@ pub struct PathMonitor {
     watcher: Option<ChangeWatch>,
     recent_dir: Option<PathBuf>,
     recent_pending: bool,
+    recent_recovery: RecentRecovery,
     status: Option<String>,
     last_error: Option<String>,
     cancellation: Arc<AtomicU64>,
@@ -107,13 +112,18 @@ impl PathMonitor {
                 if cancelled() {
                     return Receipt {
                         ticket: probe.ticket,
+                        recent_attempt: probe.recent_attempt,
+                        recent_revision: probe.recent_revision,
                         observations,
                         error,
                         recent_setup,
                     };
                 }
-                if generation != Some(probe.ticket.generation) {
-                    generation = Some(probe.ticket.generation);
+                let recent_generation = (probe.ticket.generation, probe.recent_revision);
+                if generation != Some(recent_generation) || probe.initialize_recent {
+                    generation = Some(recent_generation);
+                    // Rebuilding a notifier always starts a fresh metadata-only baseline,
+                    // including same-generation retries after an unavailable directory.
                     baseline.reset();
                 }
                 match Apartment::enter() {
@@ -133,6 +143,8 @@ impl PathMonitor {
                         if cancelled() {
                             return Receipt {
                                 ticket: probe.ticket,
+                                recent_attempt: probe.recent_attempt,
+                                recent_revision: probe.recent_revision,
                                 observations: vec![],
                                 error: None,
                                 recent_setup: None,
@@ -179,6 +191,8 @@ impl PathMonitor {
                 if cancelled() {
                     return Receipt {
                         ticket: probe.ticket,
+                        recent_attempt: probe.recent_attempt,
+                        recent_revision: probe.recent_revision,
                         observations: vec![],
                         error: None,
                         recent_setup: None,
@@ -192,6 +206,8 @@ impl PathMonitor {
                 });
                 Receipt {
                     ticket: probe.ticket,
+                    recent_attempt: probe.recent_attempt,
+                    recent_revision: probe.recent_revision,
                     observations,
                     error,
                     recent_setup,
@@ -207,6 +223,7 @@ impl PathMonitor {
             watcher: None,
             recent_dir: None,
             recent_pending: false,
+            recent_recovery: RecentRecovery::default(),
             status: None,
             last_error: None,
             cancellation,
@@ -234,18 +251,20 @@ impl PathMonitor {
         self.recent_pending = false;
         self.status = None;
         self.last_error = None;
-        if !self.settings.enabled || !self.settings.recent_documents {
-            return;
-        }
-        // Known-folder lookup, notification creation and baseline enumeration run
-        // on the same background worker, never in the UI configuration callback.
-        self.recent_pending = true;
+        self.recent_recovery.reset(
+            self.settings.enabled && self.settings.recent_documents,
+            self.policy.generation(),
+            self.elapsed_ms(),
+        );
+        // Initialization and all retries use the same background worker. Resetting
+        // this policy never releases its actual in-flight initialization receipt.
     }
     /// Called by the optional two-second timer. Only Win32 foreground + event checks on UI.
     pub fn tick(&mut self) {
         if !self.settings.enabled {
             return;
         }
+        let now = self.elapsed_ms();
         self.policy.foreground(explorer_foreground());
         if let Some(watcher) = &self.watcher
             && unsafe { WaitForSingleObject(watcher.handle(), 0) } == WAIT_OBJECT_0
@@ -254,13 +273,17 @@ impl PathMonitor {
             if let Err(error) = unsafe { FindNextChangeNotification(watcher.handle()) } {
                 self.report(format!("常用路径 Recent 通知停止：{error}"));
                 self.watcher = None;
+                self.recent_dir = None;
+                self.recent_pending = false;
+                self.recent_recovery.lost(now);
             }
         }
         if self.worker.busy() || self.policy.busy() {
             return;
         }
-        // No Explorer and no Recent signal: do not invoke COM or enumerate Recent.
-        if explorer_foreground().is_none() && !self.recent_pending {
+        // No Explorer, Recent signal or due recovery: do not invoke COM or scan.
+        if explorer_foreground().is_none() && !self.recent_pending && !self.recent_recovery.due(now)
+        {
             return;
         }
         let Some(ticket) = self.policy.begin_probe() else {
@@ -270,34 +293,55 @@ impl PathMonitor {
             .recent_pending
             .then(|| self.recent_dir.clone())
             .flatten();
-        let initialize_recent = self.recent_pending && self.recent_dir.is_none();
+        let recent_attempt = self.recent_recovery.begin(now);
+        let initialize_recent = recent_attempt.is_some();
         let probe = Probe {
             ticket,
             settings: self.settings.clone(),
             recent_dir,
             initialize_recent,
+            recent_attempt,
+            recent_revision: self.recent_recovery.revision(),
         };
         if self.worker.submit(probe) {
             self.recent_pending = false;
         } else {
-            self.policy.complete(ticket, vec![], self.elapsed_ms());
+            self.policy.complete(ticket, vec![], now);
+            if let Some(attempt) = recent_attempt {
+                self.recent_recovery.complete(attempt, false, now);
+            }
         }
     }
     pub fn receive(&mut self) -> Vec<PathObservation> {
-        let Some(receipt) = self.worker.try_result() else {
+        let Some(mut receipt) = self.worker.try_result() else {
             return vec![];
         };
         // Cheap recheck closes the foreground change between timer and receipt.
         self.policy.foreground(explorer_foreground());
         let current =
             receipt.ticket.generation == self.policy.generation() && self.settings.enabled;
-        if current && let Some((dir, watcher)) = receipt.recent_setup {
+        let now = self.elapsed_ms();
+        let accepted_setup = receipt.recent_attempt.is_some_and(|attempt| {
+            self.recent_recovery
+                .complete(attempt, receipt.recent_setup.is_some(), now)
+        });
+        if current
+            && accepted_setup
+            && let Some((dir, watcher)) = receipt.recent_setup
+        {
             self.recent_dir = Some(dir);
             self.watcher = Some(watcher);
         }
-        let observations =
-            self.policy
-                .complete(receipt.ticket, receipt.observations, self.elapsed_ms());
+        // A notifier loss can occur while a previous Recent scan is in flight.
+        // Drop only its Recent samples; the same Explorer receipt remains valid.
+        receipt.observations.retain(|observation| {
+            observation.source != ObservationSource::RecentDocuments
+                || (receipt.recent_revision == self.recent_recovery.revision()
+                    && self.recent_recovery.ready())
+        });
+        let observations = self
+            .policy
+            .complete(receipt.ticket, receipt.observations, now);
         if current && let Some(message) = receipt.error {
             self.report(format!("常用路径观察暂不可用：{message}"));
         }
