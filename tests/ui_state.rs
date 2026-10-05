@@ -263,3 +263,28 @@ fn held_enter_cannot_activate_new_content_after_a_function_clears_the_query() {
     ui.composing = true;
     assert_eq!(ui.key_down(PanelKey::Enter, true), KeyAction::NativeInput);
 }
+
+#[test]
+fn same_target_background_refresh_preserves_action_but_selection_change_revokes_it() {
+    let mut state = UiState::default();
+    state.visible = true;
+    state.replace_ids(vec!["a".into(), "b".into()]);
+    assert!(state.begin_action(77));
+    let query = state.next_refresh_request();
+    state.replace_ids(vec!["a".into(), "b".into()]);
+    assert!(state.is_current(query));
+    assert!(state.action_current(77));
+    state.select(1);
+    assert!(!state.action_current(77));
+}
+
+#[test]
+fn removed_target_invalidates_action_before_selection_is_replaced() {
+    let mut state = UiState::default();
+    state.visible = true;
+    state.replace_ids(vec!["a".into(), "b".into()]);
+    assert!(state.begin_action(77));
+    state.replace_ids(vec!["b".into()]);
+    assert_eq!(state.selected_id(), Some("b"));
+    assert!(!state.action_current(77));
+}

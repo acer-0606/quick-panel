@@ -1,6 +1,7 @@
 //! Shared data, persistence and search for the native Windows panel.
 pub mod ai;
 pub mod ai_jobs;
+pub mod background_job;
 pub mod claude;
 pub mod clipboard_formats;
 pub mod connection_test;
@@ -12,6 +13,7 @@ pub mod model;
 pub mod palette;
 #[cfg(windows)]
 pub mod platform;
+pub mod preview;
 pub mod query_feedback;
 pub mod repository;
 pub mod search;

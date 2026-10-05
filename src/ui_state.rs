@@ -60,6 +60,9 @@ impl UiState {
     pub fn replace_ids(&mut self, ids: Vec<String>) {
         let previous = self.selected_index().unwrap_or(0);
         if !self.selected.as_ref().is_some_and(|id| ids.contains(id)) {
+            if self.selected.is_some() {
+                self.target_changed();
+            }
             self.selected = ids.get(previous.min(ids.len().saturating_sub(1))).cloned();
         }
         self.ids = ids;
@@ -163,10 +166,14 @@ impl UiState {
         self.target_changed();
         self.visible = false;
     }
-    pub fn next_request(&mut self) -> u64 {
-        self.target_changed();
+    /// Refresh the same query and scope without invalidating the selected action.
+    pub fn next_refresh_request(&mut self) -> u64 {
         self.request_id = self.request_id.wrapping_add(1);
         self.request_id
+    }
+    pub fn next_request(&mut self) -> u64 {
+        self.target_changed();
+        self.next_refresh_request()
     }
     pub fn is_current(&self, request_id: u64) -> bool {
         self.request_id == request_id

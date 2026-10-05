@@ -3,6 +3,7 @@ pub mod ai_client;
 mod ai_time;
 pub mod clipboard;
 mod dialogs;
+pub mod images;
 mod theme;
 mod ui;
 pub use ui::run;

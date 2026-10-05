@@ -4,6 +4,7 @@ use crate::{
         validate_representations,
     },
     model::{ClipboardSnapshot, Representation, StoredItem},
+    preview::capture_format,
 };
 use std::{
     thread,
@@ -83,7 +84,20 @@ impl Drop for LockedGlobal {
 }
 
 struct OwnedGlobal(Option<HGLOBAL>);
+/// Exclusively owned movable HGLOBAL; no lock or borrowed pointer crosses threads.
+unsafe impl Send for OwnedGlobal {}
+pub struct PreparedCompatibility(OwnedGlobal);
 impl OwnedGlobal {
+    fn filled(size: usize, fill: &dyn Fn(&mut [u8]) -> Result<(), String>) -> Result<Self, String> {
+        let global = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size) }
+            .map_err(|err| format!("无法分配剪贴板内存：{err}"))?;
+        let owned = Self(Some(global));
+        {
+            let lock = LockedGlobal::new(global)?;
+            fill(unsafe { std::slice::from_raw_parts_mut(lock.1.cast(), size) })?;
+        }
+        Ok(owned)
+    }
     fn copy_from(bytes: &[u8]) -> Result<Self, String> {
         let global = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes.len()) }
             .map_err(|err| format!("无法分配剪贴板内存：{err}"))?;
@@ -274,6 +288,7 @@ fn capture_locked(
     let mut representations = Vec::new();
     let mut total = 0usize;
     let mut text = String::new();
+    let mut readable_png = false;
     // Prefer descriptive formats on restore; keep all supported representations byte-for-byte.
     for name in [
         "HTML Format",
@@ -296,10 +311,10 @@ fn capture_locked(
         if length == 0 {
             return Err(format!("剪贴板格式{name}不是可复制的全局内存"));
         }
-        total = total.checked_add(length).ok_or("剪贴板数据大小溢出")?;
-        if total > limit {
-            return Err("剪贴板内容超过8 MiB或配置上限，未记录".into());
+        if !capture_format(name, length, total, limit, readable_png)? {
+            continue;
         }
+        total += length;
         let mut data = Vec::new();
         data.try_reserve_exact(length)
             .map_err(|_| "无法为剪贴板数据分配内存")?;
@@ -315,6 +330,9 @@ fn capture_locked(
         // Validate DROPFILES bounds/terminators before passing the foreign HGLOBAL to the Shell decoder.
         if name == "CF_HDROP" {
             validate_representations(std::slice::from_ref(&representation), limit)?;
+        }
+        if name == "PNG" {
+            readable_png = super::images::png_is_readable(&representation);
         }
         let data = &representation.data;
         if name == "CF_UNICODETEXT" {
@@ -364,6 +382,35 @@ fn capture_locked(
 }
 
 pub fn restore(owner: HWND, item: &StoredItem, plain_text: bool) -> Result<(), String> {
+    restore_prepared(owner, item, plain_text, None)
+}
+
+pub fn prepare_compatibility(item: &StoredItem, plain_text: bool) -> Option<PreparedCompatibility> {
+    if plain_text
+        || item
+            .representations
+            .iter()
+            .any(|r| matches!(r.format.as_str(), "CF_DIB" | "CF_DIBV5"))
+    {
+        return None;
+    }
+    item.representations
+        .iter()
+        .find(|r| r.format == "PNG")
+        .and_then(|r| {
+            super::images::png_dib_writer(r, |size, fill| {
+                OwnedGlobal::filled(size, fill).map(PreparedCompatibility)
+            })
+            .ok()
+        })
+}
+
+pub fn restore_prepared(
+    owner: HWND,
+    item: &StoredItem,
+    plain_text: bool,
+    dib: Option<PreparedCompatibility>,
+) -> Result<(), String> {
     if !unsafe { IsWindow(Some(owner)) }.as_bool() {
         return Err("剪贴板所属窗口已失效".into());
     }
@@ -407,6 +454,9 @@ pub fn restore(owner: HWND, item: &StoredItem, plain_text: bool) -> Result<(), S
             format_id(&representation.format)?,
             OwnedGlobal::copy_from(&representation.data)?,
         ));
+    }
+    if !plain_text && let Some(dib) = dib {
+        allocations.push((CF_DIB, dib.0));
     }
     let _clipboard = ClipboardGuard::open(owner)?;
     unsafe { EmptyClipboard() }.map_err(|err| format!("清空剪贴板失败：{err}"))?;

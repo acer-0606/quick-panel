@@ -74,7 +74,7 @@ impl Default for Context {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionResult {
     pub action: Function,
     pub title: &'static str,
@@ -82,7 +82,7 @@ pub struct FunctionResult {
     score: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Entry {
     Function(FunctionResult),
     Saved(ItemSummary),

@@ -1,4 +1,4 @@
-use crate::model::StoredItem;
+use crate::{background_job::ActionTicket, model::StoredItem};
 use windows::{
     Win32::{
         Foundation::RPC_E_CHANGED_MODE,
@@ -55,7 +55,11 @@ fn quote_argument(value: &str) -> String {
     result
 }
 
-pub fn open_target(item: &StoredItem) -> Result<(), String> {
+pub fn open_target(item: &StoredItem, ticket: &ActionTicket) -> Result<bool, String> {
+    let _com = ComGuard::new()?;
+    if !ticket.current() {
+        return Ok(false);
+    }
     let path = target(item)?;
     let application = item
         .open_with
@@ -65,6 +69,9 @@ pub fn open_target(item: &StoredItem) -> Result<(), String> {
     let parameters = application
         .map(|_| wide(&quote_argument(path)))
         .transpose()?;
+    if !ticket.commit() {
+        return Ok(false);
+    }
     // ShellExecute's documented result is an HINSTANCE-typed status: >32 means success.
     let status = unsafe {
         ShellExecuteW(
@@ -80,7 +87,7 @@ pub fn open_target(item: &StoredItem) -> Result<(), String> {
     }
     .0 as isize;
     if status > 32 {
-        Ok(())
+        Ok(true)
     } else {
         Err(format!("打开目标失败（Shell错误{status}）"))
     }
@@ -119,7 +126,10 @@ impl Drop for Pidl {
     }
 }
 
-pub fn reveal_target(item: &StoredItem) -> Result<(), String> {
+pub fn reveal_target(item: &StoredItem, ticket: &ActionTicket) -> Result<bool, String> {
+    if !ticket.current() {
+        return Ok(false);
+    }
     let path = wide(target(item)?)?;
     let _com = ComGuard::new()?;
     let mut pointer = std::ptr::null_mut();
@@ -134,11 +144,16 @@ pub fn reveal_target(item: &StoredItem) -> Result<(), String> {
         return Err("无法分配Shell路径内存".into());
     }
     let last = unsafe { ILFindLastID(full.0) };
+    if !ticket.commit() {
+        return Ok(false);
+    }
     let result = if unsafe { ILRemoveLastID(Some(parent.0)) }.as_bool() {
         unsafe { SHOpenFolderAndSelectItems(parent.0, Some(&[last.cast_const()]), 0) }
     } else {
         // A namespace root has no parent: open that root directly.
         unsafe { SHOpenFolderAndSelectItems(full.0, None, 0) }
     };
-    result.map_err(|err| format!("在资源管理器中定位失败：{err}"))
+    result
+        .map(|()| true)
+        .map_err(|err| format!("在资源管理器中定位失败：{err}"))
 }

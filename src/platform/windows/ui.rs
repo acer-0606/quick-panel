@@ -2,16 +2,19 @@
 use super::{
     actions, ai_client, ai_time, clipboard,
     dialogs::{self, wide},
+    images::{self, Image},
     theme,
 };
 use crate::{
     ai::{AiPlan, AiSettings, AuthMethod},
     ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
+    background_job::{ActionLoads, ActionPermit, ActionTicket, BackgroundWorker},
     embedding_jobs::{EmbeddingRequest, EmbeddingWorker},
     engine::Engine,
     hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
     model::*,
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
+    preview::{PreviewLoads, bounded_text},
     query_feedback::{IndexReply, QueryReply, claude_reply, embedding_reply, index_reply},
     semantic::{self, EmbeddingSettings, IndexScope},
     semantic_ui::{
@@ -25,17 +28,13 @@ use std::{
     collections::VecDeque,
     path::Path,
     rc::Rc,
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::{Gdi::*, Imaging::*},
+        Graphics::Gdi::*,
         System::{Com::*, DataExchange::*, LibraryLoader::GetModuleHandleW},
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
     },
@@ -81,38 +80,142 @@ enum Action {
     CopyPath,
     Preview,
 }
-struct Image {
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-}
 enum Work {
     Capture(u32),
     Stop,
 }
 enum Done {
     Captured(Result<Option<ClipboardSnapshot>, String>),
-    Preview(u64, Result<Image, String>),
 }
-struct PreviewQueue {
-    job: Mutex<Option<(u64, StoredItem)>>,
-    wake: Condvar,
-    generation: AtomicU64,
-    stop: AtomicBool,
+type PendingPaste = (
+    u64,
+    StoredItem,
+    Action,
+    HWND,
+    Option<clipboard::PreparedCompatibility>,
+);
+struct PreviewResult {
+    generation: u64,
+    text: String,
+    image: Option<Result<Image, String>>,
 }
-impl PreviewQueue {
-    fn replace(&self, id: u64, item: StoredItem) {
-        self.generation.store(id, Ordering::Release);
-        if let Ok(mut job) = self.job.lock() {
-            *job = Some((id, item));
-            self.wake.notify_one();
+enum NativeJob {
+    Action {
+        item: StoredItem,
+        action: Action,
+        ticket: ActionTicket,
+    },
+    Paths {
+        item: Option<StoredItem>,
+        paths: Vec<String>,
+        ticket: ActionTicket,
+    },
+}
+enum NativeResult {
+    Action {
+        item: StoredItem,
+        action: Action,
+        ticket: ActionTicket,
+        dib: Option<clipboard::PreparedCompatibility>,
+        result: Result<bool, String>,
+        missing: bool,
+    },
+    Paths {
+        item: Option<StoredItem>,
+        paths: Vec<(String, ItemKind)>,
+        ticket: ActionTicket,
+    },
+}
+fn native_job(job: NativeJob) -> NativeResult {
+    match job {
+        NativeJob::Action {
+            item,
+            action,
+            ticket,
+        } => {
+            let mut dib = None;
+            let result = if !ticket.current() {
+                Ok(false)
+            } else {
+                match action {
+                    Action::Open(_) if item.summary.kind != ItemKind::Clipboard => {
+                        actions::open_target(&item, &ticket)
+                    }
+                    Action::Reveal => actions::reveal_target(&item, &ticket),
+                    Action::Open(plain) | Action::Copy(plain) => {
+                        dib = clipboard::prepare_compatibility(&item, plain);
+                        Ok(false)
+                    }
+                    _ => Ok(false),
+                }
+            };
+            let missing = result.is_err()
+                && ticket.current()
+                && item
+                    .target
+                    .as_ref()
+                    .is_some_and(|p| std::fs::metadata(p).is_err());
+            NativeResult::Action {
+                item,
+                action,
+                ticket,
+                dib,
+                result,
+                missing,
+            }
+        }
+        NativeJob::Paths {
+            item,
+            paths,
+            ticket,
+        } => {
+            let paths = paths
+                .into_iter()
+                .map(|path| {
+                    let kind = if std::fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+                        ItemKind::Folder
+                    } else {
+                        ItemKind::Document
+                    };
+                    (path, kind)
+                })
+                .collect();
+            NativeResult::Paths {
+                item,
+                paths,
+                ticket,
+            }
         }
     }
-    fn cancel(&self, id: u64) {
-        self.generation.store(id, Ordering::Release);
-        if let Ok(mut job) = self.job.lock() {
-            *job = None;
-        }
+}
+fn prepare_preview((generation, item): (u64, StoredItem)) -> PreviewResult {
+    let text = if item.summary.kind == ItemKind::Clipboard {
+        bounded_text(&item.text)
+    } else {
+        let path = item.target.as_deref().unwrap_or_default();
+        bounded_text(&format!(
+            "{}\n\n{}\n\n{}",
+            item.summary.title,
+            path,
+            match std::fs::metadata(path) {
+                Ok(m) => format!(
+                    "大小：{} 字节\n标签：{}",
+                    m.len(),
+                    item.summary.tags.join("、")
+                ),
+                Err(_) => "目标已失效 · Ctrl+K → 重新定位".into(),
+            }
+        ))
+    };
+    let image = item
+        .representations
+        .iter()
+        .any(|r| matches!(r.format.as_str(), "PNG" | "CF_DIB" | "CF_DIBV5"))
+        .then(|| images::preview(&item));
+    PreviewResult {
+        generation,
+        text,
+        image,
     }
 }
 #[derive(Clone)]
@@ -293,119 +396,26 @@ struct App {
     scope: Scope,
     target: HWND,
     load_id: u64,
+    action_loads: ActionLoads,
     pending_action: Option<(u64, Action)>,
-    pending_paste: Option<(u64, StoredItem, Action, HWND)>,
+    pending_paste: Option<PendingPaste>,
     preview_id: u64,
     preview_open: bool,
+    preview_loading: bool,
     image: Option<Arc<Image>>,
     tx: mpsc::Sender<Work>,
     rx: mpsc::Receiver<Done>,
     capture_worker: Option<std::thread::JoinHandle<()>>,
-    preview_queue: Arc<PreviewQueue>,
-    preview_worker: Option<std::thread::JoinHandle<()>>,
+    preview_loads: PreviewLoads,
+    preview_worker: Option<BackgroundWorker<(u64, StoredItem), PreviewResult>>,
+    action_worker: Option<BackgroundWorker<NativeJob, NativeResult>>,
+    action_permit: ActionPermit,
     dpi: u32,
     suppress_sequence: Option<u32>,
     last_capture_sequence: u32,
 }
 unsafe fn post(handle: usize, msg: u32) {
     let _ = PostMessageW(Some(HWND(handle as *mut _)), msg, WPARAM(0), LPARAM(0));
-}
-unsafe fn decode(item: &StoredItem, id: u64, generation: &AtomicU64) -> Result<Image, String> {
-    if generation.load(Ordering::Acquire) != id {
-        return Err("预览已取消".into());
-    }
-    let rep = item
-        .representations
-        .iter()
-        .find(|r| r.format == "PNG")
-        .or_else(|| {
-            item.representations
-                .iter()
-                .find(|r| r.format == "CF_DIBV5" || r.format == "CF_DIB")
-        })
-        .ok_or("该记录没有可解码的图片")?;
-    let mut data = rep.data.clone();
-    if rep.format != "PNG" {
-        if data.len() < 40 {
-            return Err("图片数据不完整".into());
-        }
-        let u32at = |n: usize| u32::from_le_bytes(data[n..n + 4].try_into().unwrap());
-        let header = u32at(0) as usize;
-        let bpp = u16::from_le_bytes(data[14..16].try_into().unwrap());
-        let compression = u32at(16);
-        let colors = u32at(32) as usize;
-        let palette = if bpp <= 8 {
-            if colors == 0 { 1usize << bpp } else { colors }
-        } else {
-            colors
-        };
-        let offset = 14usize
-            .checked_add(header)
-            .and_then(|v| v.checked_add(palette * 4))
-            .and_then(|v| {
-                v.checked_add(if header == 40 && compression == 3 {
-                    12
-                } else {
-                    0
-                })
-            })
-            .ok_or("图片尺寸溢出")?;
-        if offset > data.len() + 14 {
-            return Err("图片头无效".into());
-        }
-        let mut bmp = Vec::with_capacity(data.len() + 14);
-        bmp.extend_from_slice(b"BM");
-        bmp.extend_from_slice(&((data.len() + 14) as u32).to_le_bytes());
-        bmp.extend_from_slice(&[0; 4]);
-        bmp.extend_from_slice(&(offset as u32).to_le_bytes());
-        bmp.append(&mut data);
-        data = bmp;
-    }
-    let factory: IWICImagingFactory =
-        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
-            .map_err(|e| e.to_string())?;
-    let stream = factory.CreateStream().map_err(|e| e.to_string())?;
-    stream
-        .InitializeFromMemory(&data)
-        .map_err(|e| e.to_string())?;
-    let decoder = factory
-        .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
-        .map_err(|e| e.to_string())?;
-    let frame = decoder.GetFrame(0).map_err(|e| e.to_string())?;
-    let (mut width, mut height) = (0, 0);
-    frame
-        .GetSize(&mut width, &mut height)
-        .map_err(|e| e.to_string())?;
-    let bytes = (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|n| n.checked_mul(4))
-        .ok_or("图片尺寸溢出")?;
-    if bytes > 16 * 1024 * 1024 || width == 0 || height == 0 {
-        return Err("图片解码超过16 MiB预算；仍可复制原图".into());
-    }
-    let converter = factory.CreateFormatConverter().map_err(|e| e.to_string())?;
-    converter
-        .Initialize(
-            &frame,
-            &GUID_WICPixelFormat32bppBGRA,
-            WICBitmapDitherTypeNone,
-            None,
-            0.0,
-            WICBitmapPaletteTypeCustom,
-        )
-        .map_err(|e| e.to_string())?;
-    if generation.load(Ordering::Acquire) != id {
-        return Err("预览已取消".into());
-    }
-    let mut pixels = vec![0; bytes];
-    converter
-        .CopyPixels(std::ptr::null(), width * 4, &mut pixels)
-        .map_err(|e| e.to_string())?;
-    Ok(Image {
-        width,
-        height,
-        pixels,
-    })
 }
 pub fn run() -> Result<(), String> {
     unsafe {
@@ -462,21 +472,20 @@ pub fn run() -> Result<(), String> {
             scope: Scope::All,
             target: HWND::default(),
             load_id: 0,
+            action_loads: ActionLoads::default(),
             pending_action: None,
             pending_paste: None,
             preview_id: 0,
             preview_open: false,
+            preview_loading: false,
             image: None,
             tx,
             rx,
             capture_worker: None,
-            preview_queue: Arc::new(PreviewQueue {
-                job: Mutex::new(None),
-                wake: Condvar::new(),
-                generation: AtomicU64::new(0),
-                stop: AtomicBool::new(false),
-            }),
+            preview_loads: PreviewLoads::default(),
             preview_worker: None,
+            action_worker: None,
+            action_permit: ActionPermit::default(),
             dpi: 96,
             suppress_sequence: None,
             last_capture_sequence: 0,
@@ -549,37 +558,9 @@ pub fn run() -> Result<(), String> {
             }
             CoUninitialize();
         }));
-        let preview_queue = app.preview_queue.clone();
-        app.preview_worker = Some(std::thread::spawn(move || {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            loop {
-                let mut slot = match preview_queue.job.lock() {
-                    Ok(slot) => slot,
-                    Err(_) => break,
-                };
-                while slot.is_none() && !preview_queue.stop.load(Ordering::Acquire) {
-                    slot = match preview_queue.wake.wait(slot) {
-                        Ok(slot) => slot,
-                        Err(_) => return,
-                    };
-                }
-                if preview_queue.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let Some((id, item)) = slot.take() else {
-                    continue;
-                };
-                drop(slot);
-                let result = decode(&item, id, &preview_queue.generation);
-                if id == preview_queue.generation.load(Ordering::Acquire) {
-                    if done_tx.send(Done::Preview(id, result)).is_err() {
-                        break;
-                    }
-                    post(handle, WORK_WAKE);
-                }
-            }
-            CoUninitialize();
-        }));
+        let notify = Arc::new(move || post(handle, WORK_WAKE));
+        app.preview_worker = Some(BackgroundWorker::new(prepare_preview, notify.clone()));
+        app.action_worker = Some(BackgroundWorker::new(native_job, notify));
         AddClipboardFormatListener(hwnd).map_err(|e| e.to_string())?;
         app.tray(NIM_ADD);
         DragAcceptFiles(hwnd, true);
@@ -608,11 +589,9 @@ pub fn run() -> Result<(), String> {
         if let Some(worker) = app.capture_worker.take() {
             let _ = worker.join();
         }
-        app.preview_queue.stop.store(true, Ordering::Release);
-        app.preview_queue.wake.notify_all();
-        if let Some(worker) = app.preview_worker.take() {
-            let _ = worker.join();
-        }
+        app.action_permit.cancel();
+        app.preview_worker.take();
+        app.action_worker.take();
         CoUninitialize();
         Ok(())
     }
@@ -633,6 +612,7 @@ impl App {
         }
     }
     fn cancel_actions(&mut self) {
+        self.action_permit.cancel();
         self.load_id = self.load_id.wrapping_add(1);
         self.pending_action = None;
         self.pending_paste = None;
@@ -1055,7 +1035,11 @@ impl App {
         self.load_id = self.load_id.wrapping_add(1);
         self.preview_id = self.load_id;
         self.image = None;
-        self.preview_queue.cancel(self.preview_id);
+        self.preview_loading = false;
+        self.preview_loads.cancel();
+        if let Some(worker) = &self.preview_worker {
+            worker.cancel_pending();
+        }
         self.sync_render();
         let _ = SetWindowTextW(self.preview, w!(""));
         let _ = InvalidateRect(Some(self.preview), None, true);
@@ -1133,7 +1117,14 @@ impl App {
             WINDOW_STYLE::default(),
             109,
         )?;
-        self.preview = self.control(w!("STATIC"), "", WINDOW_STYLE(0), 110)?;
+        self.preview = self.control(
+            w!("EDIT"),
+            "",
+            WS_TABSTOP
+                | WS_VSCROLL
+                | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+            112,
+        )?;
         self.ai_button = self.control(w!("BUTTON"), "按意思查找", WS_TABSTOP, AI_FIND)?;
         self.semantic_button = self.control(w!("BUTTON"), "语义查找", WS_TABSTOP, SEMANTIC_FIND)?;
         let _ = ShowWindow(self.preview, SW_HIDE);
@@ -1399,6 +1390,9 @@ impl App {
         );
         let _ = SetForegroundWindow(self.hwnd);
         let _ = SetFocus(Some(self.edit));
+        if update_target && !own_window {
+            SendMessageW(self.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+        }
         self.search();
     }
     unsafe fn hide(&mut self) {
@@ -1413,7 +1407,6 @@ impl App {
         if self.state.lifecycle != Lifecycle::Running {
             return;
         }
-        self.cancel_actions();
         let current = match self.scope {
             Scope::All => 0,
             Scope::Clipboard => 1,
@@ -1447,6 +1440,8 @@ impl App {
             let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
         }
         if query != self.query || self.scope != self.result_scope {
+            self.cancel_actions();
+            self.clear_preview();
             self.cancel_ai();
             self.cancel_semantic();
             self.saved_items.clear();
@@ -1454,7 +1449,7 @@ impl App {
         }
         self.query = query;
         self.result_scope = self.scope;
-        let id = self.state.next_request();
+        let id = self.state.next_refresh_request();
         if let Some(query) = self.semantic_query.local_query(id) {
             self.rebuild_results();
             self.send(Command::SemanticSearch(query));
@@ -1502,19 +1497,45 @@ impl App {
             embedding_enabled: self.settings.embedding.enabled,
             indexing: self.semantic_index.active(),
         };
-        self.items = if let Some(plan) = self.ai_plan.as_ref() {
+        let items = if let Some(plan) = self.ai_plan.as_ref() {
             palette::ai_results(plan, self.saved_items.clone(), context)
         } else if self.semantic_query.adopted() {
             palette::semantic_results(&self.query, self.saved_items.clone(), context)
         } else {
             palette::results(&self.query, self.saved_items.clone(), context)
         };
+        if self.items == items {
+            self.selection();
+            return;
+        }
+        let selected_content = self
+            .state
+            .selected_index()
+            .and_then(|i| self.items.get(i))
+            .and_then(PaletteEntry::saved)
+            .cloned();
+        let top_index = SendMessageW(self.list, LB_GETTOPINDEX, None, None).0.max(0) as usize;
+        let top_id = self.items.get(top_index).map(|e| e.id().to_owned());
+        self.items = items;
+        let selected_before = self.state.selected_id().map(str::to_owned);
         self.state.replace_ids(
             self.items
                 .iter()
                 .map(|entry| entry.id().to_owned())
                 .collect(),
         );
+        let current_content = self
+            .state
+            .selected_index()
+            .and_then(|i| self.items.get(i))
+            .and_then(PaletteEntry::saved);
+        let version_changed = selected_content
+            .as_ref()
+            .zip(current_content)
+            .is_some_and(|(old, next)| !crate::preview::same_content_version(old, next));
+        if selected_before.as_deref() != self.state.selected_id() || version_changed {
+            self.cancel_actions();
+        }
         self.sync_render();
         SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
         SendMessageW(self.list, LB_RESETCONTENT, None, None);
@@ -1530,6 +1551,10 @@ impl App {
         if let Some(index) = self.state.selected_index() {
             SendMessageW(self.list, LB_SETCURSEL, Some(WPARAM(index)), None);
         }
+        let top = top_id
+            .and_then(|id| self.items.iter().position(|e| e.id() == id))
+            .unwrap_or(top_index.min(self.items.len().saturating_sub(1)));
+        SendMessageW(self.list, LB_SETTOPINDEX, Some(WPARAM(top)), None);
         SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
         let _ = InvalidateRect(Some(self.list), None, true);
         self.selection();
@@ -1550,6 +1575,100 @@ impl App {
     unsafe fn work_done(&mut self) {
         self.ai_done();
         self.embedding_done();
+        if let Some(result) = self
+            .preview_worker
+            .as_ref()
+            .and_then(BackgroundWorker::try_result)
+            && result.generation == self.preview_id
+            && self.state.visible
+            && self.state.lifecycle == Lifecycle::Running
+        {
+            self.image = None;
+            self.preview_loading = false;
+            let mut text = result.text;
+            if let Some(image) = result.image {
+                match image {
+                    Ok(image) => {
+                        self.status(&format!(
+                            "图片：{} × {} · ↑↓ 选择 · Enter 粘贴",
+                            image.source_width, image.source_height
+                        ));
+                        self.image = Some(Arc::new(image));
+                    }
+                    Err(error) => {
+                        text = error;
+                        self.status("图片预览不可用；仍可复制原图");
+                    }
+                }
+            }
+            self.sync_render();
+            let text = wide(&text);
+            let _ = SetWindowTextW(self.preview, PCWSTR(text.as_ptr()));
+            let _ = InvalidateRect(Some(self.preview), None, true);
+        }
+        if let Some(result) = self
+            .action_worker
+            .as_ref()
+            .and_then(BackgroundWorker::try_result)
+        {
+            match result {
+                NativeResult::Action {
+                    item,
+                    action,
+                    ticket,
+                    dib,
+                    result,
+                    missing,
+                } => {
+                    let id = ticket.generation;
+                    let shell = matches!(action, Action::Reveal)
+                        || matches!(action, Action::Open(_))
+                            && item.summary.kind != ItemKind::Clipboard;
+                    // Shell has already changed foreground; a successful launch still earns its receipt.
+                    if shell && matches!(result, Ok(true)) {
+                        self.send(Command::Used(item.summary.id.clone()));
+                    }
+                    if GetForegroundWindow() == self.hwnd && self.state.action_current(id) {
+                        if shell {
+                            self.state.finish_action(id);
+                            if let Err(error) = result {
+                                self.status(&error);
+                                if missing && matches!(action, Action::Open(_)) {
+                                    self.perform(item, Action::Relink);
+                                }
+                            }
+                        } else if matches!(action, Action::Open(_)) {
+                            self.pending_paste = Some((id, item, action, self.target, dib));
+                            self.release_paste();
+                        } else if ticket.commit()
+                            && self.state.finish_action(id)
+                            && let Action::Copy(plain) = action
+                        {
+                            let result = clipboard::restore_prepared(self.hwnd, &item, plain, dib);
+                            self.suppress_sequence = Some(clipboard::sequence_number());
+                            match result {
+                                Ok(()) => self.status("已复制"),
+                                Err(error) => self.status(&error),
+                            }
+                        }
+                    }
+                }
+                NativeResult::Paths {
+                    item,
+                    paths,
+                    ticket,
+                } => {
+                    if GetForegroundWindow() == self.hwnd
+                        && self.state.action_current(ticket.generation)
+                        && self.state.finish_action(ticket.generation)
+                    {
+                        for (path, kind) in paths {
+                            self.favorite_form(item.clone(), Some(path), kind);
+                        }
+                    }
+                }
+            }
+        }
         while let Ok(done) = self.rx.try_recv() {
             match done {
                 Done::Captured(result) => {
@@ -1560,22 +1679,6 @@ impl App {
                     }
                     if self.state.capture_completed() {
                         self.send(Command::Shutdown);
-                    }
-                }
-                Done::Preview(id, result) => {
-                    if id == self.preview_id && self.preview_open && self.state.visible {
-                        match result {
-                            Ok(image) => {
-                                self.image = Some(Arc::new(image));
-                                self.sync_render();
-                                let _ = SetWindowTextW(self.preview, w!(""));
-                            }
-                            Err(e) => {
-                                let text = wide(&e);
-                                let _ = SetWindowTextW(self.preview, PCWSTR(text.as_ptr()));
-                            }
-                        }
-                        let _ = InvalidateRect(Some(self.preview), None, true);
                     }
                 }
             }
@@ -1622,37 +1725,47 @@ impl App {
                     }
                 }
                 Event::Loaded { request_id, item } => {
-                    if let Some(item) = item {
-                        if self
-                            .pending_action
-                            .as_ref()
-                            .is_some_and(|(id, _)| *id == request_id)
+                    self.action_loads.complete(request_id);
+                    let (preview_current, next) = self.preview_loads.complete(request_id);
+                    if let Some((request_id, summary)) = next {
+                        self.send(Command::Load {
+                            id: summary.id,
+                            request_id,
+                        });
+                    }
+                    if self
+                        .pending_action
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == request_id)
+                    {
+                        if GetForegroundWindow() == self.hwnd
+                            && self.state.action_current(request_id)
                         {
-                            if GetForegroundWindow() == self.hwnd
-                                && self.state.action_current(request_id)
-                            {
-                                if let Some((_, action)) = self.pending_action.take() {
-                                    if matches!(action, Action::Open(_))
-                                        && item.summary.kind == ItemKind::Clipboard
+                            if let Some((_, action)) = self.pending_action.take() {
+                                if let Some(item) = item {
+                                    if matches!(
+                                        action,
+                                        Action::Open(_) | Action::Copy(_) | Action::Reveal
+                                    ) && (item.summary.kind == ItemKind::Clipboard
+                                        || !matches!(action, Action::Copy(_)))
                                     {
-                                        self.pending_paste =
-                                            Some((request_id, item, action, self.target));
-                                        self.release_paste();
+                                        self.start_native(item, action, request_id);
                                     } else if self.state.finish_action(request_id) {
                                         self.perform(item, action);
                                     }
+                                } else {
+                                    self.state.finish_action(request_id);
                                 }
-                            } else {
-                                self.cancel_actions();
                             }
-                        } else if self.state.visible
-                            && self.state.lifecycle == Lifecycle::Running
-                            && !self.state.modal_open
-                            && self.preview_open
-                            && request_id == self.preview_id
-                        {
-                            self.perform(item, Action::Preview);
+                        } else {
+                            self.cancel_actions();
                         }
+                    } else if preview_current
+                        && self.state.visible
+                        && self.state.lifecycle == Lifecycle::Running
+                        && let Some(item) = item
+                    {
+                        self.perform(item, Action::Preview);
                     }
                 }
                 Event::Changed => {
@@ -1686,19 +1799,25 @@ impl App {
         }
     }
     unsafe fn selection(&mut self) {
-        self.cancel_actions();
-        self.clear_preview();
+        let previous = self.state.selected_id().map(str::to_owned);
         let i = SendMessageW(self.list, LB_GETCURSEL, None, None).0;
         if i >= 0 {
             self.state.select(i as usize);
         } else {
             self.state.select(usize::MAX);
+            if previous.is_some() {
+                self.cancel_actions();
+                self.clear_preview();
+            }
             self.status(if self.saved_ready {
                 "没有匹配结果 · 可换个关键词或添加收藏"
             } else {
                 "正在检索保存内容…"
             });
             return;
+        }
+        if previous.as_deref() != self.state.selected_id() {
+            self.cancel_actions();
         }
         let selected = self.items.get(i as usize);
         let function = selected.is_some_and(|entry| entry.function().is_some());
@@ -1712,8 +1831,15 @@ impl App {
         } else {
             "Enter 打开 · Esc 关闭 · 右键更多"
         });
-        if self.preview_open && !function {
-            self.request(Action::Preview);
+        if self.preview_open {
+            if function {
+                self.clear_preview();
+            } else {
+                self.request(Action::Preview);
+            }
+        }
+        if self.preview_open && self.preview_loading {
+            self.status("正在加载所选内容预览…");
         }
         if self.ai_gate.busy() {
             self.status("AI 正在理解查询…可点击取消 AI");
@@ -1738,27 +1864,67 @@ impl App {
             return;
         }
         if let Some(id) = self.state.selected_id().map(str::to_owned) {
-            self.load_id = self.load_id.wrapping_add(1);
             if matches!(action, Action::Preview) {
-                self.preview_id = self.load_id;
-                self.image = None;
-                self.preview_queue.cancel(self.preview_id);
-                self.sync_render();
-            } else {
-                self.pending_paste = None;
-                if !self.state.begin_action(self.load_id) {
-                    return;
+                let summary = self
+                    .state
+                    .selected_index()
+                    .and_then(|i| self.items.get(i))
+                    .and_then(PaletteEntry::saved)
+                    .cloned();
+                self.load_id = self.load_id.wrapping_add(1);
+                let previous = self.preview_loads.generation();
+                let next = self.preview_loads.select(summary, self.load_id);
+                if self.preview_loads.generation() != previous {
+                    self.preview_id = self.preview_loads.generation();
+                    self.preview_loading = true;
+                    if let Some(worker) = &self.preview_worker {
+                        worker.cancel_pending();
+                    }
+                    self.status("正在加载所选内容预览…");
                 }
-                self.pending_action = Some((self.load_id, action));
+                if let Some((request_id, summary)) = next {
+                    self.send(Command::Load {
+                        id: summary.id,
+                        request_id,
+                    });
+                }
+                return;
             }
+            if self.action_loads.busy()
+                || self.pending_action.is_some()
+                || self.pending_paste.is_some()
+                || self
+                    .action_worker
+                    .as_ref()
+                    .is_some_and(BackgroundWorker::busy)
+            {
+                return;
+            }
+            self.load_id = self.load_id.wrapping_add(1);
+            if !self.state.begin_action(self.load_id) || !self.action_loads.begin(self.load_id) {
+                return;
+            }
+            self.pending_action = Some((self.load_id, action));
             self.send(Command::Load {
                 id,
                 request_id: self.load_id,
             });
         }
     }
+    fn start_native(&mut self, item: StoredItem, action: Action, id: u64) {
+        let ticket = self.action_permit.begin(id);
+        if !self.action_worker.as_ref().is_some_and(|w| {
+            w.submit(NativeJob::Action {
+                item,
+                action,
+                ticket,
+            })
+        }) {
+            self.cancel_actions();
+        }
+    }
     unsafe fn release_paste(&mut self) {
-        let Some((request_id, _, _, target)) = self.pending_paste.as_ref() else {
+        let Some((request_id, _, _, target, _)) = self.pending_paste.as_ref() else {
             return;
         };
         if self.target != *target
@@ -1774,58 +1940,35 @@ impl App {
             .into_iter()
             .any(|key| GetAsyncKeyState(key.0 as i32) < 0);
         if self.state.finish_paste(*request_id, keys_down)
-            && let Some((_, item, action, _)) = self.pending_paste.take()
+            && let Some((_, item, action, _, dib)) = self.pending_paste.take()
+            && let Action::Open(plain) = action
         {
-            self.perform(item, action);
+            let result = clipboard::restore_prepared(self.hwnd, &item, plain, dib);
+            self.suppress_sequence = Some(clipboard::sequence_number());
+            match result {
+                Ok(()) => {
+                    self.send(Command::Used(item.summary.id));
+                    let target = self.target;
+                    self.hide();
+                    if let Err(error) = clipboard::paste_to(target) {
+                        self.show_panel(None, false);
+                        self.status(&error);
+                    }
+                }
+                Err(error) => self.status(&error),
+            }
         }
     }
     unsafe fn perform(&mut self, item: StoredItem, action: Action) {
         match action {
-            Action::Open(plain) => {
-                if item.summary.kind == ItemKind::Clipboard {
-                    let result = clipboard::restore(self.hwnd, &item, plain);
-                    self.suppress_sequence = Some(clipboard::sequence_number());
-                    match result {
-                        Ok(()) => {
-                            self.hide();
-                            if let Err(e) = clipboard::paste_to(self.target) {
-                                self.show(None);
-                                self.status(&e);
-                            }
-                        }
-                        Err(e) => self.status(&e),
-                    }
-                } else if let Err(e) = actions::open_target(&item) {
-                    self.status(&e);
-                    if item.target.as_ref().is_some_and(|p| !Path::new(p).exists()) {
-                        self.perform(item, Action::Relink);
-                    }
-                    return;
-                }
-                self.send(Command::Used(item.summary.id));
+            Action::Open(_) | Action::Reveal => { /* Load dispatches these to the guarded worker. */
             }
-            Action::Copy(plain) => {
-                if item.summary.kind != ItemKind::Clipboard {
-                    self.perform(item, Action::CopyPath);
-                    return;
-                }
-                let result = clipboard::restore(self.hwnd, &item, plain);
-                self.suppress_sequence = Some(clipboard::sequence_number());
-                match result {
-                    Ok(()) => self.status("已复制"),
-                    Err(e) => self.status(&e),
-                }
-            }
+            Action::Copy(_) => self.perform(item, Action::CopyPath),
             Action::Pin => self.send(Command::Pin {
                 id: item.summary.id,
                 pinned: !item.summary.pinned,
             }),
             Action::Delete => self.send(Command::Delete(item.summary.id)),
-            Action::Reveal => {
-                if let Err(e) = actions::reveal_target(&item) {
-                    self.status(&e);
-                }
-            }
             Action::CopyPath => {
                 let path = item.target.clone().unwrap_or_default();
                 let mut copied = item;
@@ -1847,47 +1990,51 @@ impl App {
                 });
             }
             Action::Preview => {
-                self.image = None;
-                let text = if item.summary.kind == ItemKind::Clipboard {
-                    item.text.chars().take(6000).collect::<String>()
-                } else {
-                    let path = item.target.clone().unwrap_or_default();
-                    let metadata = std::fs::metadata(&path);
-                    format!(
-                        "{}\n\n{}\n\n{}",
-                        item.summary.title,
-                        path,
-                        match metadata {
-                            Ok(m) => format!(
-                                "大小：{} 字节\n标签：{}",
-                                m.len(),
-                                item.summary.tags.join("、")
-                            ),
-                            Err(_) => "目标已失效 · Ctrl+K → 重新定位".into(),
-                        }
-                    )
-                };
-                let t = wide(&text);
-                let _ = SetWindowTextW(self.preview, PCWSTR(t.as_ptr()));
-                if item
-                    .representations
-                    .iter()
-                    .any(|r| r.format == "PNG" || r.format == "CF_DIB" || r.format == "CF_DIBV5")
-                {
-                    self.status("正在生成图片预览…");
-                    self.preview_queue.replace(self.preview_id, item);
+                if let Some(worker) = &self.preview_worker {
+                    worker.replace((self.preview_id, item));
                 }
             }
         }
     }
     unsafe fn edit_favorite(&mut self, item: Option<StoredItem>, target: Option<String>) {
-        let kind = item.as_ref().map(|i| i.summary.kind).unwrap_or_else(|| {
-            if target.as_ref().is_some_and(|p| Path::new(p).is_dir()) {
-                ItemKind::Folder
-            } else {
-                ItemKind::Document
+        if let Some(kind) = item.as_ref().map(|i| i.summary.kind) {
+            self.favorite_form(item, target, kind);
+        } else if let Some(path) = target {
+            self.classify_paths(item, vec![path]);
+        }
+    }
+    fn classify_paths(&mut self, item: Option<StoredItem>, paths: Vec<String>) {
+        if self
+            .action_worker
+            .as_ref()
+            .is_some_and(BackgroundWorker::busy)
+        {
+            unsafe {
+                self.status("正在处理文件操作，请稍后再试");
             }
-        });
+            return;
+        }
+        self.load_id = self.load_id.wrapping_add(1);
+        if !self.state.begin_action(self.load_id) {
+            return;
+        }
+        let ticket = self.action_permit.begin(self.load_id);
+        if !self.action_worker.as_ref().is_some_and(|w| {
+            w.submit(NativeJob::Paths {
+                item,
+                paths,
+                ticket,
+            })
+        }) {
+            self.cancel_actions();
+        }
+    }
+    unsafe fn favorite_form(
+        &mut self,
+        item: Option<StoredItem>,
+        target: Option<String>,
+        kind: ItemKind,
+    ) {
         if kind == ItemKind::Clipboard {
             self.status("剪贴板记录可固定；文件与文件夹可编辑收藏信息。");
             return;
@@ -2186,7 +2333,6 @@ impl App {
             }
             PREVIEW => {
                 self.preview_open = !self.preview_open;
-                self.clear_preview();
                 let _ = ShowWindow(
                     self.preview,
                     if self.preview_open { SW_SHOW } else { SW_HIDE },
@@ -2197,7 +2343,7 @@ impl App {
                     "预览 ›"
                 });
                 let _ = SetWindowTextW(self.buttons[1], PCWSTR(label.as_ptr()));
-                self.show(None);
+                self.show_panel(None, false);
                 if self.preview_open {
                     self.request(Action::Preview);
                 }
@@ -2352,6 +2498,9 @@ unsafe fn app_message(
             } else {
                 let update_target = app.state.instance_show_updates_target();
                 app.show_panel(None, update_target);
+                if app.state.can_show_panel() {
+                    SendMessageW(app.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+                }
             }
             return Some(LRESULT(0));
         }
@@ -2477,9 +2626,7 @@ unsafe fn app_message(
                 paths.push(String::from_utf16_lossy(&b[..len as usize]));
             }
             DragFinish(drop);
-            for path in paths {
-                app.edit_favorite(None, Some(path));
-            }
+            app.classify_paths(None, paths);
             return Some(LRESULT(0));
         }
         WM_QUERYENDSESSION => return Some(LRESULT(1)),
@@ -2631,8 +2778,29 @@ unsafe extern "system" fn preview_proc(
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
         FillRect(dc, &r, render.brush);
+        let caption_height = render.s(28);
+        let mut caption = wide(&format!(
+            "原图：{} × {}",
+            image.source_width, image.source_height
+        ));
+        let mut caption_rect = RECT {
+            left: render.s(8),
+            top: render.s(4),
+            right: r.right - render.s(8),
+            bottom: caption_height,
+        };
+        let previous_font = SelectObject(dc, render.font.into());
+        SetTextColor(dc, theme::palette(render.theme).muted);
+        SetBkMode(dc, TRANSPARENT);
+        DrawTextW(
+            dc,
+            &mut caption,
+            &mut caption_rect,
+            DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        SelectObject(dc, previous_font);
         let ratio = (r.right as f64 / image.width as f64)
-            .min(r.bottom as f64 / image.height as f64)
+            .min((r.bottom - caption_height).max(0) as f64 / image.height as f64)
             .min(1.0);
         let width = (image.width as f64 * ratio) as i32;
         let height = (image.height as f64 * ratio) as i32;
@@ -2652,7 +2820,7 @@ unsafe extern "system" fn preview_proc(
         StretchDIBits(
             dc,
             (r.right - width) / 2,
-            (r.bottom - height) / 2,
+            caption_height + (r.bottom - caption_height - height) / 2,
             width,
             height,
             0,
@@ -2725,6 +2893,9 @@ impl Host {
         }
         app.state.composing = self.composing.get();
         let key = msg.wParam.0 as u32;
+        if msg.hwnd == app.preview && key != VK_ESCAPE.0 as u32 {
+            return false;
+        }
         let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
         // WM_KEYDOWN bit 30 distinguishes auto-repeat from a fresh press. A
@@ -2866,6 +3037,9 @@ impl Host {
                     {
                         continue;
                     }
+                    app.action_permit.cancel();
+                    app.pending_action = None;
+                    app.pending_paste = None;
                     app.stop_ai_request();
                     // Menu targets are captured before the native pump; preserve their
                     // epoch/selection while suppressing in-flight network publication.
