@@ -67,6 +67,7 @@ impl Engine {
                     pending: HashMap::new(),
                     vectors: crate::semantic_store::PendingVectors::default(),
                     semantic_scan: None,
+                    status_work: None,
                     source_generation: 0,
                     queries: worker_queries,
                     query_guard: None,
@@ -246,6 +247,22 @@ impl Drop for Engine {
         }
     }
 }
+// At most one explicit status request is active. This retains only counters,
+// cursors and pending IDs, never source bodies or an open SQLite statement.
+struct SemanticStatusWork {
+    request_id: u64,
+    revision: u64,
+    commits: u64,
+    source_generation: u64,
+    profile: String,
+    scope: crate::semantic::IndexScope,
+    after_rowid: i64,
+    disk_done: bool,
+    pending_ids: Vec<String>,
+    indexed: usize,
+    needs_update: bool,
+}
+
 struct Actor {
     repo: Repository,
     options: EngineOptions,
@@ -256,6 +273,7 @@ struct Actor {
     // unscanned RAM content into disk rows, including updates to old rowids.
     semantic_scan: Option<(crate::semantic::IndexCursor, u64, String)>,
     source_generation: u64,
+    status_work: Option<SemanticStatusWork>,
     queries: Arc<Queries>,
     query_guard: Option<(u64, u64)>,
     deleted: HashSet<String>,
@@ -726,51 +744,113 @@ impl Actor {
         });
         Ok(())
     }
-    fn semantic_status(&self, request_id: u64) -> Result<(), String> {
-        let profile = crate::semantic::profile_id(&self.settings.embedding)?;
-        let mut indexed = 0;
-        let mut needs_update = false;
-        let mut inspect = |item: StoredItem| -> Result<(), String> {
-            if let Some(candidate) =
-                crate::semantic::candidate(&item, self.settings.embedding.index_scope)
-            {
-                if self.needs_embedding(&profile, &candidate)? {
-                    needs_update = true;
-                } else {
-                    indexed += 1;
-                }
+    fn new_status_work(&self, request_id: u64) -> Result<SemanticStatusWork, String> {
+        Ok(SemanticStatusWork {
+            request_id,
+            revision: self.queries.revision.load(Ordering::Acquire),
+            commits: self.commits,
+            source_generation: self.source_generation,
+            profile: crate::semantic::profile_id(&self.settings.embedding)?,
+            scope: self.settings.embedding.index_scope,
+            after_rowid: 0,
+            disk_done: false,
+            pending_ids: Vec::new(),
+            indexed: 0,
+            needs_update: false,
+        })
+    }
+    fn semantic_status(&mut self, request_id: u64) -> Result<(), String> {
+        self.status_work = None;
+        self.status_work = Some(self.new_status_work(request_id)?);
+        Ok(())
+    }
+    fn status_should_yield(&self, work: &SemanticStatusWork) -> bool {
+        self.exiting
+            || self.queries.reliable_pending.load(Ordering::Acquire) > 0
+            || self.queries.revision.load(Ordering::Acquire) != work.revision
+            || self
+                .deadline
+                .is_some_and(|deadline| deadline <= Instant::now())
+    }
+    fn inspect_status_item(
+        &self,
+        work: &mut SemanticStatusWork,
+        item: StoredItem,
+    ) -> Result<(), String> {
+        if let Some(candidate) = crate::semantic::candidate(&item, work.scope) {
+            if self.needs_embedding(&work.profile, &candidate)? {
+                work.needs_update = true;
+            } else {
+                work.indexed += 1;
             }
-            Ok(())
+        }
+        Ok(())
+    }
+    fn status_step(&mut self) -> Result<(), String> {
+        let Some(mut work) = self.status_work.take() else {
+            return Ok(());
         };
-        let mut cursor = 0;
-        loop {
+        if self.exiting {
+            return Ok(());
+        }
+        // Even vector-only commits can change valid counts or apply retention.
+        // Reliable command revisions also cover RAM vectors and pending deletes.
+        if work.revision != self.queries.revision.load(Ordering::Acquire)
+            || work.commits != self.commits
+            || work.source_generation != self.source_generation
+            || work.scope != self.settings.embedding.index_scope
+            || work.profile != crate::semantic::profile_id(&self.settings.embedding)?
+        {
+            work = self.new_status_work(work.request_id)?;
+        }
+        if self.status_should_yield(&work) {
+            self.status_work = Some(work);
+            return Ok(());
+        }
+        if !work.disk_done {
+            let mut visited = 0;
             let (last, done) =
-                crate::semantic_store::page(&self.repo.connection, cursor, |item| {
+                crate::semantic_store::page(&self.repo.connection, work.after_rowid, |item| {
                     if !self.deleted.contains(&item.summary.id)
                         && !self.pending.contains_key(&item.summary.id)
                     {
-                        inspect(item)?;
+                        self.inspect_status_item(&mut work, item)?;
                     }
-                    Ok(true)
+                    visited += 1;
+                    // The callback has consumed this row, so retaining its rowid
+                    // resumes without skipping or double-counting a source.
+                    Ok(visited < 16 && !self.status_should_yield(&work))
                 })?;
-            cursor = last;
+            work.after_rowid = last;
+            work.disk_done = done;
             if done {
-                break;
+                work.pending_ids = self.pending.keys().cloned().collect();
+            }
+        } else {
+            for _ in 0..16 {
+                if self.status_should_yield(&work) {
+                    break;
+                }
+                let Some(id) = work.pending_ids.pop() else {
+                    break;
+                };
+                if let Some(item) = self.semantic_item(&id)? {
+                    self.inspect_status_item(&mut work, item)?;
+                }
             }
         }
-        for id in self.pending.keys() {
-            if let Some(item) = self.semantic_item(id)? {
-                inspect(item)?;
-            }
+        if work.disk_done && work.pending_ids.is_empty() && !self.status_should_yield(&work) {
+            self.emit(Event::SemanticStatus {
+                request_id: work.request_id,
+                status: SemanticIndexStatus {
+                    profile: work.profile,
+                    indexed: work.indexed,
+                    needs_update: work.needs_update,
+                },
+            });
+        } else {
+            self.status_work = Some(work);
         }
-        self.emit(Event::SemanticStatus {
-            request_id,
-            status: SemanticIndexStatus {
-                profile,
-                indexed,
-                needs_update,
-            },
-        });
         Ok(())
     }
     fn edit_clipboard_metadata(&mut self, input: ClipboardMetadataInput) -> Result<(), String> {
@@ -1402,6 +1482,12 @@ impl Actor {
                     }
                     continue;
                 }
+                if self.status_work.is_some() {
+                    if let Err(message) = self.status_step() {
+                        self.error(message);
+                    }
+                    continue;
+                }
             }
             let received = if let Some(queued) = queued {
                 Ok(queued)
@@ -1501,6 +1587,7 @@ impl Actor {
                     Ok(())
                 }
                 Command::Shutdown => {
+                    self.status_work = None;
                     self.exiting = true;
                     if self.flush() {
                         // Drop SQLite before the final acknowledgement.
@@ -1515,5 +1602,248 @@ impl Actor {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod status_scheduling_tests {
+    use super::*;
+
+    fn actor_fixture() -> (Actor, Receiver<Event>) {
+        let (events, received) = mpsc::channel();
+        let mut settings = Settings::default();
+        settings.embedding.enabled = true;
+        settings.embedding.model = "status-fixture".into();
+        settings.embedding.index_scope = crate::semantic::IndexScope::AllText;
+        let actor = Actor {
+            repo: Repository::open(std::path::Path::new(":memory:")).unwrap(),
+            options: EngineOptions::new(":memory:".into()),
+            settings,
+            pending: HashMap::new(),
+            vectors: crate::semantic_store::PendingVectors::default(),
+            semantic_scan: None,
+            status_work: None,
+            source_generation: 0,
+            queries: Arc::new(Queries::default()),
+            query_guard: None,
+            deleted: HashSet::new(),
+            settings_dirty: false,
+            deadline: None,
+            checkpoint_at: None,
+            emergency_checkpoint_retry: None,
+            commits: 0,
+            retry_delay_ms: 1000,
+            retry_not_before: None,
+            queued_bytes: Arc::new(AtomicUsize::new(0)),
+            exiting: false,
+            events,
+            notifier: Arc::new(|| {}),
+        };
+        (actor, received)
+    }
+
+    #[test]
+    fn status_request_defers_work_to_scheduler_without_publishing_inline() {
+        let (mut actor, events) = actor_fixture();
+        actor.semantic_status(91).unwrap();
+        assert!(
+            matches!(events.try_recv(), Err(TryRecvError::Empty)),
+            "a status request must schedule bounded work, not finish its scan inline"
+        );
+    }
+    fn seed_sources(
+        actor: &mut Actor,
+        events: &Receiver<Event>,
+        count: usize,
+        indexed: bool,
+        persist: bool,
+    ) {
+        for i in 0..count {
+            actor
+                .capture(ClipboardSnapshot {
+                    text: format!("状态来源 {i}"),
+                    representations: vec![],
+                    source_app: "fixture".into(),
+                    captured_at_ms: now_ms(),
+                })
+                .unwrap();
+        }
+        if indexed {
+            let profile = actor.semantic_profile().unwrap();
+            for items in ram_vectors(actor).chunks(16) {
+                actor
+                    .store_embeddings(1, profile.clone(), items.to_vec())
+                    .unwrap();
+            }
+        }
+        if persist {
+            assert!(actor.flush());
+        }
+        while events.try_recv().is_ok() {}
+    }
+    fn ram_vectors(actor: &Actor) -> Vec<crate::semantic::IndexedEmbedding> {
+        actor
+            .pending
+            .values()
+            .map(|p| {
+                let candidate =
+                    crate::semantic::candidate(&p.item, actor.settings.embedding.index_scope)
+                        .unwrap();
+                crate::semantic::IndexedEmbedding {
+                    id: candidate.id,
+                    text_hash: candidate.text_hash,
+                    vector: vec![1., 0.],
+                }
+            })
+            .collect()
+    }
+    fn queue(sender: &Sender<QueuedCommand>, queries: &Queries, command: Command) {
+        queries.revision.fetch_add(1, Ordering::AcqRel);
+        queries.reliable_pending.fetch_add(1, Ordering::AcqRel);
+        sender
+            .send(QueuedCommand {
+                command: Some(Ok(command)),
+                bytes: 0,
+            })
+            .unwrap();
+    }
+    fn drive_until_status(
+        actor: &mut Actor,
+        events: &Receiver<Event>,
+        commands: Vec<Command>,
+    ) -> (SemanticIndexStatus, usize) {
+        let queries = actor.queries.clone();
+        let (sender, received) = mpsc::channel();
+        for command in commands {
+            queue(&sender, &queries, command);
+        }
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| actor.run(received));
+            let mut saved = 0;
+            let status = loop {
+                match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Event::Saved(_) => saved += 1,
+                    Event::SemanticStatus { status, .. } => break status,
+                    Event::Error { message, .. } => panic!("{message}"),
+                    _ => (),
+                }
+            };
+            queue(&sender, &queries, Command::Shutdown);
+            assert!(worker.join().unwrap());
+            (status, saved)
+        })
+    }
+    #[test]
+    fn partial_disk_status_yields_to_due_commit_and_immediate_saves_then_restarts() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 40, true, true);
+        actor.semantic_status(92).unwrap();
+        actor.status_step().unwrap();
+        assert_eq!(actor.status_work.as_ref().unwrap().indexed, 16);
+        assert!(events.try_recv().is_err());
+        actor
+            .capture(ClipboardSnapshot {
+                text: "待到期提交".into(),
+                representations: vec![],
+                source_app: "fixture".into(),
+                captured_at_ms: now_ms(),
+            })
+            .unwrap();
+        while events.try_recv().is_ok() {}
+        actor.deadline = Some(Instant::now());
+        let mut settings = actor.settings.clone();
+        settings.embedding.model = "new-profile".into();
+        let expected_profile = crate::semantic::profile_id(&settings.embedding).unwrap();
+        let (status, saved) = drive_until_status(
+            &mut actor,
+            &events,
+            vec![
+                Command::SaveFavorite(FavoriteInput {
+                    id: Some("favorite".into()),
+                    kind: ItemKind::Document,
+                    title: "收藏".into(),
+                    target: "C:/favorite.txt".into(),
+                    alias: String::new(),
+                    tags: vec![],
+                    open_with: None,
+                }),
+                Command::SaveSettings(settings),
+            ],
+        );
+        assert_eq!(
+            saved, 3,
+            "due commit and both immediate saves must finish before status"
+        );
+        assert_eq!(status.profile, expected_profile);
+        assert_eq!(status.indexed, 0);
+        assert!(status.needs_update);
+        assert_eq!(actor.commits, 4, "status scanning must not add commits");
+        assert_eq!(
+            actor
+                .repo
+                .connection
+                .query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+    }
+    #[test]
+    fn partial_pending_status_restarts_for_ram_vectors_and_deleted_overlays() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 40, false, false);
+        actor.semantic_status(93).unwrap();
+        actor.status_step().unwrap(); // Empty disk, snapshot pending IDs.
+        actor.status_step().unwrap(); // Only 16 of the 40 RAM bodies.
+        let work = actor.status_work.as_ref().unwrap();
+        assert_eq!(work.pending_ids.len(), 24);
+        assert!(work.needs_update);
+        let profile = actor.semantic_profile().unwrap();
+        let vectors = ram_vectors(&actor);
+        let mut commands: Vec<_> = vectors
+            .chunks(16)
+            .map(|items| Command::StoreEmbeddings {
+                request_id: 1,
+                profile: profile.clone(),
+                items: items.to_vec(),
+            })
+            .collect();
+        commands.push(Command::Delete(vectors[0].id.clone()));
+        let (status, saved) = drive_until_status(&mut actor, &events, commands);
+        assert_eq!(status.indexed, 39);
+        assert!(!status.needs_update);
+        assert_eq!(
+            saved, 0,
+            "status plus RAM vector admission must remain read-only"
+        );
+        assert_eq!(
+            actor.commits, 1,
+            "only the final Shutdown may persist this test's data"
+        );
+    }
+    #[test]
+    fn shutdown_discards_a_partial_status_without_finishing_the_scan() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 40, true, false);
+        actor.semantic_status(94).unwrap();
+        actor.status_step().unwrap();
+        actor.status_step().unwrap();
+        assert_eq!(actor.status_work.as_ref().unwrap().indexed, 16);
+        let (sender, received) = mpsc::channel();
+        queue(&sender, &actor.queries, Command::Shutdown);
+        assert!(actor.run(received));
+        assert!(actor.status_work.is_none());
+        let events: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Saved(_)))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::SemanticStatus { .. } | Event::Error { .. }))
+        );
     }
 }

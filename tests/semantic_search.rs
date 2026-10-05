@@ -1438,3 +1438,87 @@ fn renamed_clipboard_invalidates_status_and_completed_source_cursor() {
     assert!(dirty.candidates[0].text.contains("新名称"));
     shutdown(&engine);
 }
+
+#[test]
+fn queued_status_yields_to_favorite_and_profile_saves_then_reports_current_data() {
+    use std::sync::{
+        Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("status-priority.sqlite");
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let armed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new(AtomicBool::new(false));
+    let engine = Engine::start(EngineOptions::new(path.clone()), {
+        let gate = gate.clone();
+        let armed = armed.clone();
+        let entered = entered.clone();
+        Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                entered.store(true, Ordering::SeqCst);
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            }
+        })
+    })
+    .unwrap();
+    wait(&engine, |e| matches!(e, Event::Ready(_)));
+    let mut settings = configure(&engine, IndexScope::AllText);
+    capture(&engine, "已索引来源");
+    let b = batch(&engine, IndexCursor::default());
+    assert_eq!(store(&engine, &b, vec![vec![1., 0.]]), 1);
+    flush(&engine);
+    armed.store(true, Ordering::SeqCst);
+    capture(&engine, "等待保存的来源");
+    while !entered.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    engine
+        .send(Command::SemanticStatus { request_id: 500 })
+        .unwrap();
+    engine
+        .send(Command::SaveFavorite(FavoriteInput {
+            id: Some("new-favorite".into()),
+            kind: ItemKind::Document,
+            title: "新收藏".into(),
+            target: "C:/new.txt".into(),
+            alias: String::new(),
+            tags: vec![],
+            open_with: None,
+        }))
+        .unwrap();
+    settings.embedding.model = "changed-profile".into();
+    engine
+        .send(Command::SaveSettings(settings.clone()))
+        .unwrap();
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_one();
+    let mut saved = 0;
+    loop {
+        match wait(&engine, |_| true) {
+            Event::Saved(_) => saved += 1,
+            Event::SemanticStatus {
+                request_id: 500,
+                status,
+            } => {
+                assert_eq!(saved, 2, "both immediate saves must precede status work");
+                assert_eq!(status.profile, profile_id(&settings.embedding).unwrap());
+                assert_eq!(status.indexed, 0);
+                assert!(status.needs_update);
+                break;
+            }
+            Event::Error { message, .. } => panic!("{message}"),
+            _ => (),
+        }
+    }
+    let db = Connection::open(path).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    shutdown(&engine);
+}
