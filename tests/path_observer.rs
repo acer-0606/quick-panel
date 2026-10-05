@@ -363,3 +363,36 @@ fn recent_backoff_does_not_block_explorer_visits() {
     assert_eq!(observe(&mut observer, "C:/Explorer", 2000).len(), 1);
     assert!(!recovery.due(2000));
 }
+
+#[test]
+fn recent_link_accepts_a_confirmed_empty_argument_string() {
+    use quick_panel::path_observer::recent_arguments_empty;
+    assert!(recent_arguments_empty(0, &[0]));
+    assert!(recent_arguments_empty(0, &[0, u16::MAX, u16::MAX]));
+}
+
+#[test]
+fn recent_link_rejects_nonempty_arguments_including_whitespace() {
+    use quick_panel::path_observer::recent_arguments_empty;
+    let arguments: Vec<_> = r"C:\Docs\Report.txt"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    assert!(!recent_arguments_empty(0, &arguments));
+    assert!(!recent_arguments_empty(0, &[32, 0]));
+}
+
+#[test]
+fn recent_link_rejects_failed_or_unconfirmed_argument_reads() {
+    use quick_panel::path_observer::recent_arguments_empty;
+    assert!(!recent_arguments_empty(-2_147_467_259, &[0]));
+    assert!(!recent_arguments_empty(1, &[0]));
+}
+
+#[test]
+fn recent_link_rejects_arguments_without_a_confirmed_terminator() {
+    use quick_panel::path_observer::recent_arguments_empty;
+    assert!(!recent_arguments_empty(0, &[]));
+    assert!(!recent_arguments_empty(0, &[u16::MAX; 260]));
+    assert!(!recent_arguments_empty(0, &[65, 66]));
+}

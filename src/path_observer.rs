@@ -312,3 +312,10 @@ impl RecentRecovery {
         self.revision
     }
 }
+
+/// Admit a Recent link only after its saved argument string is confirmed empty.
+pub fn recent_arguments_empty(hresult: i32, buffer: &[u16]) -> bool {
+    // S_OK plus a written terminator at the beginning confirms the entire string
+    // is empty. Truncated/nonempty strings and an untouched buffer fail closed.
+    hresult == 0 && buffer.first() == Some(&0)
+}

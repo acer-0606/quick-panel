@@ -24,7 +24,7 @@ use windows::{
         System::{Com::*, Threading::WaitForSingleObject, Variant::VARIANT},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
-    core::{IUnknown, Interface, PCWSTR},
+    core::{IUnknown, Interface, PCWSTR, PWSTR},
 };
 
 struct Apartment;
@@ -611,6 +611,19 @@ fn parse_link(link_path: &std::path::Path) -> Option<(String, ItemKind)> {
         let file: IPersistFile = link.cast().ok()?;
         let name = wide(&link_path.to_string_lossy());
         file.Load(PCWSTR(name.as_ptr()), STGM_READ).ok()?;
+        // Arguments are saved link data only. The sentinel distinguishes an
+        // unwritten/incomplete buffer from an explicitly returned empty string.
+        let mut arguments = [u16::MAX; 260];
+        // Keep the raw HRESULT: the generated wrapper treats S_FALSE as success,
+        // while admission requires the documented S_OK and a confirmed empty value.
+        let argument_result = (Interface::vtable(&link).GetArguments)(
+            Interface::as_raw(&link),
+            PWSTR(arguments.as_mut_ptr()),
+            arguments.len() as i32,
+        );
+        if !crate::path_observer::recent_arguments_empty(argument_result.0, &arguments) {
+            return None;
+        }
         let mut buffer = [0u16; 260];
         let mut data = WIN32_FIND_DATAW::default();
         // Saved raw target only: no Resolve(), target metadata or network existence check.
