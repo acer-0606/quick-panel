@@ -207,3 +207,112 @@ pub fn png_is_readable(rep: &Representation) -> bool {
         .is_ok()
     }
 }
+/// Encode an owned, tightly packed top-down BGRA rectangle. GDI's unused high
+/// byte is not alpha: force opaque pixels before handing them to WIC.
+pub fn encode_png(width: u32, height: u32, mut pixels: Vec<u8>) -> Result<Representation, String> {
+    use crate::screenshot::{MAX_PNG_BYTES, pixel_bytes};
+    use windows::Win32::{
+        Foundation::HGLOBAL,
+        System::{
+            Com::StructuredStorage::CreateStreamOnHGlobal,
+            Memory::{GlobalLock, GlobalUnlock},
+        },
+    };
+    let bytes = pixel_bytes(width, height)?;
+    if pixels.len() != bytes {
+        return Err("截图像素长度与尺寸不符".into());
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    unsafe {
+        let _com = com()?;
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+                .map_err(|e| e.to_string())?;
+        // The stream exclusively owns the growable HGLOBAL and frees it on every branch.
+        let stream = CreateStreamOnHGlobal(HGLOBAL::default(), true).map_err(|e| e.to_string())?;
+        let encoder = factory
+            .CreateEncoder(&GUID_ContainerFormatPng, std::ptr::null())
+            .map_err(|e| e.to_string())?;
+        encoder
+            .Initialize(&stream, WICBitmapEncoderNoCache)
+            .map_err(|e| e.to_string())?;
+        let (mut frame, mut options) = (None, None);
+        encoder
+            .CreateNewFrame(&mut frame, &mut options)
+            .map_err(|e| e.to_string())?;
+        let frame = frame.ok_or("PNG 编码器没有创建帧")?;
+        frame
+            .Initialize(options.as_ref())
+            .map_err(|e| e.to_string())?;
+        frame.SetSize(width, height).map_err(|e| e.to_string())?;
+        let mut actual_format = GUID_WICPixelFormat32bppBGRA;
+        frame
+            .SetPixelFormat(&mut actual_format)
+            .map_err(|e| e.to_string())?;
+        if actual_format == GUID_WICPixelFormat32bppBGRA {
+            frame
+                .WritePixels(height, width * 4, &pixels)
+                .map_err(|e| e.to_string())?;
+        } else {
+            // SetPixelFormat is in/out; a successful call may choose a different format.
+            let bitmap = factory
+                .CreateBitmapFromMemory(
+                    width,
+                    height,
+                    &GUID_WICPixelFormat32bppBGRA,
+                    width * 4,
+                    &pixels,
+                )
+                .map_err(|e| e.to_string())?;
+            let converter = factory.CreateFormatConverter().map_err(|e| e.to_string())?;
+            converter
+                .Initialize(
+                    &bitmap,
+                    &actual_format,
+                    WICBitmapDitherTypeNone,
+                    None,
+                    0.0,
+                    WICBitmapPaletteTypeCustom,
+                )
+                .map_err(|e| e.to_string())?;
+            frame
+                .WriteSource(&converter, std::ptr::null())
+                .map_err(|e| e.to_string())?;
+        }
+        frame.Commit().map_err(|e| e.to_string())?;
+        encoder.Commit().map_err(|e| e.to_string())?;
+        let mut stat = STATSTG::default();
+        stream
+            .Stat(&mut stat, STATFLAG_NONAME)
+            .map_err(|e| e.to_string())?;
+        let length = usize::try_from(stat.cbSize).map_err(|_| "PNG 编码长度溢出")?;
+        if length == 0 || length > MAX_PNG_BYTES {
+            return Err("截图 PNG 超过 8 MiB 上限，未复制".into());
+        }
+        let global = windows::Win32::System::Com::StructuredStorage::GetHGlobalFromStream(&stream)
+            .map_err(|e| e.to_string())?;
+        let pointer = GlobalLock(global);
+        if pointer.is_null() {
+            return Err("无法读取 PNG 编码内存".into());
+        }
+        struct Unlock(HGLOBAL);
+        impl Drop for Unlock {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = GlobalUnlock(self.0);
+                }
+            }
+        }
+        let _unlock = Unlock(global);
+        let mut data = Vec::new();
+        data.try_reserve_exact(length)
+            .map_err(|_| "无法为 PNG 分配内存")?;
+        data.extend_from_slice(std::slice::from_raw_parts(pointer.cast::<u8>(), length));
+        Ok(Representation {
+            format: "PNG".into(),
+            data,
+        })
+    }
+}

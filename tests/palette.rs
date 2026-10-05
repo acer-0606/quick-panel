@@ -451,3 +451,27 @@ fn external_path_settings_are_reachable_before_any_saved_favorite() {
             .any(|row| row.id() == "function:path-activity-settings")
     );
 }
+
+#[test]
+fn screenshot_and_optional_shortcut_settings_are_searchable_while_history_is_paused() {
+    for (query, action) in [
+        ("截图", Function::Screenshot),
+        ("区域截图", Function::Screenshot),
+        ("screenshot", Function::Screenshot),
+        ("jietu", Function::Screenshot),
+        ("截图快捷键", Function::ScreenshotSettings),
+    ] {
+        let rows = palette::results(
+            query,
+            vec![],
+            Context {
+                capture_paused: true,
+                ..Context::default()
+            },
+        );
+        assert!(
+            rows.iter().any(|row| row.function() == Some(action)),
+            "missing {action:?} for {query}"
+        );
+    }
+}

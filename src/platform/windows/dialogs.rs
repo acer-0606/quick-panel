@@ -78,6 +78,22 @@ pub unsafe fn path_settings_form(
         )
     }
 }
+
+pub unsafe fn screenshot_settings_form(
+    owner: HWND,
+    hotkey: String,
+    appearance: Theme,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            "截图快捷键设置",
+            &[("区域截图快捷键（默认关闭；留空关闭）", Field::Text(hotkey))],
+            None,
+            appearance,
+        )
+    }
+}
 enum Field {
     Text(String),
     Multiline(String),

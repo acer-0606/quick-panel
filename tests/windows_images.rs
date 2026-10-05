@@ -99,3 +99,49 @@ fn failed_compatibility_decode_keeps_original_registered_png_payload() {
     )
     .unwrap();
 }
+
+#[test]
+fn screenshot_png_preserves_top_down_pixel_order_and_forces_gdi_alpha_opaque() {
+    let png = images::encode_png(
+        2,
+        2,
+        vec![0, 0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 1, 255, 255, 255, 17],
+    )
+    .unwrap();
+    assert_eq!(png.format, "PNG");
+    assert_eq!(&png.data[..8], b"\x89PNG\r\n\x1a\n");
+    let dib = decode_dib(&png);
+    assert_eq!(&dib[8..12], &(-2i32).to_le_bytes());
+    assert_eq!(
+        &dib[40..],
+        &[
+            0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255
+        ]
+    );
+    assert!(clipboard::prepare_screenshot(png).is_ok());
+}
+
+#[test]
+fn screenshot_encoder_rejects_malformed_or_over_budget_pixels_before_wic() {
+    assert!(images::encode_png(2, 2, vec![0; 15]).is_err());
+    assert!(images::encode_png(0, 1, vec![]).is_err());
+    assert!(images::encode_png(4097, 4096, vec![]).is_err());
+}
+
+#[test]
+fn screenshot_encoder_checks_stream_size_before_delivering_large_png() {
+    let mut seed = 0x31415926u32;
+    let pixels = (0..2048 * 2048)
+        .flat_map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            [seed as u8, (seed >> 8) as u8, (seed >> 16) as u8, 0]
+        })
+        .collect();
+    assert!(
+        images::encode_png(2048, 2048, pixels)
+            .unwrap_err()
+            .contains("8 MiB")
+    );
+}

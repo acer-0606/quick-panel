@@ -26,18 +26,32 @@ fn binding(modifiers: u32, key: u32) -> Result<Option<Hotkey>, String> {
     Ok(Some(Hotkey { modifiers, key }))
 }
 
-pub fn settings_hotkeys(settings: &Settings) -> Result<[Option<Hotkey>; 2], String> {
+pub fn settings_hotkeys(settings: &Settings) -> Result<[Option<Hotkey>; 3], String> {
     let keys = [
         binding(settings.hotkey_modifiers, settings.hotkey_key)?,
         binding(
             settings.clipboard_hotkey_modifiers,
             settings.clipboard_hotkey_key,
         )?,
+        binding(
+            settings.screenshot_hotkey_modifiers,
+            settings.screenshot_hotkey_key,
+        )?,
     ];
-    if keys[0].is_some() && keys[0] == keys[1] {
-        return Err("两组已启用的快捷键须不同".into());
-    }
+    validate_bindings(&keys)?;
     Ok(keys)
+}
+
+fn validate_bindings(keys: &[Option<Hotkey>]) -> Result<(), String> {
+    for (index, key) in keys.iter().enumerate() {
+        if let Some(key) = key {
+            binding(key.modifiers, key.key)?;
+            if keys[..index].contains(&Some(*key)) {
+                return Err("已启用的快捷键须互不相同".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn parse_hotkey(value: &str) -> Result<(u32, u32), String> {
@@ -104,25 +118,20 @@ pub fn format_hotkey(modifiers: u32, key: u32) -> String {
 
 #[derive(Default)]
 pub struct HotkeyBindings {
-    active: [Option<(i32, Hotkey)>; 2],
+    active: [Option<(i32, Hotkey)>; 3],
 }
 impl HotkeyBindings {
     pub fn replace(
         &mut self,
-        next: [Option<Hotkey>; 2],
+        next: [Option<Hotkey>; 3],
         mut register: impl FnMut(i32, Hotkey) -> Result<(), String>,
         mut unregister: impl FnMut(i32),
     ) -> Result<(), String> {
-        for key in next.iter().flatten() {
-            binding(key.modifiers, key.key)?;
-        }
-        if next[0].is_some() && next[0] == next[1] {
-            return Err("两组已启用的快捷键须不同".into());
-        }
+        validate_bindings(&next)?;
         let mut fresh =
             (1..=8).filter(|id| !self.active.iter().flatten().any(|(old, _)| old == id));
         let mut staged = Vec::new();
-        let mut replacement = [None, None];
+        let mut replacement = [None, None, None];
         for (index, desired) in next.into_iter().enumerate() {
             let Some(key) = desired else {
                 continue;
@@ -131,7 +140,7 @@ impl HotkeyBindings {
                 replacement[index] = Some(previous);
                 continue;
             }
-            let id = fresh.next().expect("two staged bindings fit eight IDs");
+            let id = fresh.next().expect("three staged bindings fit eight IDs");
             if let Err(error) = register(id, key) {
                 for id in staged {
                     unregister(id);
@@ -162,6 +171,6 @@ impl HotkeyBindings {
         for &(id, _) in self.active.iter().flatten() {
             unregister(id);
         }
-        self.active = [None, None];
+        self.active = [None, None, None];
     }
 }

@@ -4,7 +4,7 @@ use super::{
     dialogs::{self, wide},
     images::{self, Image},
     path_monitor::PathMonitor,
-    theme,
+    screenshot, theme,
 };
 use crate::{
     ai::{AiPlan, AiSettings, AuthMethod},
@@ -17,6 +17,7 @@ use crate::{
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
     preview::{PreviewLoads, bounded_text},
     query_feedback::{IndexReply, QueryReply, claude_reply, embedding_reply, index_reply},
+    screenshot::{ScreenshotGate, ScreenshotTicket},
     semantic::{self, EmbeddingSettings, IndexScope},
     semantic_ui::{
         IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
@@ -60,6 +61,8 @@ const EMBEDDING_SETTINGS: usize = 109;
 const INDEX_START: usize = 110;
 const INDEX_CANCEL: usize = 111;
 const PATH_SETTINGS: usize = 112;
+const SCREENSHOT: usize = 113;
+const SCREENSHOT_SETTINGS: usize = 114;
 const PATH_TIMER: usize = 400;
 const FAVORITE_PATH: usize = 210;
 const SUPPRESS_PATH: usize = 211;
@@ -106,6 +109,30 @@ struct PreviewResult {
     generation: u64,
     text: String,
     image: Option<Result<Image, String>>,
+}
+struct ScreenshotJob {
+    ticket: ScreenshotTicket,
+    pixels: screenshot::Pixels,
+}
+struct ScreenshotResult {
+    ticket: ScreenshotTicket,
+    result: Result<clipboard::PreparedScreenshot, String>,
+}
+fn encode_screenshot(job: ScreenshotJob) -> ScreenshotResult {
+    let ScreenshotJob { ticket, pixels } = job;
+    // A worker panic still yields a terminal receipt, releasing the actual slot.
+    let result = std::panic::catch_unwind(|| {
+        if !ticket.current() {
+            return Err("截图已取消".into());
+        }
+        let png = images::encode_png(pixels.width, pixels.height, pixels.bgra)?;
+        if !ticket.current() {
+            return Err("截图已取消".into());
+        }
+        clipboard::prepare_screenshot(png)
+    })
+    .unwrap_or_else(|_| Err("截图编码失败，可重新截图".into()));
+    ScreenshotResult { ticket, result }
 }
 enum NativeJob {
     Action {
@@ -242,6 +269,20 @@ impl RenderState {
     }
 }
 enum UiEffect {
+    ScreenshotSelect {
+        owner: HWND,
+        target: HWND,
+        ticket: ScreenshotTicket,
+    },
+    ScreenshotDeliver {
+        owner: HWND,
+        ticket: ScreenshotTicket,
+        prepared: clipboard::PreparedScreenshot,
+    },
+    ScreenshotSettings {
+        owner: HWND,
+        settings: Settings,
+    },
     Picker {
         owner: HWND,
         folder: bool,
@@ -431,6 +472,8 @@ struct App {
     preview_loads: PreviewLoads,
     preview_worker: Option<BackgroundWorker<(u64, StoredItem), PreviewResult>>,
     action_worker: Option<BackgroundWorker<NativeJob, NativeResult>>,
+    screenshot_worker: Option<BackgroundWorker<ScreenshotJob, ScreenshotResult>>,
+    screenshot_gate: ScreenshotGate,
     action_permit: ActionPermit,
     dpi: u32,
     suppress_sequence: Option<u32>,
@@ -546,6 +589,8 @@ pub fn run() -> Result<(), String> {
             preview_loads: PreviewLoads::default(),
             preview_worker: None,
             action_worker: None,
+            screenshot_worker: None,
+            screenshot_gate: ScreenshotGate::default(),
             action_permit: ActionPermit::default(),
             dpi: 96,
             suppress_sequence: None,
@@ -624,6 +669,7 @@ pub fn run() -> Result<(), String> {
         let notify = Arc::new(move || post(handle, WORK_WAKE));
         app.preview_worker = Some(BackgroundWorker::new(prepare_preview, notify.clone()));
         app.action_worker = Some(BackgroundWorker::new(native_job, notify.clone()));
+        app.screenshot_worker = Some(BackgroundWorker::new(encode_screenshot, notify.clone()));
         app.path_monitor = Some(PathMonitor::new(notify));
         AddClipboardFormatListener(hwnd).map_err(|e| e.to_string())?;
         app.tray(NIM_ADD);
@@ -1616,6 +1662,7 @@ impl App {
         if !self.state.can_show_panel() {
             return;
         }
+        self.screenshot_gate.cancel();
         let foreground = GetForegroundWindow();
         let mut process = 0u32;
         GetWindowThreadProcessId(foreground, Some(&mut process));
@@ -1664,6 +1711,11 @@ impl App {
         self.search();
     }
     unsafe fn hide(&mut self) {
+        // Selection hides the native panel only after setting state.visible=false.
+        // Its resulting WA_INACTIVE must not revoke its own screenshot.
+        if self.state.visible {
+            self.screenshot_gate.cancel();
+        }
         self.cancel_preflight();
         self.cancel_semantic();
         self.cancel_ai();
@@ -1857,6 +1909,30 @@ impl App {
         }
     }
     unsafe fn work_done(&mut self) {
+        if let Some(done) = self
+            .screenshot_worker
+            .as_ref()
+            .and_then(BackgroundWorker::try_result)
+        {
+            if done.ticket.current() && self.state.lifecycle == Lifecycle::Running {
+                match done.result {
+                    Ok(prepared) => self.effects.push_back(UiEffect::ScreenshotDeliver {
+                        owner: self.hwnd,
+                        ticket: done.ticket,
+                        prepared,
+                    }),
+                    Err(message) => {
+                        self.screenshot_gate.finish(&done.ticket);
+                        self.effects.push_back(UiEffect::Message {
+                            owner: self.hwnd,
+                            message,
+                        });
+                    }
+                }
+            } else {
+                self.screenshot_gate.finish(&done.ticket);
+            }
+        }
         let observations = self
             .path_monitor
             .as_mut()
@@ -2647,6 +2723,59 @@ impl App {
             settings: self.settings.clone(),
         });
     }
+    unsafe fn begin_screenshot(&mut self) {
+        self.begin_screenshot_for(None);
+    }
+    unsafe fn begin_screenshot_for(&mut self, menu_target: Option<HWND>) {
+        if self.state.lifecycle != Lifecycle::Running || self.state.modal_open {
+            return;
+        }
+        let Some(ticket) = self.screenshot_gate.begin(clipboard::sequence_number()) else {
+            self.effects.push_back(UiEffect::Message {
+                owner: self.hwnd,
+                message: "截图正在编码或交付，请等待本次处理完成".into(),
+            });
+            return;
+        };
+        let foreground = GetForegroundWindow();
+        let target = menu_target.unwrap_or_else(|| {
+            if self.state.visible || foreground == self.hwnd {
+                self.target
+            } else {
+                foreground
+            }
+        });
+        self.cancel_preflight();
+        self.cancel_semantic();
+        self.cancel_ai();
+        self.cancel_actions();
+        self.clear_preview();
+        self.state.hide();
+        self.effects.push_back(UiEffect::ScreenshotSelect {
+            owner: self.hwnd,
+            target,
+            ticket,
+        });
+    }
+    unsafe fn screenshot_settings(&mut self) {
+        self.effects.push_back(UiEffect::ScreenshotSettings {
+            owner: self.hwnd,
+            settings: self.settings.clone(),
+        });
+    }
+    unsafe fn apply_screenshot_settings(&mut self, values: Vec<String>) -> Result<(), String> {
+        if self.state.lifecycle != Lifecycle::Running {
+            return Ok(());
+        }
+        let (modifiers, key) = parse_hotkey(values.first().ok_or("截图快捷键设置无效")?)?;
+        let mut next = self.settings.clone();
+        next.screenshot_hotkey_modifiers = modifiers;
+        next.screenshot_hotkey_key = key;
+        self.replace_hotkeys(&next)?;
+        self.settings = next;
+        self.send(Command::SaveSettings(self.settings.clone()));
+        Ok(())
+    }
     unsafe fn settings_menu(&mut self) {
         let mut rect = RECT::default();
         let _ = GetWindowRect(self.buttons[2], &mut rect);
@@ -2657,6 +2786,8 @@ impl App {
             entries: vec![
                 (GENERAL_SETTINGS, "常规设置…"),
                 (PATH_SETTINGS, "常用推荐设置…"),
+                (SCREENSHOT, "区域截图"),
+                (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
             ],
@@ -2780,6 +2911,8 @@ impl App {
                 (221, "打开面板"),
                 (GENERAL_SETTINGS, "常规设置…"),
                 (PATH_SETTINGS, "常用推荐设置…"),
+                (SCREENSHOT, "区域截图"),
+                (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
                 (222, "暂停 / 恢复剪贴板记录"),
@@ -2863,6 +2996,8 @@ impl App {
             let _ = SetWindowTextW(self.edit, w!(""));
         }
         match function {
+            Function::Screenshot => self.begin_screenshot(),
+            Function::ScreenshotSettings => self.screenshot_settings(),
             Function::Settings => self.settings(),
             Function::PathActivitySettings => self.path_settings(),
             Function::AiSettings => self.ai_settings(),
@@ -2916,6 +3051,8 @@ impl App {
             SETTINGS => self.settings_menu(),
             GENERAL_SETTINGS => self.settings(),
             PATH_SETTINGS => self.path_settings(),
+            SCREENSHOT => self.begin_screenshot(),
+            SCREENSHOT_SETTINGS => self.screenshot_settings(),
             FAVORITE_PATH => self.request(Action::Favorite),
             SUPPRESS_PATH => self.request(Action::Suppress),
             AI_SETTINGS => self.ai_settings(),
@@ -2959,6 +3096,7 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.screenshot_gate.close();
                 self.cancel_preflight();
                 self.cancel_index();
                 self.cancel_semantic();
@@ -3040,7 +3178,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     ENGINE_WAKE | WORK_WAKE | SHOW_EXISTING | WM_CLIPBOARDUPDATE | WM_HOTKEY
                     | WM_CLOSE | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND
                     | WM_THEMECHANGED | WM_CONTEXTMENU | TRAY | WM_DROPFILES | WM_ENDSESSION
-                    | WM_DESTROY => host.defer(Deferred::Message(msg, wp, lp)),
+                    | WM_DESTROY | WM_DISPLAYCHANGE => host.defer(Deferred::Message(msg, wp, lp)),
                     WM_QUERYENDSESSION => return LRESULT(1),
                     _ => return DefWindowProcW(hwnd, msg, wp, lp),
                 }
@@ -3098,12 +3236,20 @@ unsafe fn app_message(
         }
         WM_HOTKEY => {
             if let Some(action) = app.hotkey_bindings.action_for(wp.0 as i32) {
-                app.show((action == 1).then_some(Scope::Clipboard));
+                if action == 2 {
+                    app.begin_screenshot();
+                } else {
+                    app.show((action == 1).then_some(Scope::Clipboard));
+                }
             }
             return Some(LRESULT(0));
         }
         WM_CLOSE => {
             app.hide();
+            return Some(LRESULT(0));
+        }
+        WM_DISPLAYCHANGE => {
+            app.screenshot_gate.cancel();
             return Some(LRESULT(0));
         }
         WM_ACTIVATE if (wp.0 & 0xffff) == WA_INACTIVE as usize && !app.state.modal_open => {
@@ -3211,6 +3357,7 @@ unsafe fn app_message(
         }
         WM_QUERYENDSESSION => return Some(LRESULT(1)),
         WM_DESTROY => {
+            app.screenshot_gate.close();
             app.stop_path_monitor();
             let _ = RemoveClipboardFormatListener(hwnd);
             app.hotkey_bindings.clear(|id| {
@@ -3583,6 +3730,7 @@ impl Host {
         {
             let mut app = self.app.borrow_mut();
             app.stop_path_monitor();
+            app.screenshot_gate.close();
             app.cancel_index();
             app.cancel_semantic();
             app.cancel_ai();
@@ -3642,6 +3790,11 @@ impl Host {
                                 | UiEffect::Destroy(_)
                         )
                     {
+                        if let UiEffect::ScreenshotSelect { ticket, .. }
+                        | UiEffect::ScreenshotDeliver { ticket, .. } = effect
+                        {
+                            app.screenshot_gate.finish(ticket);
+                        }
                         continue;
                     }
                     app.action_permit.cancel();
@@ -3663,6 +3816,124 @@ impl Host {
                 break;
             };
             match effect {
+                UiEffect::ScreenshotSelect {
+                    owner,
+                    target,
+                    ticket,
+                } => {
+                    // All callback-capable native calls run after dropping the App borrow.
+                    let _ = ShowWindow(owner, SW_HIDE);
+                    let result = screenshot::select_and_capture(&ticket, target);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    semantic_revoked = false;
+                    if !ticket.current() || app.state.lifecycle != Lifecycle::Running {
+                        app.screenshot_gate.finish(&ticket);
+                    } else {
+                        match result {
+                            Ok(Some(pixels)) if app.screenshot_gate.encoding(&ticket) => {
+                                if !app.screenshot_worker.as_ref().is_some_and(|worker| {
+                                    worker.submit(ScreenshotJob {
+                                        ticket: ticket.clone(),
+                                        pixels,
+                                    })
+                                }) {
+                                    app.screenshot_gate.finish(&ticket);
+                                    app.effects.push_back(UiEffect::Message {
+                                        owner,
+                                        message: "无法启动截图编码，请重试；剪贴板保持原样".into(),
+                                    });
+                                }
+                            }
+                            Ok(_) => {
+                                app.screenshot_gate.finish(&ticket);
+                            }
+                            Err(message) => {
+                                app.screenshot_gate.finish(&ticket);
+                                app.effects.push_back(UiEffect::Message { owner, message });
+                            }
+                        }
+                    }
+                }
+                UiEffect::ScreenshotDeliver {
+                    owner,
+                    ticket,
+                    prepared,
+                } => {
+                    let result = clipboard::publish_screenshot(owner, &ticket, prepared);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    semantic_revoked = false;
+                    app.screenshot_gate.finish(&ticket);
+                    match result {
+                        clipboard::ScreenshotWrite::Copied {
+                            sequence,
+                            snapshot,
+                            mut warning,
+                        } => {
+                            // Pair the exact self-write sequence with one explicit PNG capture.
+                            app.suppress_sequence = Some(sequence);
+                            app.last_capture_sequence = sequence;
+                            let allowed =
+                                !app.settings.capture_paused
+                                    && !app.settings.excluded_apps.iter().any(|name| {
+                                        name.eq_ignore_ascii_case(&snapshot.source_app)
+                                    });
+                            if allowed {
+                                let queued = app
+                                    .engine
+                                    .as_ref()
+                                    .ok_or_else(|| "历史引擎不可用".to_owned())
+                                    .and_then(|engine| engine.send(Command::Capture(snapshot)));
+                                if let Err(error) = queued {
+                                    let message = format!("截图已复制，但历史未入队：{error}");
+                                    warning = Some(warning.map_or(message.clone(), |old| {
+                                        format!("{old}\n{message}")
+                                    }));
+                                }
+                            }
+                            app.status(if allowed {
+                                "截图已复制"
+                            } else {
+                                "截图已复制；本次未记录历史"
+                            });
+                            if let Some(message) = warning {
+                                app.effects.push_back(UiEffect::Message { owner, message });
+                            }
+                        }
+                        clipboard::ScreenshotWrite::NotCopied {
+                            changed_sequence,
+                            message,
+                        } => {
+                            if let Some(sequence) = changed_sequence {
+                                app.suppress_sequence = Some(sequence);
+                                app.last_capture_sequence = sequence;
+                            }
+                            if let Some(message) = message {
+                                app.effects.push_back(UiEffect::Message { owner, message });
+                            }
+                        }
+                    }
+                }
+                UiEffect::ScreenshotSettings { owner, settings } => {
+                    let result = dialogs::screenshot_settings_form(
+                        owner,
+                        format_hotkey(
+                            settings.screenshot_hotkey_modifiers,
+                            settings.screenshot_hotkey_key,
+                        ),
+                        settings.theme,
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    let error =
+                        result.and_then(|values| app.apply_screenshot_settings(values).err());
+                    app.restore_after_modal(true);
+                    semantic_revoked = false;
+                    if let Some(message) = error {
+                        app.effects.push_back(UiEffect::Message { owner, message });
+                    }
+                }
                 UiEffect::Picker {
                     owner,
                     folder,
@@ -3809,6 +4080,7 @@ impl Host {
                     } else {
                         app.send(Command::CancelShutdown);
                         app.state.cancel_exit();
+                        app.screenshot_gate.resume();
                         app.update_path_monitor();
                         app.last_capture_sequence = 0;
                         app.capture();
@@ -3832,6 +4104,9 @@ impl Host {
                     entries,
                     target,
                 } => {
+                    // Keep the pre-menu app for tray screenshot cancellation; this menu
+                    // temporarily makes its (possibly hidden) owner foreground.
+                    let screenshot_target = GetForegroundWindow();
                     if let Ok(menu) = CreatePopupMenu() {
                         for (id, title) in entries {
                             let text = wide(title);
@@ -3872,7 +4147,17 @@ impl Host {
                                 .as_ref()
                                 .is_none_or(|target| app.state.menu_target_current(target))
                             {
-                                app.command(command);
+                                if command == SCREENSHOT {
+                                    let target = if app.state.visible || screenshot_target == owner
+                                    {
+                                        app.target
+                                    } else {
+                                        screenshot_target
+                                    };
+                                    app.begin_screenshot_for(Some(target));
+                                } else {
+                                    app.command(command);
+                                }
                             } else {
                                 app.status("结果已更新，请重新选择后操作");
                             }

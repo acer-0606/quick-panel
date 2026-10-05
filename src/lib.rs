@@ -19,6 +19,7 @@ pub mod platform;
 pub mod preview;
 pub mod query_feedback;
 pub mod repository;
+pub mod screenshot;
 pub mod search;
 pub mod semantic;
 mod semantic_store;

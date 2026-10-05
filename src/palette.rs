@@ -15,6 +15,8 @@ pub struct RowDetail {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Function {
+    Screenshot,
+    ScreenshotSettings,
     Settings,
     PathActivitySettings,
     AiSettings,
@@ -39,6 +41,8 @@ pub enum Function {
 impl Function {
     fn id(self) -> &'static str {
         match self {
+            Self::Screenshot => "function:screenshot",
+            Self::ScreenshotSettings => "function:screenshot-settings",
             Self::Settings => "function:settings",
             Self::PathActivitySettings => "function:path-activity-settings",
             Self::AiSettings => "function:ai-settings",
@@ -261,6 +265,20 @@ struct Spec {
     keywords: &'static [&'static str],
 }
 const CATALOG: &[Spec] = &[
+    Spec {
+        action: Function::Screenshot,
+        title: "区域截图",
+        description: "拖动选区，将 PNG 图片复制到剪贴板",
+        alias: "截图",
+        keywords: &["截屏", "屏幕截图", "screenshot", "screen capture"],
+    },
+    Spec {
+        action: Function::ScreenshotSettings,
+        title: "截图快捷键设置",
+        description: "配置可选截图快捷键；默认关闭，留空可关闭",
+        alias: "截图设置",
+        keywords: &["截图快捷键", "截图热键"],
+    },
     Spec {
         action: Function::PathActivitySettings,
         title: "常用推荐设置",

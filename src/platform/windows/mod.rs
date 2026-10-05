@@ -5,6 +5,7 @@ pub mod clipboard;
 mod dialogs;
 pub mod images;
 mod path_monitor;
+mod screenshot;
 mod theme;
 mod ui;
 pub use ui::run;

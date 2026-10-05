@@ -29,7 +29,7 @@ fn defaults_register_only_the_panel_and_disabled_keys_are_not_claimed() {
     assert_eq!(bindings.action_for(id), Some(0));
     bindings
         .replace(
-            [None, None],
+            [None, None, None],
             |_, _| panic!("disabled keys must not be registered"),
             |id| {
                 registry.borrow_mut().remove(&id);
@@ -67,6 +67,7 @@ fn settings_accept_empty_disabled_keys_and_preserve_custom_bindings() {
                 modifiers: 6,
                 key: 80
             }),
+            None,
             None
         ]
     );
@@ -104,7 +105,7 @@ fn invalid_reserved_and_duplicate_active_keys_are_rejected() {
         hotkey_key: 0,
         ..Settings::default()
     };
-    assert_eq!(settings_hotkeys(&both_off).unwrap(), [None, None]);
+    assert_eq!(settings_hotkeys(&both_off).unwrap(), [None, None, None]);
 }
 
 #[test]
@@ -120,6 +121,7 @@ fn conflicting_replacement_rolls_back_staged_keys_and_keeps_old_bindings() {
             modifiers: 3,
             key: 86,
         }),
+        None,
     ];
     bindings
         .replace(
@@ -144,6 +146,7 @@ fn conflicting_replacement_rolls_back_staged_keys_and_keeps_old_bindings() {
                 modifiers: 6,
                 key: 81,
             }),
+            None,
         ],
         |id, key| {
             if key.key == 81 {
@@ -167,7 +170,7 @@ fn conflicting_replacement_rolls_back_staged_keys_and_keeps_old_bindings() {
     }
     bindings
         .replace(
-            [original[1], original[0]],
+            [original[1], original[0], None],
             |_, _| panic!("swapped owned keys should be reused"),
             |_| panic!("reused keys should stay registered"),
         )
@@ -177,5 +180,137 @@ fn conflicting_replacement_rolls_back_staged_keys_and_keeps_old_bindings() {
             bindings.action_for(id),
             Some(if key.key == 86 { 0 } else { 1 })
         );
+    }
+}
+
+#[test]
+fn third_hotkey_can_swap_all_actions_and_conflict_rolls_back_every_binding() {
+    let keys = [
+        Some(Hotkey {
+            modifiers: 3,
+            key: 32,
+        }),
+        Some(Hotkey {
+            modifiers: 3,
+            key: 86,
+        }),
+        Some(Hotkey {
+            modifiers: 6,
+            key: 83,
+        }),
+    ];
+    let mut bindings = HotkeyBindings::default();
+    let registry = RefCell::new(HashMap::new());
+    bindings
+        .replace(
+            keys,
+            |id, key| {
+                registry.borrow_mut().insert(id, key);
+                Ok(())
+            },
+            |id| {
+                registry.borrow_mut().remove(&id);
+            },
+        )
+        .unwrap();
+    bindings
+        .replace(
+            [keys[2], keys[0], keys[1]],
+            |_, _| panic!("owned keys reused"),
+            |_| panic!("owned keys retained"),
+        )
+        .unwrap();
+    let before = registry.borrow().clone();
+    let result = bindings.replace(
+        [
+            Some(Hotkey {
+                modifiers: 6,
+                key: 80,
+            }),
+            Some(Hotkey {
+                modifiers: 6,
+                key: 81,
+            }),
+            Some(Hotkey {
+                modifiers: 6,
+                key: 82,
+            }),
+        ],
+        |id, key| {
+            if key.key == 82 {
+                Err("third key occupied".into())
+            } else {
+                registry.borrow_mut().insert(id, key);
+                Ok(())
+            }
+        },
+        |id| {
+            registry.borrow_mut().remove(&id);
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(*registry.borrow(), before);
+    for (id, key) in before {
+        assert_eq!(
+            bindings.action_for(id),
+            Some(if key.key == 83 {
+                0
+            } else if key.key == 32 {
+                1
+            } else {
+                2
+            })
+        );
+    }
+    bindings
+        .replace(
+            [None, None, keys[1]],
+            |_, _| panic!("existing key retained"),
+            |id| {
+                registry.borrow_mut().remove(&id);
+            },
+        )
+        .unwrap();
+    let id = *registry.borrow().keys().next().unwrap();
+    assert_eq!(registry.borrow().len(), 1);
+    assert_eq!(bindings.action_for(id), Some(2));
+    assert!(
+        bindings
+            .replace(
+                [keys[1], None, keys[1]],
+                |_, _| panic!("duplicate rejected before registration"),
+                |_| panic!("original retained")
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn screenshot_defaults_disabled_and_settings_reject_any_of_three_duplicate_keys() {
+    let old: Settings = serde_json::from_str(r#"{"hotkey_modifiers":6,"hotkey_key":80}"#).unwrap();
+    assert_eq!(old.screenshot_hotkey_key, 0);
+    assert_eq!(old.screenshot_hotkey_modifiers, 0);
+    let settings = Settings {
+        screenshot_hotkey_modifiers: 6,
+        screenshot_hotkey_key: 83,
+        ..old
+    };
+    let restored: Settings =
+        serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        settings_hotkeys(&restored).unwrap()[2],
+        Some(Hotkey {
+            modifiers: 6,
+            key: 83
+        })
+    );
+    for key in [80, 86] {
+        let settings = Settings {
+            clipboard_hotkey_modifiers: 6,
+            clipboard_hotkey_key: 86,
+            screenshot_hotkey_key: key,
+            ..settings.clone()
+        };
+        assert!(settings_hotkeys(&settings).is_err());
     }
 }

@@ -87,6 +87,23 @@ struct OwnedGlobal(Option<HGLOBAL>);
 /// Exclusively owned movable HGLOBAL; no lock or borrowed pointer crosses threads.
 unsafe impl Send for OwnedGlobal {}
 pub struct PreparedCompatibility(OwnedGlobal);
+pub struct PreparedScreenshot {
+    png: Representation,
+    format: u32,
+    memory: OwnedGlobal,
+    dib: PreparedCompatibility,
+}
+pub enum ScreenshotWrite {
+    Copied {
+        sequence: u32,
+        snapshot: ClipboardSnapshot,
+        warning: Option<String>,
+    },
+    NotCopied {
+        changed_sequence: Option<u32>,
+        message: Option<String>,
+    },
+}
 impl OwnedGlobal {
     fn filled(size: usize, fill: &dyn Fn(&mut [u8]) -> Result<(), String>) -> Result<Self, String> {
         let global = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size) }
@@ -403,6 +420,90 @@ pub fn prepare_compatibility(item: &StoredItem, plain_text: bool) -> Option<Prep
             })
             .ok()
         })
+}
+
+/// All final clipboard allocations and compatibility decoding occur in the
+/// screenshot worker, before opening or clearing the user's clipboard.
+pub fn prepare_screenshot(png: Representation) -> Result<PreparedScreenshot, String> {
+    if png.format != "PNG" || png.data.is_empty() || png.data.len() > MAX_ITEM_BYTES {
+        return Err("截图 PNG 数据无效或超过 8 MiB 上限".into());
+    }
+    let format = format_id("PNG")?;
+    let memory = OwnedGlobal::copy_from(&png.data)?;
+    let dib = super::images::png_dib_writer(&png, |size, fill| {
+        OwnedGlobal::filled(size, fill).map(PreparedCompatibility)
+    })?;
+    Ok(PreparedScreenshot {
+        png,
+        format,
+        memory,
+        dib,
+    })
+}
+
+/// No App borrow may survive this call. Revalidate under OpenClipboard, so a
+/// copy made during selection/encoding or lock retries always wins.
+pub fn publish_screenshot(
+    owner: HWND,
+    ticket: &crate::screenshot::ScreenshotTicket,
+    mut prepared: PreparedScreenshot,
+) -> ScreenshotWrite {
+    let skipped = |message| ScreenshotWrite::NotCopied {
+        changed_sequence: None,
+        message,
+    };
+    let newer = || Some("截图期间剪贴板已有更新，本次截图未覆盖新内容".into());
+    if !ticket.current() {
+        return skipped(None);
+    }
+    if !ticket.may_write(sequence_number()) {
+        return skipped(newer());
+    }
+    if !unsafe { IsWindow(Some(owner)) }.as_bool() {
+        return skipped(Some("截图所属窗口已失效，未复制".into()));
+    }
+    let _clipboard = match ClipboardGuard::open(owner) {
+        Ok(guard) => guard,
+        Err(message) => return skipped(Some(message)),
+    };
+    if !ticket.current() {
+        return skipped(None);
+    }
+    if !ticket.may_write(sequence_number()) {
+        return skipped(newer());
+    }
+    if let Err(error) = unsafe { EmptyClipboard() } {
+        return skipped(Some(format!("清空剪贴板失败：{error}")));
+    }
+    if let Err(error) = prepared.memory.transfer(prepared.format) {
+        return ScreenshotWrite::NotCopied {
+            changed_sequence: Some(sequence_number()),
+            message: Some(format!("剪贴板已清空，但截图 PNG 写入失败：{error}")),
+        };
+    }
+    let warning = prepared
+        .dib
+        .0
+        .transfer(CF_DIB)
+        .err()
+        .map(|error| format!("截图 PNG 已复制，但兼容位图写入失败：{error}"));
+    let sequence = sequence_number();
+    let snapshot = ClipboardSnapshot {
+        text: String::new(),
+        // Persist PNG once; the large compatibility bitmap is only owned by Windows.
+        representations: vec![prepared.png],
+        source_app: source_app(),
+        captured_at_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64,
+    };
+    ScreenshotWrite::Copied {
+        sequence,
+        snapshot,
+        warning,
+    }
 }
 
 pub fn restore_prepared(
