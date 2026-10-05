@@ -10,6 +10,7 @@ use windows::{
     },
     core::w,
 };
+#[derive(Clone, Copy)]
 pub struct Palette {
     pub background: COLORREF,
     pub surface: COLORREF,
@@ -41,8 +42,8 @@ pub fn dark(theme: Theme) -> bool {
         },
     }
 }
-pub fn palette(theme: Theme) -> Palette {
-    if dark(theme) {
+fn palette_for_dark(is_dark: bool) -> Palette {
+    if is_dark {
         Palette {
             background: rgb(30, 32, 36),
             surface: rgb(39, 42, 47),
@@ -62,9 +63,45 @@ pub fn palette(theme: Theme) -> Palette {
         }
     }
 }
-pub unsafe fn apply(hwnd: HWND, theme: Theme) {
+/// Own cached colors and brushes; snapshots keep them alive through nested paint callbacks.
+pub struct Colors {
+    pub palette: Palette,
+    pub dark: bool,
+    pub background: HBRUSH,
+    pub surface: HBRUSH,
+    pub selected: HBRUSH,
+    pub accent: HBRUSH,
+}
+impl Colors {
+    pub fn new(theme: Theme) -> Self {
+        let dark = dark(theme);
+        let palette = palette_for_dark(dark);
+        unsafe {
+            Self {
+                palette,
+                dark,
+                background: CreateSolidBrush(palette.background),
+                surface: CreateSolidBrush(palette.surface),
+                selected: CreateSolidBrush(palette.selected),
+                accent: CreateSolidBrush(palette.accent),
+            }
+        }
+    }
+}
+impl Drop for Colors {
+    fn drop(&mut self) {
+        unsafe {
+            for brush in [self.background, self.surface, self.selected, self.accent] {
+                if !brush.is_invalid() {
+                    let _ = DeleteObject(brush.into());
+                }
+            }
+        }
+    }
+}
+pub unsafe fn apply(hwnd: HWND, dark: bool) {
     unsafe {
-        let value = i32::from(dark(theme));
+        let value = i32::from(dark);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,

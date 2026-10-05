@@ -20,4 +20,5 @@ pub mod search;
 pub mod semantic;
 mod semantic_store;
 pub mod semantic_ui;
+pub mod smart_search;
 pub mod ui_state;

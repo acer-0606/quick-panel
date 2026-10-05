@@ -1,6 +1,7 @@
 //! Small native dialogs keep every editable field in a real Win32 Edit control.
 use super::{ai_client, theme};
 use crate::connection_test::{ConnectionTestGate, ConnectionTestWorker};
+use crate::model::{ItemSummary, SmartSearchMode, Theme};
 use std::{cell::RefCell, sync::Arc};
 use windows::{
     Win32::{
@@ -51,6 +52,7 @@ enum Field {
     Choice(usize),
     AuthChoice(usize),
     IndexChoice(usize),
+    SmartChoice(usize),
     Toggle(bool),
     Switch(bool, &'static str),
 }
@@ -66,6 +68,11 @@ impl Drop for FormWindow {
 }
 struct Form {
     edits: Vec<HWND>,
+    controls: Vec<HWND>,
+    colors: theme::Colors,
+    appearance: Theme,
+    font: HFONT,
+    dpi: u32,
     done: bool,
     accepted: bool,
     test: Option<TestForm>,
@@ -88,6 +95,15 @@ struct TestRequest {
 enum TestSuccess {
     Ai,
     Embedding(usize),
+}
+impl Drop for Form {
+    fn drop(&mut self) {
+        if !self.font.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(self.font.into());
+            }
+        }
+    }
 }
 const TEST_BUTTON: usize = 3;
 const TEST_TIMER: usize = 1;
@@ -267,6 +283,96 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     poll_test(ptr);
                     return LRESULT(0);
                 }
+                WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
+                    let (palette, brush) = {
+                        let form = (*ptr).borrow();
+                        (form.colors.palette, form.colors.background)
+                    };
+                    let dc = windows::Win32::Graphics::Gdi::HDC(wp.0 as *mut _);
+                    windows::Win32::Graphics::Gdi::SetTextColor(dc, palette.text);
+                    windows::Win32::Graphics::Gdi::SetBkColor(dc, palette.background);
+                    return LRESULT(brush.0 as isize);
+                }
+                WM_ERASEBKGND => {
+                    let brush = (*ptr).borrow().colors.background;
+                    let mut rect = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    windows::Win32::Graphics::Gdi::FillRect(
+                        windows::Win32::Graphics::Gdi::HDC(wp.0 as *mut _),
+                        &rect,
+                        brush,
+                    );
+                    return LRESULT(1);
+                }
+                WM_SETTINGCHANGE | WM_THEMECHANGED => {
+                    let appearance = (*ptr).borrow().appearance;
+                    (*ptr).borrow_mut().colors = theme::Colors::new(appearance);
+                    let dark = (*ptr).borrow().colors.dark;
+                    theme::apply(hwnd, dark);
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
+                WM_DPICHANGED => {
+                    let dpi = (wp.0 & 0xffff) as u32;
+                    let (old_dpi, controls) = {
+                        let form = (*ptr).borrow();
+                        (form.dpi, form.controls.clone())
+                    };
+                    let new_font = theme::font(dpi);
+                    for control in controls {
+                        let mut rect = RECT::default();
+                        let _ = GetWindowRect(control, &mut rect);
+                        let mut points = [
+                            POINT {
+                                x: rect.left,
+                                y: rect.top,
+                            },
+                            POINT {
+                                x: rect.right,
+                                y: rect.bottom,
+                            },
+                        ];
+                        windows::Win32::Graphics::Gdi::MapWindowPoints(
+                            None,
+                            Some(hwnd),
+                            &mut points,
+                        );
+                        let scale = |n: i32| n * dpi as i32 / old_dpi.max(1) as i32;
+                        let _ = MoveWindow(
+                            control,
+                            scale(points[0].x),
+                            scale(points[0].y),
+                            scale(points[1].x - points[0].x),
+                            scale(points[1].y - points[0].y),
+                            true,
+                        );
+                        SendMessageW(
+                            control,
+                            WM_SETFONT,
+                            Some(WPARAM(new_font.0 as usize)),
+                            Some(LPARAM(1)),
+                        );
+                    }
+                    let old_font = {
+                        let mut form = (*ptr).borrow_mut();
+                        form.dpi = dpi;
+                        std::mem::replace(&mut form.font, new_font)
+                    };
+                    if !old_font.is_invalid() {
+                        let _ = DeleteObject(old_font.into());
+                    }
+                    let rect = &*(lp.0 as *const RECT);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    return LRESULT(0);
+                }
                 WM_CLOSE => {
                     (*ptr).borrow_mut().done = true;
                     cancel_test(ptr);
@@ -284,12 +390,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 /// A bounded modal editor. It dispatches the application's messages while waiting.
-pub unsafe fn form(owner: HWND, title: &str, fields: &[(&str, String)]) -> Option<Vec<String>> {
+pub unsafe fn form(
+    owner: HWND,
+    title: &str,
+    fields: &[(&str, String)],
+    appearance: Theme,
+) -> Option<Vec<String>> {
     let fields: Vec<_> = fields
         .iter()
         .map(|(label, value)| (*label, Field::Text(value.clone())))
         .collect();
-    unsafe { form_fields(owner, title, &fields) }
+    unsafe { form_fields_with_test_theme(owner, title, &fields, None, appearance) }
 }
 pub unsafe fn settings_form(
     owner: HWND,
@@ -298,9 +409,10 @@ pub unsafe fn settings_form(
     clipboard_hotkey: String,
     paused: bool,
     excluded: String,
+    preferred: SmartSearchMode,
 ) -> Option<Vec<String>> {
     unsafe {
-        form_fields(
+        form_fields_with_test_theme(
             owner,
             "设置",
             &[
@@ -312,17 +424,54 @@ pub unsafe fn settings_form(
                 ),
                 ("记录状态", Field::Toggle(paused)),
                 ("排除应用（exe 名称，逗号分隔）", Field::Text(excluded)),
+                (
+                    "智能查找首选能力",
+                    Field::SmartChoice(match preferred {
+                        SmartSearchMode::Auto => 0,
+                        SmartSearchMode::Claude => 1,
+                        SmartSearchMode::Semantic => 2,
+                    }),
+                ),
             ],
+            None,
+            match theme {
+                1 => Theme::Light,
+                2 => Theme::Dark,
+                _ => Theme::System,
+            },
         )
     }
 }
 
+pub unsafe fn clipboard_metadata_form(
+    owner: HWND,
+    summary: &ItemSummary,
+    appearance: Theme,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            "编辑固定内容的名称、别名和标签",
+            &[
+                ("名称（1–160 字符）", Field::Text(summary.title.clone())),
+                ("别名（最多 128 字符）", Field::Text(summary.alias.clone())),
+                (
+                    "标签（逗号分隔；最多 32 个）",
+                    Field::Text(summary.tags.join(", ")),
+                ),
+            ],
+            None,
+            appearance,
+        )
+    }
+}
 pub unsafe fn ai_settings_form(
     owner: HWND,
     settings: &crate::ai::AiSettings,
+    appearance: Theme,
 ) -> Option<Vec<String>> {
     unsafe {
-        form_fields_with_test(
+        form_fields_with_test_theme(
             owner,
             "AI检索设置 · 仅发送查询与功能目录",
             &[
@@ -352,15 +501,17 @@ pub unsafe fn ai_settings_form(
                 ),
             ],
             Some(TestForm::Ai(settings.clone())),
+            appearance,
         )
     }
 }
 pub unsafe fn embedding_settings_form(
     owner: HWND,
     settings: &crate::semantic::EmbeddingSettings,
+    appearance: Theme,
 ) -> Option<Vec<String>> {
     unsafe {
-        form_fields_with_test(
+        form_fields_with_test_theme(
             owner,
             "语义检索设置 · 独立 Embedding 服务",
             &[
@@ -392,17 +543,16 @@ pub unsafe fn embedding_settings_form(
                 ),
             ],
             Some(TestForm::Embedding(settings.clone())),
+            appearance,
         )
     }
 }
-unsafe fn form_fields(owner: HWND, title: &str, fields: &[(&str, Field)]) -> Option<Vec<String>> {
-    unsafe { form_fields_with_test(owner, title, fields, None) }
-}
-unsafe fn form_fields_with_test(
+unsafe fn form_fields_with_test_theme(
     owner: HWND,
     title: &str,
     fields: &[(&str, Field)],
     test: Option<TestForm>,
+    appearance: Theme,
 ) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -419,6 +569,11 @@ unsafe fn form_fields_with_test(
         let testing = test.is_some();
         let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
+            controls: Vec::new(),
+            colors: theme::Colors::new(appearance),
+            appearance,
+            font: HFONT::default(),
+            dpi: 96,
             done: false,
             accepted: false,
             test,
@@ -460,11 +615,21 @@ unsafe fn form_fields_with_test(
         .ok()?;
         let _window_guard = FormWindow(hwnd);
         let font = theme::font(dpi);
+        {
+            let mut form = state.borrow_mut();
+            form.font = font;
+            form.dpi = dpi;
+        }
+        let dark = state.borrow().colors.dark;
+        theme::apply(hwnd, dark);
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
             let value = wide(match value {
                 Field::Text(t) | Field::Password(t) => t,
-                Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => "",
+                Field::Choice(_)
+                | Field::AuthChoice(_)
+                | Field::IndexChoice(_)
+                | Field::SmartChoice(_) => "",
                 Field::Toggle(_) => "暂停剪贴板记录",
                 Field::Switch(_, label) => label,
             });
@@ -488,7 +653,10 @@ unsafe fn form_fields_with_test(
                 WS_EX_CLIENTEDGE,
                 match fields[i].1 {
                     Field::Text(_) | Field::Password(_) => w!("EDIT"),
-                    Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
+                    Field::Choice(_)
+                    | Field::AuthChoice(_)
+                    | Field::IndexChoice(_)
+                    | Field::SmartChoice(_) => {
                         w!("COMBOBOX")
                     }
                     Field::Toggle(_) | Field::Switch(_, _) => w!("BUTTON"),
@@ -500,9 +668,10 @@ unsafe fn form_fields_with_test(
                     | WINDOW_STYLE(match fields[i].1 {
                         Field::Text(_) => ES_AUTOHSCROLL as u32,
                         Field::Password(_) => (ES_AUTOHSCROLL | ES_PASSWORD) as u32,
-                        Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
-                            CBS_DROPDOWNLIST as u32
-                        }
+                        Field::Choice(_)
+                        | Field::AuthChoice(_)
+                        | Field::IndexChoice(_)
+                        | Field::SmartChoice(_) => CBS_DROPDOWNLIST as u32,
                         Field::Toggle(_) | Field::Switch(_, _) => BS_AUTOCHECKBOX as u32,
                     }),
                 scale(18),
@@ -511,7 +680,10 @@ unsafe fn form_fields_with_test(
                 scale(
                     if matches!(
                         fields[i].1,
-                        Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_)
+                        Field::Choice(_)
+                            | Field::AuthChoice(_)
+                            | Field::IndexChoice(_)
+                            | Field::SmartChoice(_)
                     ) {
                         150
                     } else {
@@ -529,11 +701,18 @@ unsafe fn form_fields_with_test(
             match fields[i].1 {
                 Field::Choice(selected)
                 | Field::AuthChoice(selected)
-                | Field::IndexChoice(selected) => {
+                | Field::IndexChoice(selected)
+                | Field::SmartChoice(selected) => {
                     let choices: &[&str] = if matches!(fields[i].1, Field::AuthChoice(_)) {
                         &["API Key（x-api-key）", "Bearer token（兼容网关）"]
                     } else if matches!(fields[i].1, Field::IndexChoice(_)) {
                         &["固定内容与收藏", "全部文本"]
+                    } else if matches!(fields[i].1, Field::SmartChoice(_)) {
+                        &[
+                            "自动：有索引查相似内容，否则用 Claude",
+                            "Claude：理解描述并查本机内容与功能",
+                            "语义：在已建立的索引中找相似内容",
+                        ]
                     } else {
                         &["跟随系统", "浅色", "深色"]
                     };
@@ -553,7 +732,11 @@ unsafe fn form_fields_with_test(
                 }
                 Field::Text(_) | Field::Password(_) => {}
             }
-            state.borrow_mut().edits.push(e);
+            {
+                let mut form = state.borrow_mut();
+                form.edits.push(e);
+                form.controls.extend([l, e]);
+            }
         }
         if testing {
             let y = scale(12 + fields.len() as i32 * 62);
@@ -589,6 +772,7 @@ unsafe fn form_fields_with_test(
             .ok()?;
             SendMessageW(button, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             SendMessageW(output, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            state.borrow_mut().controls.extend([button, output]);
             {
                 let mut form = state.borrow_mut();
                 form.test_button = Some(button);
@@ -619,6 +803,7 @@ unsafe fn form_fields_with_test(
             )
             .ok()?;
             SendMessageW(b, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            state.borrow_mut().controls.push(b);
             if id == 1 {
                 state.borrow_mut().save_button = Some(b);
             }
@@ -677,7 +862,10 @@ unsafe fn form_fields_with_test(
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
                     Field::Text(_) | Field::Password(_) => text(*e),
-                    Field::Choice(_) | Field::AuthChoice(_) | Field::IndexChoice(_) => {
+                    Field::Choice(_)
+                    | Field::AuthChoice(_)
+                    | Field::IndexChoice(_)
+                    | Field::SmartChoice(_) => {
                         SendMessageW(*e, CB_GETCURSEL, None, None).0.to_string()
                     }
                     Field::Toggle(_) | Field::Switch(_, _) => {
@@ -687,7 +875,7 @@ unsafe fn form_fields_with_test(
                 .collect()
         });
         let _ = DestroyWindow(hwnd);
-        let _ = DeleteObject(font.into());
+
         let _ = EnableWindow(owner, true);
         let _ = SetForegroundWindow(owner);
         if let Some(code) = quit {
@@ -696,5 +884,5 @@ unsafe fn form_fields_with_test(
         result
     }
 }
-use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, HBRUSH};
+use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, HBRUSH, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;

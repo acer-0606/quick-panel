@@ -198,6 +198,10 @@ pub enum Event {
         request_id: u64,
         status: SemanticIndexStatus,
     },
+    SemanticStatusFailed {
+        request_id: u64,
+        message: String,
+    },
     SemanticBatch(crate::semantic::IndexBatch),
     EmbeddingsStored {
         request_id: u64,

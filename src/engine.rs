@@ -854,37 +854,16 @@ impl Actor {
         Ok(())
     }
     fn edit_clipboard_metadata(&mut self, input: ClipboardMetadataInput) -> Result<(), String> {
-        let title = input.title.trim();
-        let alias = input.alias.trim();
-        if title.is_empty()
-            || title.chars().count() > 160
-            || alias.chars().count() > 128
-            || input.tags.len() > 32
-            || input.tags.iter().any(|t| t.trim().chars().count() > 64)
-            || title
-                .chars()
-                .chain(alias.chars())
-                .chain(input.tags.iter().flat_map(|t| t.chars()))
-                .any(char::is_control)
-        {
-            return Err("名称需为 1–160 字符，别名最多 128 字符，标签最多 32 个、各 64 字符，且不能含控制字符".into());
-        }
+        let input = crate::smart_search::normalize_metadata(input)?;
         let Some(mut item) = self.lookup(&input.id, false)? else {
             return Err("剪贴板条目不存在".into());
         };
         if item.summary.kind != ItemKind::Clipboard || !item.summary.pinned {
             return Err("仅可编辑已固定的剪贴板条目".into());
         }
-        item.summary.title = title.into();
-        item.summary.alias = alias.into();
-        let mut seen = HashSet::new();
-        item.summary.tags = input
-            .tags
-            .iter()
-            .map(|t| t.trim())
-            .filter(|t| !t.is_empty() && seen.insert(t.to_lowercase()))
-            .map(str::to_owned)
-            .collect();
+        item.summary.title = input.title;
+        item.summary.alias = input.alias;
+        item.summary.tags = input.tags;
         let mutation = if self
             .pending
             .get(&input.id)
@@ -1482,9 +1461,13 @@ impl Actor {
                     }
                     continue;
                 }
-                if self.status_work.is_some() {
+                if let Some(work) = &self.status_work {
+                    let request_id = work.request_id;
                     if let Err(message) = self.status_step() {
-                        self.error(message);
+                        self.emit(Event::SemanticStatusFailed {
+                            request_id,
+                            message,
+                        });
                     }
                     continue;
                 }
@@ -1547,7 +1530,15 @@ impl Actor {
                 }
                 Command::SaveFavorite(favorite) => self.favorite(favorite),
                 Command::EditClipboardMetadata(input) => self.edit_clipboard_metadata(input),
-                Command::SemanticStatus { request_id } => self.semantic_status(request_id),
+                Command::SemanticStatus { request_id } => {
+                    if let Err(message) = self.semantic_status(request_id) {
+                        self.emit(Event::SemanticStatusFailed {
+                            request_id,
+                            message,
+                        });
+                    }
+                    Ok(())
+                }
                 Command::SaveSettings(settings) => {
                     if self.settings.embedding != settings.embedding {
                         self.source_generation += 1;
@@ -1594,7 +1585,12 @@ impl Actor {
                     Ok(())
                 }
                 Command::Shutdown => {
-                    self.status_work = None;
+                    if let Some(work) = self.status_work.take() {
+                        self.emit(Event::SemanticStatusFailed {
+                            request_id: work.request_id,
+                            message: "本地索引状态检查已取消".into(),
+                        });
+                    }
                     self.exiting = true;
                     if self.flush() {
                         // Drop SQLite before the final acknowledgement.
@@ -1725,6 +1721,8 @@ mod status_scheduling_tests {
             queue(&sender, &queries, command);
         }
         thread::scope(|scope| {
+            // Local ownership drops the live channel before scoped joining on unwind.
+            let sender = sender;
             let worker = scope.spawn(|| actor.run(received));
             let mut saved = 0;
             let status = loop {
@@ -1840,6 +1838,12 @@ mod status_scheduling_tests {
         assert!(actor.run(received));
         assert!(actor.status_work.is_none());
         let events: Vec<_> = events.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::SemanticStatusFailed { request_id: 94, .. })),
+            "shutdown must release the front-end state slot even if saving later fails"
+        );
         assert_eq!(
             events
                 .iter()

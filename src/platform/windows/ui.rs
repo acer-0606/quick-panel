@@ -21,6 +21,7 @@ use crate::{
         IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
         sync_semantic_view,
     },
+    smart_search::{ClipboardMetadataForm, SmartAction, SmartPreflight, SmartView, StatusCache},
     ui_state::{KeyAction, Lifecycle, MenuTarget, PanelKey, UiState},
 };
 use std::{
@@ -50,10 +51,10 @@ const LIST: usize = 101;
 const ADD: usize = 102;
 const PREVIEW: usize = 103;
 const SETTINGS: usize = 104;
-const AI_FIND: usize = 105;
+const SMART_FIND: usize = 105;
 const GENERAL_SETTINGS: usize = 106;
 const AI_SETTINGS: usize = 107;
-const SEMANTIC_FIND: usize = 108;
+const INDEX_STATUS: usize = 108;
 const EMBEDDING_SETTINGS: usize = 109;
 const INDEX_START: usize = 110;
 const INDEX_CANCEL: usize = 111;
@@ -221,9 +222,10 @@ fn prepare_preview((generation, item): (u64, StoredItem)) -> PreviewResult {
 #[derive(Clone)]
 struct RenderState {
     dpi: u32,
-    theme: Theme,
+    colors: Rc<theme::Colors>,
     font: HFONT,
-    brush: HBRUSH,
+    saved_times: Vec<String>,
+    row_details: Vec<palette::RowDetail>,
     items: Vec<PaletteEntry>,
     image: Option<Arc<Image>>,
 }
@@ -256,11 +258,14 @@ enum UiEffect {
         owner: HWND,
         settings: EmbeddingSettings,
     },
-    SemanticPrompt {
+    SmartPrompt {
         owner: HWND,
+        preferred: Option<SmartSearchMode>,
     },
-    AiPrompt {
+    ClipboardMetadata {
         owner: HWND,
+        form: ClipboardMetadataForm,
+        target: MenuTarget,
     },
     ExitError {
         owner: HWND,
@@ -373,11 +378,11 @@ struct App {
     list: HWND,
     footer: HWND,
     preview: HWND,
-    ai_button: HWND,
-    semantic_button: HWND,
+    smart_button: HWND,
+    index_label: HWND,
     buttons: Vec<HWND>,
     font: HFONT,
-    brush: HBRUSH,
+    colors: Rc<theme::Colors>,
     engine: Option<Engine>,
     state: UiState,
     settings: Settings,
@@ -391,6 +396,9 @@ struct App {
     ai_plan: Option<AiPlan>,
     semantic_query: QuerySession,
     semantic_index: IndexSession,
+    semantic_status: StatusCache,
+    smart_preflight: SmartPreflight,
+    smart_mode: Option<SmartSearchMode>,
     query_worker: Option<EmbeddingWorker>,
     index_worker: Option<EmbeddingWorker>,
     scope: Scope,
@@ -413,6 +421,39 @@ struct App {
     dpi: u32,
     suppress_sequence: Option<u32>,
     last_capture_sequence: u32,
+}
+/// Windows converts the stored Unix timestamp using the current local time zone.
+fn local_saved_time(milliseconds: i64) -> String {
+    let Some(ticks) = milliseconds
+        .checked_add(11_644_473_600_000)
+        .and_then(|ms| ms.checked_mul(10_000))
+    else {
+        return String::new();
+    };
+    if ticks < 0 {
+        return String::new();
+    }
+    let ticks = ticks as u64;
+    let utc = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc_time = SYSTEMTIME::default();
+    let mut time = SYSTEMTIME::default();
+    unsafe {
+        if windows::Win32::System::Time::FileTimeToSystemTime(&utc, &mut utc_time).is_err()
+            || windows::Win32::System::Time::SystemTimeToTzSpecificLocalTimeEx(
+                None, &utc_time, &mut time,
+            )
+            .is_err()
+        {
+            return String::new();
+        }
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute
+    )
 }
 unsafe fn post(handle: usize, msg: u32) {
     let _ = PostMessageW(Some(HWND(handle as *mut _)), msg, WPARAM(0), LPARAM(0));
@@ -449,11 +490,11 @@ pub fn run() -> Result<(), String> {
             list: HWND::default(),
             footer: HWND::default(),
             preview: HWND::default(),
-            ai_button: HWND::default(),
-            semantic_button: HWND::default(),
+            smart_button: HWND::default(),
+            index_label: HWND::default(),
             buttons: Vec::new(),
             font: HFONT::default(),
-            brush: HBRUSH::default(),
+            colors: Rc::new(theme::Colors::new(Theme::System)),
             engine: None,
             state: UiState::default(),
             settings: Settings::default(),
@@ -467,6 +508,9 @@ pub fn run() -> Result<(), String> {
             ai_plan: None,
             semantic_query: QuerySession::default(),
             semantic_index: IndexSession::default(),
+            semantic_status: StatusCache::default(),
+            smart_preflight: SmartPreflight::default(),
+            smart_mode: None,
             query_worker: None,
             index_worker: None,
             scope: Scope::All,
@@ -490,13 +534,15 @@ pub fn run() -> Result<(), String> {
             suppress_sequence: None,
             last_capture_sequence: 0,
         };
+        let host_colors = app_data.colors.clone();
         let host = Box::new(Host {
             app: RefCell::new(app_data),
             render: RefCell::new(Rc::new(RenderState {
                 dpi: 96,
-                theme: Theme::System,
+                colors: host_colors,
+                saved_times: Vec::new(),
+                row_details: Vec::new(),
                 font: HFONT::default(),
-                brush: HBRUSH::default(),
                 items: Vec::new(),
                 image: None,
             })),
@@ -602,9 +648,24 @@ impl App {
             if let Some(host) = self.host.as_ref() {
                 *host.render.borrow_mut() = Rc::new(RenderState {
                     dpi: self.dpi,
-                    theme: self.settings.theme,
+                    colors: self.colors.clone(),
                     font: self.font,
-                    brush: self.brush,
+                    saved_times: self
+                        .items
+                        .iter()
+                        .map(|entry| {
+                            entry
+                                .detail(&self.query)
+                                .saved_at_ms
+                                .map(local_saved_time)
+                                .unwrap_or_default()
+                        })
+                        .collect(),
+                    row_details: self
+                        .items
+                        .iter()
+                        .map(|entry| entry.detail(&self.query))
+                        .collect(),
                     items: self.items.clone(),
                     image: self.image.clone(),
                 });
@@ -618,12 +679,203 @@ impl App {
         self.pending_paste = None;
         self.state.target_changed();
     }
+    fn smart_view(&self) -> SmartView {
+        SmartView {
+            query: unsafe { dialogs::text(self.edit) },
+            scope: self.scope,
+            profile: semantic::profile_id(&self.settings.embedding).unwrap_or_default(),
+            preferred: self.smart_mode.unwrap_or(self.settings.smart_search),
+            ai_enabled: self.settings.ai.enabled,
+            embedding_enabled: self.settings.embedding.enabled,
+        }
+    }
+    unsafe fn smart_button_label(&self) {
+        let active = self.smart_preflight.busy()
+            || self.ai_gate.busy()
+            || self.ai_plan.is_some()
+            || self.semantic_query.busy()
+            || self.semantic_query.adopted();
+        let _ = SetWindowTextW(
+            self.smart_button,
+            if active {
+                w!("取消智能")
+            } else {
+                w!("智能查找")
+            },
+        );
+    }
+    unsafe fn cancel_preflight(&mut self) {
+        self.smart_preflight.cancel();
+        self.smart_mode = None;
+        self.smart_button_label();
+    }
+    unsafe fn update_index_label(&self) {
+        let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+        let message = if self.semantic_index.active() {
+            format!(
+                "索引更新中 · 已接收 {} 条 · 点击取消",
+                self.semantic_index.accepted()
+            )
+        } else if let Some(status) = self.semantic_status.ready(&profile) {
+            if status.indexed == 0 {
+                "未建立可用索引 · 建立索引".into()
+            } else if status.needs_update {
+                format!("已索引 {} 条 · 待更新 · 更新索引", status.indexed)
+            } else {
+                format!("已索引 {} 条 · 更新索引", status.indexed)
+            }
+        } else {
+            "索引状态待刷新 · 建立/更新索引".into()
+        };
+        let text = wide(&message);
+        let _ = SetWindowTextW(self.index_label, PCWSTR(text.as_ptr()));
+    }
+    unsafe fn refresh_semantic_status(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running
+            || !self.settings.embedding.enabled
+            || self.semantic_index.active() && !self.smart_preflight.busy()
+        {
+            return;
+        }
+        let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+        if let Some(command) = self.semantic_status.request(&profile) {
+            let Command::SemanticStatus { request_id } = command else {
+                unreachable!()
+            };
+            if let Some(engine) = &self.engine {
+                if let Err(message) = engine.send(Command::SemanticStatus { request_id }) {
+                    self.semantic_status.fail(request_id);
+                    self.cancel_preflight();
+                    self.status(&message);
+                }
+            } else {
+                self.semantic_status.fail(request_id);
+                self.cancel_preflight();
+            }
+        }
+        self.update_index_label();
+    }
+    unsafe fn index_guidance(&self) {
+        self.update_index_label();
+        self.status("尚未建立可用索引；点击“建立索引”后再智能查找");
+        let _ = SetFocus(Some(self.index_label));
+    }
+    unsafe fn begin_smart(&mut self, preferred: Option<SmartSearchMode>) {
+        if !self.state.visible
+            || self.state.modal_open
+            || self.state.lifecycle != Lifecycle::Running
+        {
+            return;
+        }
+        if self.smart_preflight.busy()
+            || self.ai_gate.busy()
+            || self.ai_plan.is_some()
+            || self.semantic_query.busy()
+            || self.semantic_query.adopted()
+        {
+            self.cancel_preflight();
+            self.cancel_semantic();
+            self.cancel_ai();
+            self.search();
+            self.smart_button_label();
+            self.status("已取消智能查找，恢复本地检索");
+            return;
+        }
+        self.smart_mode = preferred;
+        let view = self.smart_view();
+        if !view.embedding_enabled {
+            let action = crate::smart_search::choose(&view, None);
+            if !matches!(action, SmartAction::Claude) {
+                self.run_smart_action(action);
+                return;
+            }
+        }
+        if [
+            "智能查找",
+            "智能检索",
+            "智能搜索",
+            "按意思查找",
+            "Claude 按意思查找",
+            "AI检索",
+            "AI搜索",
+            "语义查找",
+            "语义搜索",
+            "向量检索",
+            "语义查找（已建索引）",
+        ]
+        .contains(&view.query.trim())
+        {
+            self.effects.push_back(UiEffect::SmartPrompt {
+                owner: self.hwnd,
+                preferred,
+            });
+            return;
+        }
+        if view.query.trim().is_empty() || view.query.chars().count() > semantic::MAX_INPUT_CHARS {
+            self.status("请输入不超过 4096 字的检索描述");
+            return;
+        }
+        if view.embedding_enabled && view.profile.is_empty() {
+            if view.preferred != SmartSearchMode::Semantic && view.ai_enabled {
+                self.begin_ai();
+            } else {
+                self.embedding_settings();
+            }
+            return;
+        }
+        self.cancel_actions();
+        self.smart_preflight.begin(view);
+        self.smart_button_label();
+        self.refresh_semantic_status();
+        self.finish_smart_preflight();
+        if self.smart_preflight.busy() {
+            self.status("正在检查本地索引…点击智能查找可取消");
+        }
+    }
+    unsafe fn finish_smart_preflight(&mut self) {
+        let view = self.smart_view();
+        let active = self.state.visible
+            && !self.state.modal_open
+            && self.state.lifecycle == Lifecycle::Running
+            && GetForegroundWindow() == self.hwnd;
+        if let Some(action) =
+            self.smart_preflight
+                .finish(&view, active, self.semantic_status.ready(&view.profile))
+        {
+            self.smart_mode = None;
+            self.run_smart_action(action);
+        }
+        self.smart_button_label();
+    }
+    unsafe fn run_smart_action(&mut self, action: SmartAction) {
+        match action {
+            SmartAction::Semantic => self.begin_semantic(),
+            SmartAction::Claude => self.begin_ai(),
+            SmartAction::BuildIndex => self.index_guidance(),
+            SmartAction::ConfigureClaude => self.ai_settings(),
+            SmartAction::ConfigureSemantic => self.embedding_settings(),
+            SmartAction::Configure => {
+                let mut rect = RECT::default();
+                let _ = GetWindowRect(self.smart_button, &mut rect);
+                self.effects.push_back(UiEffect::Menu {
+                    owner: self.hwnd,
+                    x: rect.left,
+                    y: rect.bottom,
+                    target: None,
+                    entries: vec![
+                        (AI_SETTINGS, "配置按意思查找（Claude）…"),
+                        (EMBEDDING_SETTINGS, "配置相似内容查找（Embedding）…"),
+                    ],
+                });
+            }
+        }
+    }
     unsafe fn stop_ai_request(&mut self) {
         if let Some(worker) = self.ai_worker.as_ref() {
             worker.cancel();
         }
         self.ai_gate.cancel();
-        let _ = SetWindowTextW(self.ai_button, w!("按意思查找"));
+        self.smart_button_label();
     }
     unsafe fn cancel_ai(&mut self) {
         self.stop_ai_request();
@@ -638,6 +890,7 @@ impl App {
             self.clear_preview();
             self.rebuild_results();
         }
+        self.smart_button_label();
     }
     unsafe fn begin_ai(&mut self) {
         if self.state.lifecycle != Lifecycle::Running
@@ -648,22 +901,11 @@ impl App {
         }
         self.cancel_semantic();
         self.cancel_actions();
-        if self.ai_gate.busy() {
-            self.cancel_ai();
-            self.search();
-            self.status("已取消 AI 检索，保留本地检索");
-            return;
-        }
         if !self.settings.ai.enabled {
             self.ai_settings();
             return;
         }
         let query = dialogs::text(self.edit);
-        if ["按意思查找", "AI检索", "AI搜索", "智能查找"].contains(&query.trim()) {
-            self.effects
-                .push_back(UiEffect::AiPrompt { owner: self.hwnd });
-            return;
-        }
         if query.trim().is_empty() || query.chars().count() > 2048 {
             self.status("请输入不超过 2048 字的检索描述");
             return;
@@ -704,8 +946,8 @@ impl App {
         match self.ai_worker.as_ref().unwrap().submit(request) {
             Ok(id) => {
                 self.ai_gate.begin(id, &query, self.scope);
-                let _ = SetWindowTextW(self.ai_button, w!("取消 AI"));
-                self.status("AI 正在理解查询…普通结果仍可使用");
+                self.smart_button_label();
+                self.status("智能查找正在理解查询…本地结果仍可使用");
             }
             Err(_) => self.local_search_status(),
         }
@@ -724,7 +966,7 @@ impl App {
         {
             return;
         }
-        let _ = SetWindowTextW(self.ai_button, w!("按意思查找"));
+        self.smart_button_label();
         match claude_reply(
             completion.result,
             &mut self.ai_plan,
@@ -735,6 +977,7 @@ impl App {
             QueryReply::LocalFallback => self.local_search_status(),
             QueryReply::Ignored => {}
         }
+        self.smart_button_label();
     }
     unsafe fn cancel_semantic(&mut self) {
         self.prepare_semantic_effect(false);
@@ -756,14 +999,7 @@ impl App {
             self.clear_preview();
             self.rebuild_results();
         }
-        let _ = SetWindowTextW(
-            self.semantic_button,
-            if self.semantic_query.adopted() {
-                w!("取消语义")
-            } else {
-                w!("语义查找")
-            },
-        );
+        self.smart_button_label();
         revoked
     }
     unsafe fn restore_after_modal(&mut self, revoked: bool) {
@@ -801,23 +1037,12 @@ impl App {
         {
             return;
         }
-        if self.semantic_query.busy() || self.semantic_query.adopted() {
-            self.cancel_semantic();
-            self.search();
-            self.status("已取消语义查找，恢复普通检索");
-            return;
-        }
         self.cancel_ai();
         if !self.settings.embedding.enabled {
             self.embedding_settings();
             return;
         }
         let query = dialogs::text(self.edit);
-        if ["语义查找", "语义搜索", "向量检索"].contains(&query.trim()) {
-            self.effects
-                .push_back(UiEffect::SemanticPrompt { owner: self.hwnd });
-            return;
-        }
         if query.trim().is_empty() || query.chars().count() > semantic::MAX_INPUT_CHARS {
             self.status("请输入不超过 4096 字的语义查询");
             return;
@@ -829,6 +1054,14 @@ impl App {
                 return;
             }
         };
+        if self
+            .semantic_status
+            .ready(&profile)
+            .is_none_or(|s| s.indexed == 0)
+        {
+            self.index_guidance();
+            return;
+        }
         if self.query_worker.is_none() {
             self.query_worker = Some(self.embedding_worker());
         }
@@ -844,7 +1077,7 @@ impl App {
             }) {
             Ok(id) => {
                 self.semantic_query.begin(id, &query, self.scope, &profile);
-                let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
+                self.smart_button_label();
                 self.status("语义查询处理中…普通结果仍可使用");
             }
             Err(_) => self.local_search_status(),
@@ -873,10 +1106,10 @@ impl App {
                     self.saved_ready = false;
                     self.clear_preview();
                     self.search();
-                    let _ = SetWindowTextW(self.semantic_button, w!("取消语义"));
+                    self.smart_button_label();
                 }
                 QueryReply::LocalFallback => {
-                    let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+                    self.smart_button_label();
                     self.local_search_status();
                 }
                 QueryReply::Ignored => {}
@@ -929,6 +1162,7 @@ impl App {
         }
         let command = self.semantic_index.begin(&profile);
         self.send_index(command);
+        self.update_index_label();
         self.rebuild_results();
         self.status("正在建立语义索引…仅发送选定范围的保存文本和元数据");
     }
@@ -937,9 +1171,14 @@ impl App {
             worker.cancel();
         }
         self.semantic_index.cancel();
+        self.update_index_label();
         self.rebuild_results();
     }
     unsafe fn index_status(&mut self) {
+        if !self.semantic_index.active() {
+            self.refresh_semantic_status();
+        }
+        self.update_index_label();
         self.rebuild_results();
         self.status(&format!(
             "语义索引{} · 已接收 {} 条",
@@ -1026,6 +1265,8 @@ impl App {
         }
         self.cancel_semantic();
         self.cancel_index();
+        self.cancel_preflight();
+        self.semantic_status.mark_dirty();
         self.settings.embedding = next;
         self.send(Command::SaveSettings(self.settings.clone()));
         self.retheme();
@@ -1133,8 +1374,13 @@ impl App {
                 | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
             112,
         )?;
-        self.ai_button = self.control(w!("BUTTON"), "按意思查找", WS_TABSTOP, AI_FIND)?;
-        self.semantic_button = self.control(w!("BUTTON"), "语义查找", WS_TABSTOP, SEMANTIC_FIND)?;
+        self.smart_button = self.control(w!("BUTTON"), "智能查找", WS_TABSTOP, SMART_FIND)?;
+        self.index_label = self.control(
+            w!("BUTTON"),
+            "索引状态待刷新",
+            WS_TABSTOP | WINDOW_STYLE((BS_FLAT | BS_LEFT) as u32),
+            INDEX_STATUS,
+        )?;
         let _ = ShowWindow(self.preview, SW_HIDE);
         for (id, title) in [
             (ADD, "添加 ＋"),
@@ -1173,17 +1419,14 @@ impl App {
         if !self.font.is_invalid() {
             let _ = DeleteObject(self.font.into());
         }
-        if !self.brush.is_invalid() {
-            let _ = DeleteObject(self.brush.into());
-        }
         self.font = theme::font(self.dpi);
-        self.brush = CreateSolidBrush(theme::palette(self.settings.theme).background);
+        self.colors = Rc::new(theme::Colors::new(self.settings.theme));
         self.sync_render();
-        theme::apply(self.hwnd, self.settings.theme);
+        theme::apply(self.hwnd, self.colors.dark);
         for h in [self.edit, self.list, self.footer, self.preview]
             .into_iter()
             .chain(self.buttons.iter().copied())
-            .chain([self.ai_button, self.semantic_button])
+            .chain([self.smart_button, self.index_label])
         {
             SendMessageW(
                 h,
@@ -1192,22 +1435,17 @@ impl App {
                 Some(LPARAM(1)),
             );
         }
+        let _ = ShowWindow(self.smart_button, SW_SHOW);
         let _ = ShowWindow(
-            self.ai_button,
-            if self.settings.ai.enabled {
-                SW_SHOW
-            } else {
-                SW_HIDE
-            },
-        );
-        let _ = ShowWindow(
-            self.semantic_button,
+            self.index_label,
             if self.settings.embedding.enabled {
                 SW_SHOW
             } else {
                 SW_HIDE
             },
         );
+        self.update_index_label();
+        self.smart_button_label();
         self.layout();
         SendMessageW(
             self.list,
@@ -1231,33 +1469,16 @@ impl App {
         let mov = |hwnd: HWND, x, y, width, height| {
             let _ = MoveWindow(hwnd, x, y, width, height, true);
         };
-        let ai_width = if self.settings.ai.enabled {
-            self.s(114)
-        } else {
-            0
-        };
-        let semantic_width = if self.settings.embedding.enabled {
-            self.s(114)
-        } else {
-            0
-        };
         mov(
             self.edit,
             edge,
             self.s(18),
-            (w - self.s(126) - ai_width - semantic_width).max(self.s(80)),
+            (w - self.s(240)).max(self.s(80)),
             self.s(36),
         );
         mov(
-            self.ai_button,
+            self.smart_button,
             w - self.s(212),
-            self.s(18),
-            self.s(106),
-            self.s(36),
-        );
-        mov(
-            self.semantic_button,
-            w - self.s(98) - ai_width - self.s(114),
             self.s(18),
             self.s(106),
             self.s(36),
@@ -1285,7 +1506,19 @@ impl App {
             self.s(62),
             self.s(30),
         );
-        mov(self.list, edge, self.s(110), list_width, h - self.s(165));
+        let index_height = if self.settings.embedding.enabled {
+            self.s(30)
+        } else {
+            0
+        };
+        mov(self.index_label, edge, self.s(102), list_width, self.s(26));
+        mov(
+            self.list,
+            edge,
+            self.s(110) + index_height,
+            list_width,
+            h - self.s(165) - index_height,
+        );
         mov(
             self.footer,
             edge,
@@ -1401,9 +1634,11 @@ impl App {
         if update_target && !own_window {
             SendMessageW(self.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
+        self.refresh_semantic_status();
         self.search();
     }
     unsafe fn hide(&mut self) {
+        self.cancel_preflight();
         self.cancel_semantic();
         self.cancel_ai();
         self.cancel_actions();
@@ -1445,9 +1680,10 @@ impl App {
             }
             self.items.clear();
             self.clear_preview();
-            let _ = SetWindowTextW(self.semantic_button, w!("语义查找"));
+            self.smart_button_label();
         }
         if query != self.query || self.scope != self.result_scope {
+            self.cancel_preflight();
             self.cancel_actions();
             self.clear_preview();
             self.cancel_ai();
@@ -1706,9 +1942,32 @@ impl App {
                         });
                     }
                     self.tray(NIM_MODIFY);
+                    self.refresh_semantic_status();
                     self.search();
                 }
-                Event::SemanticStatus { .. } => {}
+                Event::SemanticStatus { request_id, status } => {
+                    let profile = self.smart_view().profile;
+                    let accepted = self.semantic_status.complete(request_id, status, &profile);
+                    self.update_index_label();
+                    if accepted {
+                        self.finish_smart_preflight();
+                    } else if self.state.visible {
+                        self.refresh_semantic_status();
+                    }
+                }
+                Event::SemanticStatusFailed {
+                    request_id,
+                    message,
+                } => {
+                    if self.semantic_status.fail(request_id) {
+                        self.cancel_preflight();
+                        self.update_index_label();
+                        // Read/storage failures keep their detail, without automatic retries.
+                        if self.state.lifecycle == Lifecycle::Running {
+                            self.status(&message);
+                        }
+                    }
+                }
                 Event::SemanticBatch(batch) => self.index_batch(batch),
                 Event::EmbeddingsStored {
                     request_id,
@@ -1719,7 +1978,11 @@ impl App {
                         self.send_index(command);
                     }
                     if was_active {
+                        self.semantic_status.mark_dirty();
                         self.index_status();
+                        if !self.semantic_index.active() {
+                            self.refresh_semantic_status();
+                        }
                     }
                     if self.state.visible && self.semantic_query.adopted() {
                         self.search();
@@ -1820,11 +2083,18 @@ impl App {
                     }
                 }
                 Event::Changed => {
+                    self.semantic_status.mark_dirty();
+                    self.update_index_label();
                     if self.state.visible {
+                        self.refresh_semantic_status();
                         self.search();
                     }
                 }
                 Event::Saved(_) => {
+                    self.semantic_status.mark_dirty();
+                    if self.state.visible {
+                        self.refresh_semantic_status();
+                    }
                     if self.state.lifecycle == Lifecycle::Running {
                         self.status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
                     }
@@ -1892,8 +2162,10 @@ impl App {
         if self.preview_open && self.preview_loading {
             self.status("正在加载所选内容预览…");
         }
-        if self.ai_gate.busy() {
-            self.status("AI 正在理解查询…可点击取消 AI");
+        if self.smart_preflight.busy() {
+            self.status("正在检查本地索引…点击智能查找可取消");
+        } else if self.ai_gate.busy() || self.semantic_query.busy() {
+            self.status("智能查找处理中…可点击取消");
         }
     }
     unsafe fn request(&mut self, action: Action) {
@@ -2031,7 +2303,19 @@ impl App {
                 self.suppress_sequence = Some(clipboard::sequence_number());
             }
             Action::Edit => {
-                self.edit_favorite(Some(item), None);
+                if item.summary.kind == ItemKind::Clipboard {
+                    if let Some(form) = ClipboardMetadataForm::new(&item.summary) {
+                        self.effects.push_back(UiEffect::ClipboardMetadata {
+                            owner: self.hwnd,
+                            form,
+                            target: self.state.menu_target(),
+                        });
+                    } else {
+                        self.status("请先固定，再编辑名称、别名和标签");
+                    }
+                } else {
+                    self.edit_favorite(Some(item), None);
+                }
             }
             Action::Relink => {
                 self.effects.push_back(UiEffect::Picker {
@@ -2239,6 +2523,7 @@ impl App {
             return Err("API 地址无效，配置未保存".into());
         }
         self.cancel_ai();
+        self.cancel_preflight();
         self.settings.ai = next;
         self.send(Command::SaveSettings(self.settings.clone()));
         self.retheme();
@@ -2268,6 +2553,11 @@ impl App {
         settings.hotkey_key = k;
         settings.clipboard_hotkey_modifiers = cm;
         settings.clipboard_hotkey_key = ck;
+        settings.smart_search = match v[5].as_str() {
+            "1" => SmartSearchMode::Claude,
+            "2" => SmartSearchMode::Semantic,
+            _ => SmartSearchMode::Auto,
+        };
         settings.capture_paused = v[3] == "1";
         settings.excluded_apps = v[4]
             .split([',', '，'])
@@ -2282,6 +2572,7 @@ impl App {
             });
             return;
         }
+        self.cancel_preflight();
         self.settings = settings.clone();
         self.retheme();
         self.tray(NIM_MODIFY);
@@ -2313,11 +2604,21 @@ impl App {
             .and_then(PaletteEntry::saved)
             .is_some_and(|i| i.kind == ItemKind::Clipboard)
         {
+            let pinned = self
+                .state
+                .selected_index()
+                .and_then(|i| self.items.get(i))
+                .is_some_and(PaletteEntry::pinned);
             vec![
                 (OPEN, "粘贴"),
                 (COPY, "复制"),
                 (PLAIN, "纯文本粘贴"),
                 (PIN, "固定 / 取消固定"),
+                if pinned {
+                    (EDIT, "编辑名称、别名和标签…")
+                } else {
+                    (PIN, "先固定以编辑名称、别名和标签")
+                },
                 (DELETE, "删除"),
             ]
         } else {
@@ -2345,6 +2646,7 @@ impl App {
         if function != Function::Exit
             && function != Function::AiSearch
             && function != Function::SemanticSearch
+            && function != Function::SmartSearch
         {
             // Result commands return to browsing content. Scope and preview
             // commands read the cleared native Edit through their normal handler.
@@ -2353,9 +2655,10 @@ impl App {
         match function {
             Function::Settings => self.settings(),
             Function::AiSettings => self.ai_settings(),
-            Function::AiSearch => self.begin_ai(),
+            Function::AiSearch => self.begin_smart(Some(SmartSearchMode::Claude)),
             Function::EmbeddingSettings => self.embedding_settings(),
-            Function::SemanticSearch => self.begin_semantic(),
+            Function::SemanticSearch => self.begin_smart(Some(SmartSearchMode::Semantic)),
+            Function::SmartSearch => self.begin_smart(None),
             Function::UpdateSemanticIndex => self.begin_index(),
             Function::CancelSemanticIndex => self.cancel_index(),
             Function::AddFolder => self.command(223),
@@ -2402,12 +2705,14 @@ impl App {
             SETTINGS => self.settings_menu(),
             GENERAL_SETTINGS => self.settings(),
             AI_SETTINGS => self.ai_settings(),
-            AI_FIND => self.begin_ai(),
-            SEMANTIC_FIND => self.begin_semantic(),
+            SMART_FIND => self.begin_smart(None),
+            INDEX_STATUS if self.semantic_index.active() => self.cancel_index(),
+            INDEX_STATUS => self.begin_index(),
             EMBEDDING_SETTINGS => self.embedding_settings(),
             INDEX_START => self.begin_index(),
             INDEX_CANCEL => self.cancel_index(),
             300..=303 => {
+                self.cancel_preflight();
                 self.cancel_semantic();
                 self.cancel_ai();
                 self.scope = match id {
@@ -2440,6 +2745,7 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.cancel_preflight();
                 self.cancel_index();
                 self.cancel_semantic();
                 self.cancel_ai();
@@ -2518,9 +2824,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
                     ENGINE_WAKE | WORK_WAKE | SHOW_EXISTING | WM_CLIPBOARDUPDATE | WM_HOTKEY
                     | WM_CLOSE | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND
-                    | WM_CONTEXTMENU | TRAY | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY => {
-                        host.defer(Deferred::Message(msg, wp, lp))
-                    }
+                    | WM_THEMECHANGED | WM_CONTEXTMENU | TRAY | WM_DROPFILES | WM_ENDSESSION
+                    | WM_DESTROY => host.defer(Deferred::Message(msg, wp, lp)),
                     WM_QUERYENDSESSION => return LRESULT(1),
                     _ => return DefWindowProcW(hwnd, msg, wp, lp),
                 }
@@ -2601,7 +2906,7 @@ unsafe fn app_message(
             app.layout();
             return Some(LRESULT(0));
         }
-        WM_SETTINGCHANGE => {
+        WM_SETTINGCHANGE | WM_THEMECHANGED => {
             app.retheme();
             return Some(LRESULT(0));
         }
@@ -2693,9 +2998,6 @@ unsafe fn app_message(
             if !app.font.is_invalid() {
                 let _ = DeleteObject(app.font.into());
             }
-            if !app.brush.is_invalid() {
-                let _ = DeleteObject(app.brush.into());
-            }
             PostQuitMessage(0);
             return Some(LRESULT(0));
         }
@@ -2727,11 +3029,17 @@ unsafe fn render_message(
                 && draw.itemID != u32::MAX
                 && let Some(item) = render.items.get(draw.itemID as usize)
             {
-                let p = theme::palette(render.theme);
+                let p = render.colors.palette;
                 let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
-                let brush = CreateSolidBrush(if selected { p.selected } else { p.surface });
-                FillRect(draw.hDC, &draw.rcItem, brush);
-                let _ = DeleteObject(brush.into());
+                FillRect(
+                    draw.hDC,
+                    &draw.rcItem,
+                    if selected {
+                        render.colors.selected
+                    } else {
+                        render.colors.surface
+                    },
+                );
                 let _ = SetBkMode(draw.hDC, TRANSPARENT);
                 let _ = SelectObject(draw.hDC, render.font.into());
                 let kind = item.kind_label();
@@ -2764,20 +3072,42 @@ unsafe fn render_message(
                     &mut type_rect,
                     DT_SINGLELINE | DT_NOPREFIX,
                 );
-                let mut subtitle = wide(&item.subtitle());
+                let mut subtitle = wide(
+                    render
+                        .row_details
+                        .get(draw.itemID as usize)
+                        .map(|detail| detail.text.as_str())
+                        .unwrap_or_default(),
+                );
                 rect.top += render.s(26);
                 rect.bottom = rect.top + render.s(22);
-                rect.right = draw.rcItem.right - render.s(14);
+                let saved_time = render
+                    .saved_times
+                    .get(draw.itemID as usize)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                rect.right =
+                    draw.rcItem.right - render.s(if saved_time.is_empty() { 14 } else { 150 });
                 DrawTextW(
                     draw.hDC,
                     &mut subtitle,
                     &mut rect,
                     DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
                 );
+                if !saved_time.is_empty() {
+                    let mut time = wide(saved_time);
+                    let mut time_rect = rect;
+                    time_rect.left = draw.rcItem.right - render.s(145);
+                    time_rect.right = draw.rcItem.right - render.s(14);
+                    DrawTextW(
+                        draw.hDC,
+                        &mut time,
+                        &mut time_rect,
+                        DT_SINGLELINE | DT_RIGHT | DT_NOPREFIX,
+                    );
+                }
                 if selected {
-                    let border = CreateSolidBrush(p.accent);
-                    FrameRect(draw.hDC, &draw.rcItem, border);
-                    let _ = DeleteObject(border.into());
+                    FrameRect(draw.hDC, &draw.rcItem, render.colors.accent);
                 }
                 if draw.itemState.0 & ODS_FOCUS.0 != 0 {
                     let _ = DrawFocusRect(draw.hDC, &draw.rcItem);
@@ -2794,16 +3124,16 @@ unsafe fn render_message(
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
             let dc = HDC(wp.0 as *mut _);
-            let p = theme::palette(render.theme);
+            let p = render.colors.palette;
             SetTextColor(dc, p.text);
             SetBkColor(dc, p.background);
-            return Some(LRESULT(render.brush.0 as isize));
+            return Some(LRESULT(render.colors.background.0 as isize));
         }
         WM_ERASEBKGND => {
             let dc = HDC(wp.0 as *mut _);
             let mut r = RECT::default();
             let _ = GetClientRect(hwnd, &mut r);
-            FillRect(dc, &r, render.brush);
+            FillRect(dc, &r, render.colors.background);
             return Some(LRESULT(1));
         }
         _ => {}
@@ -2828,7 +3158,7 @@ unsafe extern "system" fn preview_proc(
         let dc = BeginPaint(hwnd, &mut ps);
         let mut r = RECT::default();
         let _ = GetClientRect(hwnd, &mut r);
-        FillRect(dc, &r, render.brush);
+        FillRect(dc, &r, render.colors.background);
         let caption_height = render.s(28);
         let mut caption = wide(&format!(
             "原图：{} × {}",
@@ -2841,7 +3171,7 @@ unsafe extern "system" fn preview_proc(
             bottom: caption_height,
         };
         let previous_font = SelectObject(dc, render.font.into());
-        SetTextColor(dc, theme::palette(render.theme).muted);
+        SetTextColor(dc, render.colors.palette.muted);
         SetBkMode(dc, TRANSPARENT);
         DrawTextW(
             dc,
@@ -2962,8 +3292,8 @@ impl Host {
         // search/list result surfaces activate the chosen stored item.
         if key == VK_RETURN.0 as u32
             && (app.buttons.contains(&msg.hwnd)
-                || msg.hwnd == app.ai_button
-                || msg.hwnd == app.semantic_button)
+                || msg.hwnd == app.smart_button
+                || msg.hwnd == app.index_label)
         {
             return false;
         }
@@ -3091,11 +3421,14 @@ impl Host {
                     app.action_permit.cancel();
                     app.pending_action = None;
                     app.pending_paste = None;
+                    app.cancel_preflight();
                     app.stop_ai_request();
                     // Menu targets are captured before the native pump; preserve their
                     // epoch/selection while suppressing in-flight network publication.
-                    semantic_revoked =
-                        app.prepare_semantic_effect(matches!(effect, UiEffect::Menu { .. }));
+                    semantic_revoked = app.prepare_semantic_effect(matches!(
+                        effect,
+                        UiEffect::Menu { .. } | UiEffect::ClipboardMetadata { .. }
+                    ));
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
                 effect
@@ -3124,7 +3457,8 @@ impl Host {
                     kind,
                     fields,
                 } => {
-                    let result = dialogs::form(owner, "编辑收藏", &fields);
+                    let appearance = self.app.borrow().settings.theme;
+                    let result = dialogs::form(owner, "编辑收藏", &fields, appearance);
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     if let Some(values) = result {
@@ -3146,6 +3480,7 @@ impl Host {
                         ),
                         settings.capture_paused,
                         settings.excluded_apps.join(", "),
+                        settings.smart_search,
                     );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
@@ -3157,12 +3492,14 @@ impl Host {
                     semantic_revoked = false;
                 }
                 UiEffect::AiSettings { owner, settings } => {
-                    let result = dialogs::ai_settings_form(owner, &settings);
+                    let appearance = self.app.borrow().settings.theme;
+                    let result = dialogs::ai_settings_form(owner, &settings, appearance);
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     let error = result.and_then(|values| app.apply_ai_settings(values).err());
                     // Opening this form revoked its adopted plan. Cancel and validation
                     // failure also need a fresh ordinary query rather than derived rows.
+                    app.refresh_semantic_status();
                     app.search();
                     semantic_revoked = false;
                     if let Some(message) = error {
@@ -3170,25 +3507,26 @@ impl Host {
                     }
                 }
                 UiEffect::EmbeddingSettings { owner, settings } => {
-                    let result = dialogs::embedding_settings_form(owner, &settings);
+                    let appearance = self.app.borrow().settings.theme;
+                    let result = dialogs::embedding_settings_form(owner, &settings, appearance);
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     let error =
                         result.and_then(|values| app.apply_embedding_settings(values).err());
+                    app.refresh_semantic_status();
                     app.search();
                     semantic_revoked = false;
                     if let Some(message) = error {
                         app.effects.push_back(UiEffect::Message { owner, message });
                     }
                 }
-                UiEffect::SemanticPrompt { owner } => {
+                UiEffect::SmartPrompt { owner, preferred } => {
+                    let appearance = self.app.borrow().settings.theme;
                     let result = dialogs::form(
                         owner,
-                        "语义查找",
-                        &[(
-                            "本次查询发送给独立 Embedding 服务（最多 4096 字）",
-                            String::new(),
-                        )],
+                        "智能查找",
+                        &[("描述想找的内容（点击保存后发送本次查询）", String::new())],
+                        appearance,
                     );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
@@ -3196,24 +3534,23 @@ impl Host {
                         let text = wide(&values[0]);
                         let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
                         app.search();
-                        app.begin_semantic();
+                        app.begin_smart(preferred);
                         semantic_revoked = false;
                     }
                 }
-                UiEffect::AiPrompt { owner } => {
-                    let result = dialogs::form(
-                        owner,
-                        "按意思查找",
-                        &[("描述想找的内容或功能（仅此查询发送给 AI）", String::new())],
-                    );
+                UiEffect::ClipboardMetadata {
+                    owner,
+                    form,
+                    target,
+                } => {
+                    let appearance = self.app.borrow().settings.theme;
+                    let result = dialogs::clipboard_metadata_form(owner, &form.summary, appearance);
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    if let Some(values) = result {
-                        let text = wide(&values[0]);
-                        let _ = SetWindowTextW(app.edit, PCWSTR(text.as_ptr()));
-                        app.search();
-                        app.begin_ai();
-                        semantic_revoked = false;
+                    match form.finish(result, app.state.menu_target_current(&target)) {
+                        Ok(Some(input)) => app.send(Command::EditClipboardMetadata(input)),
+                        Ok(None) => (),
+                        Err(message) => app.status(&message),
                     }
                 }
                 UiEffect::ExitError { owner, message } => {

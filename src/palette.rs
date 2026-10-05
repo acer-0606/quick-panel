@@ -6,11 +6,18 @@ use crate::{
 };
 use std::cmp::Reverse;
 
+#[derive(Clone)]
+pub struct RowDetail {
+    pub text: String,
+    pub saved_at_ms: Option<i64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Function {
     Settings,
     AiSettings,
     AiSearch,
+    SmartSearch,
     EmbeddingSettings,
     SemanticSearch,
     UpdateSemanticIndex,
@@ -32,6 +39,7 @@ impl Function {
         match self {
             Self::Settings => "function:settings",
             Self::AiSettings => "function:ai-settings",
+            Self::SmartSearch => "function:smart-search",
             Self::AiSearch => "function:ai-search",
             Self::EmbeddingSettings => "function:embedding-settings",
             Self::SemanticSearch => "function:semantic-search",
@@ -88,6 +96,45 @@ pub enum Entry {
     Saved(ItemSummary),
 }
 impl Entry {
+    pub fn detail(&self, query: &str) -> RowDetail {
+        let mut text = self.subtitle();
+        if let Some(item) = self.saved()
+            && item.kind == ItemKind::Clipboard
+            && !query.trim().is_empty()
+            && let Some((source, excerpt)) = item.subtitle.split_once(" · ")
+        {
+            let normalized = excerpt.to_lowercase();
+            if let Some(position) = normalized.find(&query.trim().to_lowercase()) {
+                let preceding = normalized[..position].chars().count();
+                let mut normalized_chars = 0;
+                let matched = excerpt
+                    .chars()
+                    .position(|c| {
+                        let at = normalized_chars;
+                        normalized_chars += c.to_lowercase().count();
+                        at >= preceding
+                    })
+                    .unwrap_or(0);
+                let start = matched.saturating_sub(4);
+                let short_source: String = source.chars().take(12).collect();
+                text = format!(
+                    "{}{} · {}{}",
+                    short_source,
+                    if source.chars().count() > 12 {
+                        "…"
+                    } else {
+                        ""
+                    },
+                    if start > 0 { "…" } else { "" },
+                    excerpt.chars().skip(start).take(64).collect::<String>()
+                );
+            }
+        }
+        RowDetail {
+            text,
+            saved_at_ms: self.saved().map(|item| item.created_at_ms),
+        }
+    }
     pub fn id(&self) -> &str {
         match self {
             Self::Function(result) => result.action.id(),
@@ -104,7 +151,16 @@ impl Entry {
         match self {
             Self::Function(result) => result.description.into(),
             Self::Saved(item) if !item.alias.is_empty() => {
-                format!("{} · {}", item.alias, item.subtitle)
+                format!(
+                    "{} · {}{}",
+                    item.subtitle,
+                    item.alias.chars().take(24).collect::<String>(),
+                    if item.alias.chars().count() > 24 {
+                        "…"
+                    } else {
+                        ""
+                    }
+                )
             }
             Self::Saved(item) => item.subtitle.clone(),
         }
@@ -147,6 +203,13 @@ struct Spec {
 }
 const CATALOG: &[Spec] = &[
     Spec {
+        action: Function::SmartSearch,
+        title: "智能查找",
+        description: "按首选能力理解查询；有索引时可查相似内容",
+        alias: "智能检索",
+        keywords: &["智能搜索"],
+    },
+    Spec {
         action: Function::EmbeddingSettings,
         title: "语义检索设置",
         description: "配置独立 Embedding API、密钥和索引范围",
@@ -155,7 +218,7 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::SemanticSearch,
-        title: "语义查找",
+        title: "语义查找（已建索引）",
         description: "发送本次查询，检索已建立的语义索引",
         alias: "语义搜索",
         keywords: &["向量检索"],
@@ -183,10 +246,10 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::AiSearch,
-        title: "按意思查找",
+        title: "Claude 按意思查找",
         description: "使用已配置的 AI 理解检索描述",
         alias: "AI检索",
-        keywords: &["AI搜索", "智能查找"],
+        keywords: &["AI搜索", "按意思查找"],
     },
     Spec {
         action: Function::Settings,
@@ -290,7 +353,10 @@ fn available(action: Function, context: Context) -> bool {
 pub fn ai_catalog(context: Context) -> Vec<FunctionDescriptor> {
     CATALOG
         .iter()
-        .filter(|spec| spec.action != Function::AiSearch && available(spec.action, context))
+        .filter(|spec| {
+            !matches!(spec.action, Function::AiSearch | Function::SmartSearch)
+                && available(spec.action, context)
+        })
         .map(|spec| FunctionDescriptor {
             id: spec.action.id().into(),
             title: spec.title.into(),
@@ -303,7 +369,7 @@ pub fn ai_results(plan: &AiPlan, saved: Vec<ItemSummary>, context: Context) -> V
     let mut rows = Vec::new();
     for id in &plan.functions {
         if let Some(spec) = CATALOG.iter().find(|spec| {
-            spec.action != Function::AiSearch
+            !matches!(spec.action, Function::AiSearch | Function::SmartSearch)
                 && spec.action.id() == id
                 && available(spec.action, context)
         }) && !rows.iter().any(|row: &Entry| row.id() == id)

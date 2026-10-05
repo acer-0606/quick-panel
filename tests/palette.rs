@@ -342,3 +342,45 @@ fn adopted_semantic_result_menu_preserves_real_row_identity_and_engine_order() {
     assert!(session.adopted());
     assert!(ready);
 }
+
+#[test]
+fn unified_smart_entry_remains_reachable_without_configured_capabilities() {
+    let entries = palette::results("智能查找", vec![], Context::default());
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.function() == Some(Function::SmartSearch))
+    );
+}
+#[test]
+fn row_detail_prioritizes_source_excerpt_and_keeps_long_alias_out_of_title() {
+    let mut summary = saved("metadata", "核心标题", ItemKind::Clipboard);
+    summary.subtitle = "terminal · 命中部署片段".into();
+    summary.alias = "长别名".repeat(50);
+    summary.tags = vec!["长标签".repeat(100)];
+    summary.created_at_ms = 1728117900000;
+    let row = Entry::Saved(summary);
+    assert!(row.subtitle().starts_with("terminal · 命中部署片段"));
+    assert!(row.subtitle().chars().count() < 80);
+    assert_eq!(row.title(), "核心标题");
+    assert_eq!(row.saved().unwrap().created_at_ms, 1728117900000);
+}
+
+#[test]
+fn row_detail_keeps_body_hit_near_the_start_and_exposes_saved_time_without_loading_body() {
+    let mut summary = saved("hit", "保存标题", ItemKind::Clipboard);
+    summary.subtitle = format!(
+        "very-long-source-application.exe · {}部署目标是在周末",
+        "上下文".repeat(12)
+    );
+    summary.created_at_ms = 1728117900000;
+    let row = Entry::Saved(summary.clone());
+    let detail = row.detail("部署");
+    assert!(detail.text.starts_with("very-long-so… · …"));
+    assert!(detail.text.chars().position(|c| c == '部').unwrap() < 24);
+    assert!(detail.text.contains("部署目标是在周末"));
+    assert_eq!(detail.saved_at_ms, Some(1728117900000));
+    assert_eq!(row.saved().unwrap(), &summary);
+    let functions = palette::results("设置", vec![], Context::default());
+    assert_eq!(functions[0].detail("设置").saved_at_ms, None);
+}

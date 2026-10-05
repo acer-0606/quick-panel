@@ -27,6 +27,85 @@ fn start(path: &std::path::Path, interval: u64) -> Engine {
     wait(&engine, |e| matches!(e, Event::Ready(_)));
     engine
 }
+
+#[test]
+fn invalid_status_profile_has_a_terminal_receipt_and_explicit_retry_succeeds() {
+    let temp = tempfile::tempdir().unwrap();
+    let engine = start(&temp.path().join("status-failure.sqlite"), 60_000);
+    engine
+        .send(Command::SemanticStatus { request_id: 700 })
+        .unwrap();
+    let event = wait(&engine, |e| {
+        matches!(e, Event::SemanticStatusFailed { .. } | Event::Error { .. })
+    });
+    assert!(matches!(
+        event,
+        Event::SemanticStatusFailed {
+            request_id: 700,
+            ..
+        }
+    ));
+    configure(&engine, IndexScope::PinnedAndFavorites);
+    engine
+        .send(Command::SemanticStatus { request_id: 701 })
+        .unwrap();
+    let event = wait(&engine, |e| matches!(e, Event::SemanticStatus { .. }));
+    assert!(matches!(
+        event,
+        Event::SemanticStatus {
+            request_id: 701,
+            ..
+        }
+    ));
+    engine.send(Command::Shutdown).unwrap();
+    wait(&engine, |e| matches!(e, Event::ExitReady));
+}
+
+#[test]
+fn sqlite_status_read_failure_has_one_terminal_receipt_without_automatic_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("status-read-failure.sqlite");
+    let engine = start(&path, 60_000);
+    configure(&engine, IndexScope::PinnedAndFavorites);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE items")
+        .unwrap();
+    engine
+        .send(Command::SemanticStatus { request_id: 702 })
+        .unwrap();
+    let event = wait(&engine, |e| {
+        matches!(e, Event::SemanticStatusFailed { .. } | Event::Error { .. })
+    });
+    assert!(matches!(
+        event,
+        Event::SemanticStatusFailed {
+            request_id: 702,
+            ..
+        }
+    ));
+    engine
+        .send(Command::Search(SearchQuery {
+            text: "no-content".into(),
+            scope: Scope::All,
+            request_id: 703,
+        }))
+        .unwrap();
+    // A reliable query completes next; a failed state job cannot spin or publish a second receipt.
+    let event = wait(&engine, |e| {
+        matches!(
+            e,
+            Event::Results {
+                request_id: 703,
+                ..
+            } | Event::Error { .. }
+                | Event::SemanticStatusFailed { .. }
+        )
+    });
+    assert!(!matches!(event, Event::SemanticStatusFailed { .. }));
+    engine.send(Command::Shutdown).unwrap();
+    wait(&engine, |e| matches!(e, Event::ExitReady));
+}
 fn configure(engine: &Engine, scope: IndexScope) -> Settings {
     let mut settings = Settings::default();
     settings.embedding.enabled = true;
