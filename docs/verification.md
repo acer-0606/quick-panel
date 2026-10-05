@@ -1,10 +1,70 @@
 # 验证记录
 
-当前验证日期：2026-10-05。产品源码提交：`b667a97`。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
+当前验证日期：2026-10-05。产品源码提交：`fb9d8b1`。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
 
-首版已实现并生成 Windows x64 便携包。共享核心、Windows 源码编译与静态审查通过；Windows 原生界面的实际运行尚未在本机验证。
+已实现并生成 Windows x64 便携包。共享核心、Windows 源码编译与静态审查通过；Windows 原生界面的实际运行尚未在本机验证。
 
-## 性能、交互与功能优化（当前版本）
+## 外部常用路径与区域截图（当前版本）
+
+[本轮设计与边界](superpowers/specs/2026-10-05-external-paths-and-screenshots-design.md)；[实施计划](superpowers/plans/2026-10-05-external-paths-and-screenshots.md)。
+
+外部路径推荐主要读取前台 Windows 资源管理器的活动可见文件系统视图，无须先通过本工具打开或收藏。入口为“常用推荐设置”，也可从设置/托盘菜单进入；默认关闭，用户启用后每两秒探测，路径稳定至少1.5秒才记录。同一窗口停留/重新聚焦不重复计次，规范路径30秒内跨来源合并。Windows11共享顶层窗口的标签页以活动视图COM身份、可见性、前台root及PIDL复核；无法确定的分支跳过。第三方文件管理器、虚拟位置和后台未访问的标签页不承诺覆盖。
+
+Recent作为可单独关闭的文档补充，依赖Windows和应用写入最近文档；带启动参数、参数读取失败或无法确定的链接跳过。只读取Recent目录和链接自身，不Resolve、不探测目标存在性、不读取文档正文；首次及故障重建仅建立基线。基线最多2048条、单次目录枚举最多8192条、链接最多1MiB、每轮解析最多16条变化，多余变化跳过；超限或不完整基线不回放。通知初始化或续订失败至少间隔30秒才重建，复用同一个实际worker，保持Explorer来源继续工作。以上是有界访问观察，不是完整文件打开审计。
+
+排名在本机按7天半衰期衰减的访问权重计算，Explorer权重1、Recent权重0.5。最多1024个有效路径、128个“不再推荐”项，路径最多2048UTF-16单元，核心路径缓存预算2MiB，独立观察队列预算256KiB。90天未访问的非抑制记录在查询中隐藏，并在有变更的保存事务中清理；不清理人工收藏或“不再推荐”偏好。大小写折叠的身份key与保留大小写的实际目标分开，避免改变可打开的路径。预算不是整个进程RSS承诺。
+
+自动路径以独立条目加入三种检索的本地结果，空查询最多5条、有输入最多10条，总列表最多50条。与同请求当前结果中的人工收藏按规范路径去重；若Semantic结果未返回某收藏，可出现同路径自动项。自动项支持打开、定位、复制路径、明确收藏和不再推荐；最近访问时间与原有保存时间分开。设置支持排除目录、关闭和清空，暂停剪贴板记录与路径开关独立。
+
+自动统计不插入items/FTS/向量表，不发送给AI，不自动成为收藏；明确收藏后遵循原来的索引规则。变化路径与已有历史在同一个约55秒开始、健康情况下60秒窗口的事务中提交；查询不创建表、不写盘，失败保留待保存状态，退出保存已接收数据。纯路径变更不重启语义来源/状态分页；如果同次维护真正删除了过期正文和向量，实际效果仍会使语义状态失效。
+
+区域截图从功能搜索、设置菜单或托盘进入，拖选后松开鼠标确认；截图快捷键有独立小设置窗，默认关闭。三组热键保留交换、冲突回滚及旧配置兼容。原生选区采用物理坐标并处理负原点、多屏和DPI；取消、失去捕获、显示变化或退出不提交旧意图。截图自身隐藏与失活不会误撤销，结束后不抢用户已切换的前台。
+
+选区层隐藏/销毁后只读取确认区域，不持续抓屏、不缓存整个桌面、不生成临时图片。原始BGRA预算64MiB；后台WIC编码设置不透明alpha并确认实际像素格式，最终PNG预算8MiB，按预算准备兼容DIB。一次真实编码在途，所有失败/取消/退出路径有终态。发布先完成分配，再在OpenClipboard锁内复核意图和原剪贴板序号；期间用户新复制的内容不会被覆盖。成功后的准确自写序号抑制监听回声，允许记录时仅入队一次PNG，兼容位图不持久化。暂停剪贴板记录仍允许复制截图，源应用排除规则按真实剪贴板owner进程名执行。
+
+原始像素、编码stream、GDI和兼容表示各有内存开销，上述预算不是进程总RSS承诺。截图反映实际读取时的屏幕，选区期间内容可以变化。EmptyClipboard之后若系统SetClipboardData失败，无法保证恢复原内容；代码明确区分PNG未写入、仅兼容位图失败，以及已复制但历史未入队。
+
+三个任务的专项审查与复审、最终全范围审查及定点复审均已完成，开放finding为0。修复了执行路径大小写、90天清理、真实保留删除的语义状态更新、纯路径变更误重启状态扫描，以及Recent通知恢复和带启动参数的链接准入。Recent链接只有明确读到完整空参数才接受；非空、失败或不确定回执跳过。
+
+| 当前检查 | 结果 |
+|---|---|
+| 全套共享测试 | **301 项通过，0 失败，2 项既有重型测试默认忽略**；最后修复后完整重跑 |
+| fmt / diff check | 通过 |
+| macOS / Windows all-target strict Clippy | 最终源码两者通过，`-D warnings` |
+| Windows GNU Release | 最终源码构建成功；PE32+ GUI x86-64，仅系统 DLL / CRT 导入 |
+| 当前共享core-check | 内存可查、保存前磁盘无历史、正常退出后恢复，三项均为 true |
+| Windows-only fixtures | **32 项仅交叉编译，0 项执行**；Claude 16、Embedding 8、images 8（含3项新截图内存fixture） |
+| 独立审查 | 全部通过；最终修复范围 `47ed667..fb9d8b1`，无未解决发现 |
+
+测试使用本次创建的2GiB HFS+ RAM卷，TMPDIR=/Volumes/QPFeatureBuild/tmp、CARGO_TARGET_DIR=/Volumes/QPFeatureBuild/target，并禁用incremental、串行Cargo、关闭dev/test debug信息。源码、最终可执行文件与ZIP保留在项目目录；临时卷按设备UUID核对后清理。共享SQLite/线程测试证明功能行为，不能作为SSD耐久性、Windows性能或原生UI运行的证据。本轮没有重跑大型基准，也没有访问用户真实Shell/目录/剪贴板/屏幕、调用付费服务或使用用户密钥。
+
+Windows原生Shell、Recent通知、图片编解码、截图选区、多屏DPI、快捷键及跨应用粘贴仍待实机验收；交叉编译不等同这些行为已执行。
+
+最终完整命令：`TMPDIR=/Volumes/QPFeatureBuild/tmp CARGO_TARGET_DIR=/Volumes/QPFeatureBuild/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 cargo test --locked -- --test-threads=1`。此后重新构建Windows Release，并再次运行共享core-check；最终产品源码 `fb9d8b1`，后续仅整理验证文档。
+
+## 外部路径与截图的实施决定
+
+按作出决定的顺序保留范围、原因及取舍：
+
+1. 用户已提出两项功能并澄清外部文件夹优先，按上一轮具体建议和本轮来源修正继续实现，不重复确认执行方式 — 授权范围足够且无外部发布 — 原生覆盖有限需如实交代。
+2. 沿用当前用户指定目录与 codex/quick-panel 分支，无remote，不另建工作树 — 延续既有偏好并节省磁盘 — 小提交可回退，保留分支交付。
+3. 将两个功能放入同一三任务计划，串行完成共享引擎/原生UI/剪贴板接线 — 共享保存和退出契约需要整体审查 — 单任务仍独立验证，交付用时可能增加。
+4. 外部采集默认关闭，由设置启用；资源管理器为主，Recent为补充，第三方应用不承诺全覆盖 — 原生自动化无法可靠审计所有软件 — 用户需开启功能，未观察到的访问不排名。
+5. 首版截图交付PNG剪贴板和兼容位图，用户要求的JPG或PNG取PNG；不添加JPG文件导出/标注 — 直接满足粘贴并限制无关扩展 — 如需文件导出再独立增加。
+6. Task1新增事件只做最小Windows match兼容，Task2接入展示；SaveStats最小新增semantic_status_changed — 保证中间提交可检查且路径提交不触发全库状态扫描 — 接口扩展需两任务共同审查。
+7. 沿用已验证242 pass/2ignored的同源码基线，不在无代码变化时重复全套；每任务focused，Task1和最终portable各一次full — 遵守验证与避免冗余 — 最终集成仍要全套覆盖。
+8. New owned 2GiB HFS+ RAM volume /Volumes/QPFeatureBuild, /dev/disk7, UUID 694AD54B-9F61-36EF-A98E-243AF480DDB3; source and dist stay on SSD. TMPDIR=/Volumes/QPFeatureBuild/tmp, CARGO_TARGET_DIR=/Volumes/QPFeatureBuild/target, CARGO_INCREMENTAL=0, CARGO_BUILD_JOBS=1, debug=0. Functional tests are not SSD/Windows performance. Copy needed outputs, verify UUID and detach on finish.
+9. QuickPanel观察权重1、既有Used不自动转换；时钟回拨允许重新计次，未来时间截到接收时刻，同批仍去重 — 契约未指定该来源权重且需避免永久冷却 — 人工系统调时可能影响一次计数，统计不是精确审计。
+10. 自动记录90天保留期按Global Constraints作为必需实现，设计正文“可清理”只表示允许在有变更事务清理，不表示永久省略 — 长期满额后需腾空间 — 过期自动推荐会消失，人工收藏及不再推荐偏好保留。
+11. Task2允许lib.rs最小pubmod声明以暴露新便携observer测试模块 — 计划Create模块但漏列声明文件 — 不改变其他核心接口。
+12. Task2 Entry::id保持既有&str；Suggested改为缓存id与PathSuggestion的SuggestedEntry包装，suggested()仍借用原数据 — brief载荷写得过细，直接使用会使所有既有条目每次id访问分配并对推荐反复hash — UI包装多一个小类型，核心公共契约保持不变。Worker已同意并采用；后续审查按此裁定。
+13. “与已有收藏去重”解释为当前请求的实际展示集合，规范路径相同则人工Saved优先；不做全库排除 — 避免每次输入额外全库扫描，也保留语义结果未含该收藏时的可用路径 — 同一路径在另一结果模式可显示为自动推荐，README准确说明；收藏仍显式表单确认。
+14. Recent通知临时故障同代次每30秒最多重建一次，保持Explorer独立可用并重建基线 — 让可选来源能自行恢复且不紧密重试 — 故障恢复可能延迟30秒，重建期间访问可能漏记，属于补充观察。
+15. Recent每轮超16的额外变化丢弃、基线推进，按有界补充来源契约接受并在文档披露 — 主需求为外部文件夹且需限制短时读量 — 批量打开文档时计数不完整，不能称为完整审计。
+16. Task3允许lib.rs模块声明与Cargo中WIC编码需要的StructuredStorage feature — 计划声明新portable模块且WIC encoder依赖IPropertyBag2，遗漏入口文件 — 不增加第三方crate或改变原有功能。
+17. SSD fell from1.7GiB to116MiB and blocked source writes; moved ONLY rebuildable target/debug (213MiB), target/release(65MiB), target/x86_64-pc-windows-gnu(224MiB) to /Volumes/QPFeatureBuild/ssd-target after byte-for-byte filecmp verification. Kept original locations as symlinks to preserve dependency absolute paths; old top-level target logs/reviews untouched. SSD now578MiB, RAM free907MiB; project write test passed. Before detach, remove ONLY these exact symlinks, recreate local target directories and preserve finalEXE. All source/dist remain SSD.
+
+## 性能、交互与功能优化（历史验证 b667a97）
 
 本轮覆盖审查提出的全部优化：
 
@@ -34,7 +94,7 @@
 
 本轮没有重新运行大型性能基准，以下历史毫秒数据不能当作本轮提速比例。常驻内存、空闲 CPU、热键延迟、GUI/IME、多屏 DPI、WinHTTP、DPAPI 和真实服务效果仍需 Windows 实机验收。
 
-## 本轮实施决定
+## 性能优化时的实施决定
 
 以下按决定顺序保留审查与实施中的取舍，便于追溯：
 
@@ -228,12 +288,18 @@ Windows CI 配置已提交，但未触发远程运行。MSVC 构建和 PowerShel
 11. Auto/Claude/Semantic 三种选择下检查唯一智能按钮、取消、未启用配置引导、空索引引导及手动更新。0 向量不发查询；状态检查中失焦、改查询、切换范围和退出后不发起过期网络请求，退出保存提示不被旧状态失败覆盖。
 12. 固定文本、图片和富文本条目编辑名称、别名、标签，再次复制同一内容并重启，确认元数据保留且正文/格式不变；取消或目标失效不提交。核对来源、命中片段和本地时间（含夏令时），以及各设置表单的键盘导航、主题与 DPI。
 
+13. 在“常用推荐设置”启用后，直接从资源管理器访问从未收藏的目录并稳定停留；确认自动项出现、停留/重复聚焦不反复计数、导航后可记录。Win11在多个标签页间切换，确认只记录当前可见文件系统视图；“此电脑”等虚拟位置跳过。
+14. 常用推荐的打开、定位、复制路径、收藏和不再推荐；与同请求已有收藏去重，独立最近访问时间正确。设置排除目录应包含子目录而不误伤相似前缀；关闭隐藏自动项，清空保留人工收藏。取消/重新配置后旧探测不能回填。
+15. Recent首次启动仅建基线，支持的应用后续打开文档才形成补充记录。用隔离测试夹具验证带参数链接不推荐、通知失败30秒退避重建、基线不回放以及Explorer独立工作；不要把有界补充当作完整文档打开记录。
+16. 从搜索、菜单及可选截图热键进入；反向拖动、负坐标、多屏不同DPI、Esc/右键/显示布局变化/失去鼠标捕获，确认区域与取消行为正确。截图不包含已关闭的选区层；PNG色序、方向、透明度及接收应用粘贴符合预期。
+17. 编码期间复制新文本，旧截图不得覆盖；暂停记录/排除本工具来源时仍能复制截图但不入历史，正常情况只入库一次。超预算/编码或剪贴板故障应区分反馈；退出不等待编码，已入队截图保存后才退出。确认三组热键的冲突回滚及旧配置升级。
+
 ## 可执行文件识别
 
-当前 `QuickPanel.exe`：4,121,600 字节，SHA-256：
+当前 `QuickPanel.exe`：4,341,248 字节，SHA-256：
 
 ```
-6075baf8547a699197e5ceb9c29b16c6c3514d3d39a22b592edfa7817121045d
+6ba87a1d3956b067087b54ad945e8b8e4a1a25570cd345c02b5ff5c5afff624b
 ```
 
 程序无需 WebView、Electron 或随包携带的 GCC 运行库。ZIP 同时包含使用说明、设计与实施文档、此验证记录、MIT 许可证及依赖版权声明。
