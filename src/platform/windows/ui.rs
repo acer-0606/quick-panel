@@ -1031,6 +1031,14 @@ impl App {
         self.retheme();
         Ok(())
     }
+    unsafe fn preview_unavailable(&mut self, message: &str) {
+        self.preview_loading = false;
+        self.image = None;
+        self.sync_render();
+        let text = wide(message);
+        let _ = SetWindowTextW(self.preview, PCWSTR(text.as_ptr()));
+        let _ = InvalidateRect(Some(self.preview), None, true);
+    }
     unsafe fn clear_preview(&mut self) {
         self.load_id = self.load_id.wrapping_add(1);
         self.preview_id = self.load_id;
@@ -1726,7 +1734,12 @@ impl App {
                 }
                 Event::Loaded { request_id, item } => {
                     self.action_loads.complete(request_id);
-                    let (preview_current, next) = self.preview_loads.complete(request_id);
+                    let (preview_current, next) = if item.is_some() {
+                        self.preview_loads.complete(request_id)
+                    } else {
+                        self.preview_loads.fail(request_id)
+                    };
+                    let preview_retrying = next.is_some();
                     if let Some((request_id, summary)) = next {
                         self.send(Command::Load {
                             id: summary.id,
@@ -1763,9 +1776,47 @@ impl App {
                     } else if preview_current
                         && self.state.visible
                         && self.state.lifecycle == Lifecycle::Running
-                        && let Some(item) = item
                     {
-                        self.perform(item, Action::Preview);
+                        if let Some(item) = item {
+                            self.perform(item, Action::Preview);
+                        } else if !preview_retrying {
+                            self.preview_unavailable("所选记录已不可用，可重新选择重试");
+                        }
+                    }
+                }
+                Event::LoadFailed {
+                    request_id,
+                    message,
+                } => {
+                    self.action_loads.complete(request_id);
+                    if self
+                        .pending_action
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == request_id)
+                    {
+                        self.pending_action = None;
+                        self.state.finish_action(request_id);
+                    }
+                    let (preview_current, next) = self.preview_loads.fail(request_id);
+                    let preview_retrying = next.is_some();
+                    if preview_current
+                        && !preview_retrying
+                        && self.state.visible
+                        && self.state.lifecycle == Lifecycle::Running
+                    {
+                        self.preview_unavailable(&message);
+                    }
+                    if let Some((request_id, summary)) = next {
+                        self.send(Command::Load {
+                            id: summary.id,
+                            request_id,
+                        });
+                    }
+                    // Storage errors remain visible; unrelated generic errors never release Load slots.
+                    if self.preview_open && self.preview_loading {
+                        self.status(&format!("{message} · 正在加载所选内容预览…"));
+                    } else {
+                        self.status(&message);
                     }
                 }
                 Event::Changed => {

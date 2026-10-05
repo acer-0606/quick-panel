@@ -107,6 +107,22 @@ impl PreviewLoads {
         self.desired = None;
         self.pending = None;
     }
+    /// A failed/unavailable target is retryable and never becomes a cached success.
+    pub fn fail(&mut self, id: u64) -> (bool, Option<(u64, ItemSummary)>) {
+        if self
+            .inflight
+            .as_ref()
+            .is_none_or(|(active, _)| *active != id)
+        {
+            return (false, None);
+        }
+        let (_, identity) = self.inflight.take().unwrap();
+        let current = self.desired.as_ref() == Some(&identity);
+        if current && self.pending.is_none() {
+            self.desired = None;
+        }
+        (current, self.start_pending())
+    }
     pub fn complete(&mut self, id: u64) -> (bool, Option<(u64, ItemSummary)>) {
         if self
             .inflight

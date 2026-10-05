@@ -1535,9 +1535,16 @@ impl Actor {
                     items,
                 } => self.store_embeddings(request_id, profile, items),
                 Command::SemanticSearch(query) => self.semantic_search(query),
-                Command::Load { id, request_id } => self
-                    .lookup(&id, true)
-                    .map(|item| self.emit(Event::Loaded { request_id, item })),
+                Command::Load { id, request_id } => {
+                    match self.lookup(&id, true) {
+                        Ok(item) => self.emit(Event::Loaded { request_id, item }),
+                        Err(message) => self.emit(Event::LoadFailed {
+                            request_id,
+                            message,
+                        }),
+                    }
+                    Ok(())
+                }
                 Command::SaveFavorite(favorite) => self.favorite(favorite),
                 Command::EditClipboardMetadata(input) => self.edit_clipboard_metadata(input),
                 Command::SemanticStatus { request_id } => self.semantic_status(request_id),

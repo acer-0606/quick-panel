@@ -211,6 +211,11 @@ pub enum Event {
         request_id: u64,
         item: Option<StoredItem>,
     },
+    /// Terminal read receipt; successful/missing reads use Loaded.
+    LoadFailed {
+        request_id: u64,
+        message: String,
+    },
     Changed,
     Saved(SaveStats),
     Error {

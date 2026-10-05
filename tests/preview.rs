@@ -67,3 +67,32 @@ fn usage_changes_do_not_reload_same_content_and_text_truncation_is_explicit() {
     assert_eq!(text.chars().filter(|c| *c == '🙂').count(), 6000);
     assert!(text.contains("截断"));
 }
+
+#[test]
+fn failed_preview_dispatches_latest_and_same_failed_target_can_retry() {
+    let mut gate = PreviewLoads::default();
+    gate.select(Some(item("a")), 1);
+    assert!(gate.select(Some(item("b")), 2).is_none());
+    assert_eq!(gate.fail(99), (false, None));
+    let (current, next) = gate.fail(1);
+    assert!(!current);
+    assert_eq!(next.unwrap().1.id, "b");
+    assert_eq!(gate.fail(2), (true, None));
+    assert_eq!(gate.select(Some(item("b")), 3).unwrap().0, 3);
+    assert!(gate.complete(3).0);
+    assert!(gate.select(Some(item("b")), 4).is_none());
+}
+
+#[test]
+fn failed_inflight_preview_keeps_a_latest_retry_of_the_same_target() {
+    let mut gate = PreviewLoads::default();
+    gate.select(Some(item("a")), 1);
+    gate.select(Some(item("b")), 2);
+    gate.select(Some(item("a")), 3);
+    let (current, next) = gate.fail(1);
+    assert!(current);
+    assert_eq!(next.unwrap().0, 3);
+    assert_eq!(gate.fail(1), (false, None));
+    assert!(gate.select(Some(item("a")), 4).is_none());
+    assert!(gate.complete(3).0);
+}

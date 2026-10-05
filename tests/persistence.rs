@@ -1708,3 +1708,111 @@ fn small_settings_commit_skips_retention_until_policy_changes() {
     assert_eq!(count(&path), 0);
     shutdown(&engine);
 }
+
+#[test]
+fn load_sqlite_failure_returns_terminal_id_and_recovery_admits_new_action_load() {
+    use quick_panel::background_job::ActionLoads;
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("读取恢复探针")))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let summary = search(&engine, "读取恢复").remove(0);
+    let db = Connection::open(&path).unwrap();
+    db.execute(
+        "ALTER TABLE representations RENAME TO load_failure_formats",
+        [],
+    )
+    .unwrap();
+    let mut loads = ActionLoads::default();
+    assert!(loads.begin(301));
+    engine
+        .send(Command::Load {
+            id: summary.id.clone(),
+            request_id: 301,
+        })
+        .unwrap();
+    let failure = wait(&engine, |e| {
+        matches!(
+            e,
+            Event::LoadFailed {
+                request_id: 301,
+                ..
+            } | Event::Loaded {
+                request_id: 301,
+                ..
+            } | Event::Error { .. }
+        )
+    });
+    db.execute(
+        "ALTER TABLE load_failure_formats RENAME TO representations",
+        [],
+    )
+    .unwrap();
+    match failure {
+        Event::LoadFailed {
+            request_id,
+            message,
+        } => {
+            assert!(message.contains("representations"));
+            loads.complete(request_id);
+        }
+        event => panic!("读取失败缺少带301代次的终态：{event:?}"),
+    }
+    assert!(loads.begin(302));
+    engine
+        .send(Command::Load {
+            id: summary.id,
+            request_id: 302,
+        })
+        .unwrap();
+    match wait(&engine, |e| {
+        matches!(
+            e,
+            Event::Loaded {
+                request_id: 302,
+                ..
+            } | Event::LoadFailed {
+                request_id: 302,
+                ..
+            }
+        )
+    }) {
+        Event::Loaded {
+            request_id,
+            item: Some(item),
+        } => {
+            assert_eq!(item.text, "读取恢复探针");
+            loads.complete(request_id);
+        }
+        event => panic!("修复数据库后读取未恢复：{event:?}"),
+    }
+    assert!(loads.begin(303));
+    engine
+        .send(Command::Load {
+            id: "not-found".into(),
+            request_id: 303,
+        })
+        .unwrap();
+    match wait(&engine, |e| {
+        matches!(
+            e,
+            Event::Loaded {
+                request_id: 303,
+                ..
+            } | Event::LoadFailed {
+                request_id: 303,
+                ..
+            }
+        )
+    }) {
+        Event::Loaded {
+            request_id,
+            item: None,
+        } => loads.complete(request_id),
+        event => panic!("不存在记录缺少终态：{event:?}"),
+    }
+    assert!(!loads.busy());
+    shutdown(&engine);
+}
