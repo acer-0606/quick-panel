@@ -1931,6 +1931,7 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
+                Event::PathSuggestions { .. } | Event::PathActivityChanged => {}
                 Event::Ready(settings) => {
                     self.settings = settings;
                     self.retheme();

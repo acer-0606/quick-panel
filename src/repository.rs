@@ -40,6 +40,7 @@ pub(crate) struct PendingItem {
     pub mutation: Mutation,
 }
 pub(crate) struct Repository {
+    pub(crate) paths: crate::path_activity_store::PathActivityStore,
     pub(crate) connection: Connection,
     wal_path: std::path::PathBuf,
     page_size: u64,
@@ -160,7 +161,9 @@ impl Repository {
         let observed_rowid = connection
             .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
+        let paths = crate::path_activity_store::PathActivityStore::load(&connection)?;
         let repo = Self {
+            paths,
             connection,
             wal_path: wal_path.into(),
             page_size,
@@ -681,10 +684,12 @@ impl Repository {
                 .map_err(|e| e.to_string())?;
         }
         crate::semantic_store::commit(&tx, pending, vectors, &removed, self.repair_vectors)?;
+        self.paths.write(&tx)?;
         let observed_rowid = tx
             .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
+        self.paths.committed();
         self.observed_rowid = observed_rowid;
         self.retention_policy = Some(policy);
         if maintain {

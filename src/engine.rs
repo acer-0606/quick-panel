@@ -34,6 +34,7 @@ struct Commands {
     queries: Arc<Queries>,
     exiting: bool,
     queued_bytes: Arc<AtomicUsize>,
+    queued_path_bytes: Arc<AtomicUsize>,
     queue_limit: usize,
     max_item_bytes: usize,
 }
@@ -53,6 +54,8 @@ impl Engine {
         let (events_tx, events) = mpsc::channel();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let worker_queue_bytes = queued_bytes.clone();
+        let queued_path_bytes = Arc::new(AtomicUsize::new(0));
+        let worker_path_bytes = queued_path_bytes.clone();
         let queries = Arc::new(Queries::default());
         let worker_queries = queries.clone();
         let queue_limit = options.max_pending_bytes;
@@ -80,6 +83,7 @@ impl Engine {
                     retry_delay_ms: 1_000,
                     retry_not_before: None,
                     queued_bytes: worker_queue_bytes,
+                    queued_path_bytes: worker_path_bytes,
                     exiting: false,
                     events: events_tx,
                     notifier,
@@ -100,6 +104,7 @@ impl Engine {
                 queries,
                 exiting: false,
                 queued_bytes,
+                queued_path_bytes,
                 queue_limit,
                 max_item_bytes,
             }),
@@ -149,6 +154,33 @@ impl Engine {
             }
             return Ok(());
         }
+        let path_bytes = if let Command::ObservePaths(observations) = &command {
+            if observations.is_empty() {
+                return Ok(());
+            }
+            if observations.len() > crate::path_activity::MAX_BATCH
+                || observations.iter().any(|o| {
+                    o.path
+                        .encode_utf16()
+                        .take(crate::path_activity::MAX_PATH_UNITS + 1)
+                        .count()
+                        > crate::path_activity::MAX_PATH_UNITS
+                })
+            {
+                return Err("路径观察批次或路径长度超过上限".into());
+            }
+            let bytes = observation_bytes(observations, observations.capacity());
+            state
+                .queued_path_bytes
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes)
+                        .filter(|total| *total <= crate::path_activity::MAX_QUEUE_BYTES)
+                })
+                .map_err(|_| "路径观察队列已满".to_string())?;
+            bytes
+        } else {
+            0
+        };
         state.queries.revision.fetch_add(1, Ordering::AcqRel);
         if matches!(command, Command::Shutdown) {
             state.queries.generation.fetch_add(1, Ordering::AcqRel);
@@ -215,6 +247,9 @@ impl Engine {
                 .reliable_pending
                 .fetch_sub(1, Ordering::AcqRel);
             state.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            state
+                .queued_path_bytes
+                .fetch_sub(path_bytes, Ordering::AcqRel);
             return Err("engine stopped".into());
         }
         if let Some(exiting) = exiting {
@@ -285,9 +320,19 @@ struct Actor {
     retry_delay_ms: u64,
     retry_not_before: Option<Instant>,
     queued_bytes: Arc<AtomicUsize>,
+    queued_path_bytes: Arc<AtomicUsize>,
     exiting: bool,
     events: Sender<Event>,
     notifier: Arc<dyn Fn() + Send + Sync>,
+}
+fn observation_bytes(
+    observations: &[crate::path_activity::PathObservation],
+    capacity: usize,
+) -> usize {
+    observations.iter().fold(
+        capacity.saturating_mul(std::mem::size_of::<crate::path_activity::PathObservation>()),
+        |bytes, observation| bytes.saturating_add(observation.path.capacity()),
+    )
 }
 fn now_ms() -> i64 {
     SystemTime::now()
@@ -366,7 +411,9 @@ impl Actor {
         Ok(())
     }
     fn emit(&self, event: Event) {
-        if matches!(event, Event::Results { .. }) && self.query_checkpoint().is_err() {
+        if matches!(event, Event::Results { .. } | Event::PathSuggestions { .. })
+            && self.query_checkpoint().is_err()
+        {
             return;
         }
         if self.events.send(event).is_ok() {
@@ -381,6 +428,7 @@ impl Actor {
     }
     fn dirty(&self) -> bool {
         !self.pending.is_empty()
+            || self.repo.paths.is_dirty()
             || !self.deleted.is_empty()
             || self.settings_dirty
             || !self.vectors.items.is_empty()
@@ -432,6 +480,10 @@ impl Actor {
             return true;
         }
         let now = now_ms();
+        let semantic_status_changed = !self.pending.is_empty()
+            || !self.deleted.is_empty()
+            || self.settings_dirty
+            || !self.vectors.items.is_empty();
         match self.repo.commit(
             &self.pending,
             &self.deleted,
@@ -481,6 +533,7 @@ impl Actor {
                     }
                 }
                 self.emit(Event::Saved(SaveStats {
+                    semantic_status_changed,
                     pending_items: 0,
                     pending_bytes: 0,
                     commits: self.commits,
@@ -676,8 +729,37 @@ impl Actor {
         }
         Ok(items)
     }
+    fn emit_path_suggestions(
+        &self,
+        request_id: u64,
+        terms: &[String],
+        scope: Scope,
+        period: (Option<i64>, Option<i64>),
+    ) -> Result<(), String> {
+        self.query_checkpoint()?;
+        let items = self.repo.paths.suggestions(
+            crate::path_activity_store::PathSearch {
+                terms,
+                scope,
+                now: now_ms(),
+                from_ms: period.0,
+                until_ms: period.1,
+            },
+            &self.settings.path_activity,
+            || self.query_checkpoint(),
+        )?;
+        self.query_checkpoint()?;
+        self.emit(Event::PathSuggestions { request_id, items });
+        Ok(())
+    }
     fn search(&self, query: SearchQuery) -> Result<(), String> {
         let items = self.collect_search(&query, None, None)?;
+        self.emit_path_suggestions(
+            query.request_id,
+            std::slice::from_ref(&query.text),
+            query.scope,
+            (None, None),
+        )?;
         self.emit(Event::Results {
             request_id: query.request_id,
             items,
@@ -714,9 +796,9 @@ impl Actor {
         // outside all six top-50 lists cannot enter the global top 50 under the
         // same rank/tie ordering, so the merge holds at most 300 real IDs.
         let mut merged: HashMap<String, (ItemSummary, i64)> = HashMap::new();
-        for text in terms {
+        for text in &terms {
             let local = SearchQuery {
-                text,
+                text: text.clone(),
                 scope: query.scope,
                 request_id: query.request_id,
             };
@@ -738,6 +820,12 @@ impl Actor {
                 .then(a.id.cmp(&b.id))
         });
         items.truncate(50);
+        self.emit_path_suggestions(
+            query.request_id,
+            &terms,
+            query.scope,
+            (query.from_ms, query.until_ms),
+        )?;
         self.emit(Event::Results {
             request_id: query.request_id,
             items: items.into_iter().map(|(summary, _)| summary).collect(),
@@ -1320,6 +1408,12 @@ impl Actor {
                 .then(a.id.cmp(&b.id))
         });
         items.truncate(50);
+        self.emit_path_suggestions(
+            query.request_id,
+            std::slice::from_ref(&query.text),
+            query.scope,
+            (None, None),
+        )?;
         self.emit(Event::Results {
             request_id: query.request_id,
             items: items.into_iter().map(|(s, _, _)| s).collect(),
@@ -1482,6 +1576,12 @@ impl Actor {
             let command = match received {
                 Ok(queued) => {
                     self.queued_bytes.fetch_sub(queued.bytes, Ordering::AcqRel);
+                    if let Some(Ok(Command::ObservePaths(observations))) = &queued.command {
+                        self.queued_path_bytes.fetch_sub(
+                            observation_bytes(observations, observations.capacity()),
+                            Ordering::AcqRel,
+                        );
+                    }
                     if queued.command.is_some() {
                         self.queries.reliable_pending.fetch_sub(1, Ordering::AcqRel);
                     }
@@ -1506,6 +1606,35 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::ObservePaths(observations) => {
+                    if self
+                        .repo
+                        .paths
+                        .observe(observations, &self.settings.path_activity, now_ms())
+                    {
+                        self.mark_dirty();
+                        self.emit(Event::PathActivityChanged);
+                    }
+                    Ok(())
+                }
+                Command::SuppressPath(path) => match self.repo.paths.suppress(&path) {
+                    Ok(true) => {
+                        self.mark_dirty();
+                        self.emit(Event::PathActivityChanged);
+                        self.flush();
+                        Ok(())
+                    }
+                    Ok(false) => Ok(()),
+                    Err(message) => Err(message),
+                },
+                Command::ClearPathActivity => {
+                    if self.repo.paths.clear() {
+                        self.mark_dirty();
+                        self.emit(Event::PathActivityChanged);
+                        self.flush();
+                    }
+                    Ok(())
+                }
                 Command::Capture(snapshot) => self.capture(snapshot),
                 Command::Search(query) => self.search(query),
                 Command::AiSearch(query) => self.ai_search(query),
@@ -1543,7 +1672,11 @@ impl Actor {
                     if self.settings.embedding != settings.embedding {
                         self.source_generation += 1;
                     }
+                    let paths_changed = self.settings.path_activity != settings.path_activity;
                     self.settings = settings;
+                    if paths_changed {
+                        self.emit(Event::PathActivityChanged);
+                    }
                     self.settings_dirty = true;
                     self.mark_dirty();
                     self.emit(Event::Changed);
@@ -1638,6 +1771,7 @@ mod status_scheduling_tests {
             retry_delay_ms: 1000,
             retry_not_before: None,
             queued_bytes: Arc::new(AtomicUsize::new(0)),
+            queued_path_bytes: Arc::new(AtomicUsize::new(0)),
             exiting: false,
             events,
             notifier: Arc::new(|| {}),

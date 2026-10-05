@@ -98,6 +98,7 @@ pub struct SemanticIndexStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub path_activity: crate::path_activity::PathActivitySettings,
     pub ai: crate::ai::AiSettings,
     pub embedding: crate::semantic::EmbeddingSettings,
     pub theme: Theme,
@@ -115,6 +116,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            path_activity: crate::path_activity::PathActivitySettings::default(),
             ai: crate::ai::AiSettings::default(),
             embedding: crate::semantic::EmbeddingSettings::default(),
             theme: Theme::System,
@@ -149,6 +151,7 @@ pub struct AiSearchQuery {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaveStats {
+    pub semantic_status_changed: bool,
     pub pending_items: usize,
     pub pending_bytes: usize,
     pub commits: u64,
@@ -157,6 +160,9 @@ pub struct SaveStats {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    ObservePaths(Vec<crate::path_activity::PathObservation>),
+    SuppressPath(String),
+    ClearPathActivity,
     Capture(ClipboardSnapshot),
     Search(SearchQuery),
     AiSearch(AiSearchQuery),
@@ -193,6 +199,11 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    PathSuggestions {
+        request_id: u64,
+        items: Vec<crate::path_activity::PathSuggestion>,
+    },
+    PathActivityChanged,
     Ready(Settings),
     SemanticStatus {
         request_id: u64,

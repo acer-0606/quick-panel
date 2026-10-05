@@ -11,6 +11,8 @@ pub mod engine;
 pub mod hotkeys;
 pub mod model;
 pub mod palette;
+pub mod path_activity;
+mod path_activity_store;
 #[cfg(windows)]
 pub mod platform;
 pub mod preview;
