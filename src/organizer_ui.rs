@@ -649,6 +649,8 @@ pub struct MemoryUiState {
     pub pending_save: bool,
     pub raw_input: String,
     snapshot_request: Option<u64>,
+    semantic_admitted: bool,
+    pending_work: Option<u64>,
 }
 /// RandomState uses the platform's random seed; time/PID/sequence avoid counter reuse.
 /// IDs are process-independent because human receipts survive application restarts.
@@ -670,6 +672,31 @@ pub fn memory_request_id() -> u64 {
     h.finish().max(1)
 }
 impl MemoryUiState {
+    /// Bind each not-yet-admitted attempt to the job present when sent to the actor.
+    pub fn bind_work(&mut self, session: &OrganizerSession) {
+        if !self.semantic_admitted {
+            self.pending_work = session.active.map(|active| active.0);
+        }
+    }
+    pub fn receipt_for_session(
+        &mut self,
+        id: u64,
+        result: Result<(), String>,
+        pending_save: bool,
+        session: &mut OrganizerSession,
+    ) -> Option<bool> {
+        let first_admission = !self.semantic_admitted && (result.is_ok() || pending_save);
+        if !self.receipt(id, result, pending_save) {
+            return None;
+        }
+        Some(
+            first_admission
+                && self
+                    .pending_work
+                    .take()
+                    .is_some_and(|token| session.finish(token).is_some()),
+        )
+    }
     pub fn request_snapshot(&mut self) -> Option<crate::model::Command> {
         if self.snapshot_request.is_some() {
             return None;
@@ -692,6 +719,8 @@ impl MemoryUiState {
         if self.saving || self.pending_save {
             return Err("请先完成当前操作的保存重试".into());
         }
+        self.semantic_admitted = false;
+        self.pending_work = None;
         self.pending = Some(command.clone());
         self.saving = true;
         self.message = "正在保存…".into();
@@ -718,6 +747,7 @@ impl MemoryUiState {
         if expected != Some(id) {
             return false;
         }
+        self.semantic_admitted |= result.is_ok() || pending_save;
         self.saving = false;
         self.pending_save = pending_save;
         self.message = match result {
@@ -887,4 +917,42 @@ pub fn memory_focus_scroll(layout: &MemoryLayout, index: usize, position: i32) -
         position
     };
     clamp_scroll(next, layout.content_height, layout.viewport_height)
+}
+
+#[derive(Default)]
+pub struct MemoryInputPolicy {
+    composing: bool,
+}
+impl MemoryInputPolicy {
+    pub fn composition(&mut self, active: bool) {
+        self.composing = active;
+    }
+    pub fn dialog_keys(&self, string_present: bool) -> bool {
+        !self.composing && !string_present
+    }
+}
+pub fn memory_text_input(raw: &str, feedback: bool) -> Result<String, String> {
+    let value = memory_text(raw);
+    let limit = if feedback {
+        crate::harness_tools::FEEDBACK_REASON_MAX_CHARS
+    } else {
+        512
+    };
+    if value.is_empty() || value.chars().count() > limit {
+        Err(format!(
+            "请填写 1–{limit} 字符的{}",
+            if feedback { "反馈原因" } else { "规则" }
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+/// Physical positions for every viewport child, including partially clipped fields.
+pub fn memory_scrolled_fields(layout: &MemoryLayout, position: i32) -> [MemoryRect; 7] {
+    let position = clamp_scroll(position, layout.content_height, layout.viewport_height);
+    layout.fields.map(|mut field| {
+        field.y -= position;
+        field
+    })
 }

@@ -774,3 +774,122 @@ fn memory_focus_scroll_reveals_reverse_tab_targets_and_clamps_after_resize() {
         assert!(position <= (larger.content_height - larger.viewport_height).max(0));
     }
 }
+
+#[test]
+fn memory_save_retry_does_not_cancel_a_new_session() {
+    use quick_panel::model::Command;
+    for success in [false, true] {
+        let mut state = MemoryUiState::default();
+        let mut session = OrganizerSession::default();
+        session.begin(41, 41);
+        state
+            .submit(Command::HarnessMemoryDelete {
+                request_id: 7,
+                ids: vec![1],
+            })
+            .unwrap();
+        state.bind_work(&session);
+        assert_eq!(
+            state.receipt_for_session(8, Ok(()), false, &mut session),
+            None
+        );
+        assert_eq!(
+            state.receipt_for_session(7, Err("参数".into()), false, &mut session),
+            Some(false)
+        );
+        state.retry().unwrap();
+        state.bind_work(&session);
+        assert_eq!(
+            state.receipt_for_session(7, Err("磁盘".into()), true, &mut session),
+            Some(true)
+        );
+        session.begin(42, 42);
+        state.retry().unwrap();
+        state.bind_work(&session);
+        assert_eq!(
+            state.receipt_for_session(
+                7,
+                if success {
+                    Ok(())
+                } else {
+                    Err("磁盘".into())
+                },
+                !success,
+                &mut session
+            ),
+            Some(false)
+        );
+        assert_eq!(session.finish(42), Some(42));
+    }
+}
+#[test]
+fn memory_first_admission_cannot_cancel_a_different_session() {
+    use quick_panel::model::Command;
+    let mut state = MemoryUiState::default();
+    let mut session = OrganizerSession::default();
+    session.begin(41, 41);
+    state
+        .submit(Command::HarnessMemoryDelete {
+            request_id: 7,
+            ids: vec![1],
+        })
+        .unwrap();
+    state.bind_work(&session);
+    session.begin(42, 42);
+    assert_eq!(
+        state.receipt_for_session(7, Ok(()), false, &mut session),
+        Some(false)
+    );
+    assert_eq!(session.finish(42), Some(42));
+}
+#[test]
+fn memory_empty_ime_composition_keeps_escape_enter_tab_with_ime_until_end() {
+    let mut policy = MemoryInputPolicy::default();
+    assert!(policy.dialog_keys(false));
+    policy.composition(true);
+    for _key in [27, 13, 9] {
+        assert!(
+            !policy.dialog_keys(false),
+            "empty active composition must bypass dialog navigation"
+        );
+    }
+    policy.composition(false);
+    assert!(policy.dialog_keys(false));
+    assert!(!policy.dialog_keys(true));
+}
+#[test]
+fn memory_feedback_limit_is_256_but_rule_limit_is_512_and_raw_survives() {
+    let raw = format!("{}\r\n\t末", "原".repeat(252));
+    assert_eq!(
+        memory_text_input(&raw, true).unwrap(),
+        format!("{}   末", "原".repeat(252))
+    );
+    assert!(raw.contains("\r\n\t"));
+    let too_long = "原".repeat(257);
+    assert!(
+        memory_text_input(&too_long, true)
+            .unwrap_err()
+            .contains("256")
+    );
+    assert_eq!(too_long.chars().count(), 257);
+    assert!(memory_text_input(&"规".repeat(512), false).is_ok());
+    assert!(memory_text_input(&"规".repeat(513), false).is_err());
+}
+
+#[test]
+fn memory_scroll_explicitly_repositions_partially_clipped_children() {
+    let layout = memory_layout(640, 360, 96, false);
+    let positions = memory_scrolled_fields(&layout, 30);
+    assert_eq!(positions[0].y, -20); // originally y=10, partially above viewport
+    assert_eq!(positions[1].y, 38); // originally y=68
+    assert_eq!(positions[6].y, 462); // originally y=492, below viewport
+    for (physical, original) in positions.iter().zip(layout.fields) {
+        assert_eq!(
+            (physical.x, physical.width, physical.height),
+            (original.x, original.width, original.height)
+        );
+    }
+    assert_eq!(memory_scrolled_fields(&layout, -99), layout.fields);
+    let clamped = memory_scrolled_fields(&layout, i32::MAX);
+    assert_eq!(clamped[6].bottom(), layout.viewport_height - 24);
+}

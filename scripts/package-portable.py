@@ -22,7 +22,12 @@ module = ROOT / "agent-runtime/dist/worker.mjs"
 if not exe.is_file() or not module.is_file():
     raise SystemExit("Build the release executable and Pi bundle before packaging")
 dist = ROOT / "dist"
+if dist.is_symlink() or dist.resolve() != ROOT / "dist":
+    raise SystemExit("Refusing package output outside the owned dist directory")
 dist.mkdir(exist_ok=True)
+legacy_sums = dist / "SHA256SUMS.txt"
+if legacy_sums.is_symlink() or (legacy_sums.exists() and not legacy_sums.is_file()):
+    raise SystemExit("Refusing to remove an unowned legacy checksum path")
 with tempfile.TemporaryDirectory(prefix=".qp-package-", dir=dist) as temporary:
     stage = pathlib.Path(temporary) / "QuickPanel-Windows-x64"
     (stage / "runtime").mkdir(parents=True)
@@ -62,5 +67,6 @@ with tempfile.TemporaryDirectory(prefix=".qp-package-", dir=dist) as temporary:
     (dist / "package-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
     sums = [f"{manifest['sha256']}  {final_zip.name}"] + [f"{m['sha256']}  QuickPanel-Windows-x64/{m['path']}" for m in members]
     (dist / "SHA256SUMS").write_text("\n".join(sums) + "\n")
+    legacy_sums.unlink(missing_ok=True)
     print(json.dumps({key: value for key, value in manifest.items() if key != "members"}, ensure_ascii=False))
     print(f"Verified {len(members)} exact members, CRC and bytes; unpacked {sum(m['bytes'] for m in members)} bytes")

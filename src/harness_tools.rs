@@ -6,6 +6,8 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const FEEDBACK_REASON_MAX_CHARS: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PiContext {
     pub model: String,

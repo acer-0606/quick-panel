@@ -41,6 +41,7 @@ struct View {
     viewport: HWND,
     scroll_y: i32,
     geometry: Option<crate::organizer_ui::MemoryLayout>,
+    input_policy: crate::organizer_ui::MemoryInputPolicy,
 }
 unsafe fn set(hwnd: HWND, value: &str) {
     if text(hwnd) != value {
@@ -267,13 +268,16 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
         }
     } else {
         let raw = text(controls[3]);
-        let value = crate::organizer_ui::memory_text(&raw);
+        let value = crate::organizer_ui::memory_text_input(&raw, target.is_some());
         state.borrow_mut().raw_input = raw;
-        if value.is_empty() || value.chars().count() > 512 {
-            state.borrow_mut().message = "请填写 1–512 字符的原因或规则".into();
-            state.borrow_mut().revision += 1;
-            return;
-        }
+        let value = match value {
+            Ok(value) => value,
+            Err(message) => {
+                state.borrow_mut().message = message;
+                state.borrow_mut().revision += 1;
+                return;
+            }
+        };
         let choice = SendMessageW(controls[4], CB_GETCURSEL, None, None).0;
         if let Some((_, target)) = target {
             Command::HarnessFeedback {
@@ -322,9 +326,9 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
     }
 }
 unsafe fn scroll_content(ptr: *const RefCell<View>, position: i32) {
-    let (viewport, old, geometry) = {
+    let (viewport, controls, dpi, geometry) = {
         let v = (*ptr).borrow();
-        (v.viewport, v.scroll_y, v.geometry.clone())
+        (v.viewport, v.controls.clone(), v.dpi, v.geometry.clone())
     };
     let Some(geometry) = geometry else {
         return;
@@ -345,15 +349,52 @@ unsafe fn scroll_content(ptr: *const RefCell<View>, position: i32) {
         ..Default::default()
     };
     SetScrollInfo(viewport, SB_VERT, &info, true);
-    ScrollWindowEx(
-        viewport,
-        0,
-        old - position,
+    let fields = crate::organizer_ui::memory_scrolled_fields(&geometry, position);
+    // Explicitly position every child. ScrollWindowEx cannot reliably move/repaint
+    // a child that is only partly inside the source viewport.
+    let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    let heights = fields.map(|r| r.height.max(1));
+    let height = |index: usize| {
+        if index == 4 {
+            160 * dpi as i32 / 96
+        } else {
+            heights[index]
+        }
+    };
+    let batch = BeginDeferWindowPos(7).and_then(|mut batch| {
+        for (index, r) in fields.iter().enumerate() {
+            batch = DeferWindowPos(
+                batch,
+                controls[index],
+                None,
+                r.x,
+                r.y,
+                r.width.max(1),
+                height(index),
+                flags,
+            )?;
+        }
+        EndDeferWindowPos(batch)
+    });
+    if batch.is_err() {
+        // If allocation for the batch fails, retain correct absolute positions.
+        for (index, r) in fields.iter().enumerate() {
+            let _ = SetWindowPos(
+                controls[index],
+                None,
+                r.x,
+                r.y,
+                r.width.max(1),
+                height(index),
+                flags,
+            );
+        }
+    }
+    let _ = RedrawWindow(
+        Some(viewport),
         None,
         None,
-        None,
-        None,
-        SW_SCROLLCHILDREN | SW_INVALIDATE,
+        RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
     );
 }
 unsafe fn reveal_control(ptr: *const RefCell<View>, hwnd: HWND) {
@@ -380,8 +421,20 @@ unsafe extern "system" fn focus_proc(
     _id: usize,
     data: usize,
 ) -> LRESULT {
+    let ptr = data as *const RefCell<View>;
     if msg == WM_SETFOCUS {
-        reveal_control(data as *const RefCell<View>, hwnd);
+        reveal_control(ptr, hwnd);
+    }
+    if matches!(msg, WM_IME_STARTCOMPOSITION | WM_IME_ENDCOMPOSITION) {
+        // Only the editable text field participates; keep START active even before
+        // the IME has supplied a nonempty composition string.
+        let editor = (*ptr).borrow().controls.get(3).copied();
+        if editor == Some(hwnd) {
+            (*ptr)
+                .borrow_mut()
+                .input_policy
+                .composition(msg == WM_IME_STARTCOMPOSITION);
+        }
     }
     DefSubclassProc(hwnd, msg, wp, lp)
 }
@@ -475,20 +528,6 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
         geometry.viewport_height,
     );
     for (index, r) in geometry.fields.iter().enumerate() {
-        // The combo's extra height is its popup, not another content field.
-        let height = if index == 4 {
-            160 * dpi as i32 / 96
-        } else {
-            r.height
-        };
-        let _ = MoveWindow(
-            controls[index],
-            r.x,
-            r.y - scroll_y,
-            r.width.max(1),
-            height.max(1),
-            true,
-        );
         let _ = ShowWindow(
             controls[index],
             if r.height == 0 { SW_HIDE } else { SW_SHOW },
@@ -687,6 +726,7 @@ unsafe fn show_form(
         viewport: HWND::default(),
         scroll_y: 0,
         geometry: None,
+        input_policy: Default::default(),
     }));
     let title = if target.is_some() {
         w!("反馈并重做")
@@ -821,12 +861,23 @@ unsafe fn show_form(
         );
     }
     SendMessageW(controls[4], CB_SETCURSEL, Some(WPARAM(0)), None);
-    SendMessageW(controls[3], EM_SETLIMITTEXT, Some(WPARAM(1024)), None);
+    // Win32 counts UTF-16 units, while validation counts Unicode scalars.
+    let input_limit = if target.is_some() {
+        FEEDBACK_REASON_MAX_CHARS
+    } else {
+        512
+    };
+    SendMessageW(
+        controls[3],
+        EM_SETLIMITTEXT,
+        Some(WPARAM(input_limit * 2)),
+        None,
+    );
     if let Some((title, target)) = &target {
         set(
             controls[2],
             &format!(
-                "原名称：{title}\r\n所见建议：{}\r\n请说明拒绝原因；需先启用“记住整理反馈”。",
+                "原名称：{title}\r\n所见建议：{}\r\n请说明拒绝原因（1–256 字符）；需先启用“记住整理反馈”。",
                 target.rejected_alias.as_deref().unwrap_or("暂无建议")
             ),
         );
@@ -945,11 +996,12 @@ unsafe fn show_form(
         } else {
             false
         };
-        if msg.message == WM_KEYDOWN && msg.wParam.0 == 27 && !composing {
+        let dialog_keys = view.borrow().input_policy.dialog_keys(composing);
+        if msg.message == WM_KEYDOWN && msg.wParam.0 == 27 && dialog_keys {
             view.borrow_mut().done = true;
             continue;
         }
-        if composing || !IsDialogMessageW(hwnd, &msg).as_bool() {
+        if !dialog_keys || !IsDialogMessageW(hwnd, &msg).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

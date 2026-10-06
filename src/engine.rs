@@ -635,7 +635,7 @@ impl Actor {
         if !self.settings.organizer.memory_enabled {
             return Err("请先启用“记住整理反馈”；反馈输入已保留".into());
         }
-        if !text_valid(&reason, 256, false)
+        if !text_valid(&reason, FEEDBACK_REASON_MAX_CHARS, false)
             || sources.is_empty()
             || sources.len() > 8
             || sources

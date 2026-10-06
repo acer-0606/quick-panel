@@ -2474,17 +2474,15 @@ impl App {
                     result,
                     pending_save,
                 } => {
-                    let admitted = result.is_ok() || pending_save;
-                    if self
-                        .harness_memory
-                        .borrow_mut()
-                        .receipt(request_id, result, pending_save)
-                    {
-                        if admitted {
-                            self.organizer_session.cancel();
-                            if let Some(worker) = &self.organizer_worker {
-                                worker.cancel();
-                            }
+                    let receipt = self.harness_memory.borrow_mut().receipt_for_session(
+                        request_id,
+                        result,
+                        pending_save,
+                        &mut self.organizer_session,
+                    );
+                    if let Some(cancel_work) = receipt {
+                        if cancel_work && let Some(worker) = &self.organizer_worker {
+                            worker.cancel();
                         }
                         self.memory_snapshot();
                         self.organizer_snapshot();
@@ -3765,6 +3763,16 @@ unsafe fn app_message(
             };
             for command in commands.into_iter().flatten() {
                 if app.state.lifecycle == Lifecycle::Running {
+                    if matches!(
+                        command,
+                        Command::HarnessFeedback { .. }
+                            | Command::HarnessMemoryEdit { .. }
+                            | Command::HarnessMemoryDelete { .. }
+                    ) {
+                        app.harness_memory
+                            .borrow_mut()
+                            .bind_work(&app.organizer_session);
+                    }
                     app.send(command);
                     if app.organizer_page_open {
                         app.organizer_snapshot();

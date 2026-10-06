@@ -2,25 +2,34 @@
 
 当前交付物的精确体积、成员及 SHA-256 以 `dist/package-manifest.json` 与 `dist/SHA256SUMS` 为准；清单位于 ZIP 外，避免自哈希循环。ZIP 包含 QuickPanel.exe、固定 Node 24.19.0、Pi bundle、全部相关许可及本次使用说明。
 
-本次验证为 macOS 共享核心、真实 Node/Pi 合成进程与消息桥；Windows 原生窗口、WinHTTP/DPAPI/Job fixtures 只交叉编译，执行数为 0。未调用收费模型 API、读取用户密钥/正文/剪贴板或截屏。最终共享全套451项通过、0失败、2项原有忽略，38个suite summaries且无warning；Node真实Pi suite 30/30通过。
+本次验证为 macOS 共享核心、真实 Node/Pi 合成进程与消息桥；Windows 原生窗口、WinHTTP/DPAPI/Job fixtures 只交叉编译，执行数为 0。未调用收费模型 API、读取用户密钥/正文/剪贴板或截屏。最终共享全套457项通过、0失败、2项原有忽略，38个suite summaries且无warning；Node真实Pi suite 30/30通过。
 
 ## 本轮结果与边界
 
-- Rust共享核心：451 passed / 0 failed / 2 原有 ignored。先前一次full被旧6字段fixture阻断，修正为8字段后完成；另一次因focused输出检查失误中断，所有日志保留于本轮开发报告，没有计作通过。
-- 真实进程/通道：13个worker测试覆盖默认关闭无spawn、无模型health、真实Pi→actor→完成回执、EOF/坏帧/有界stdout和stderr、迟到token/call、取消不释放真实占用、deadline中断不读stdin的大帧、最终checkpoint先于失败并保留elapsed、panic和owned PID清理。
+- Rust共享核心：457 passed / 0 failed / 2 原有 ignored。先前一次full被旧6字段fixture阻断，修正为8字段后完成；另一次因focused输出检查失误中断，所有日志保留于本轮开发报告，没有计作通过。
+- 真实进程/通道：14个worker测试覆盖默认关闭无spawn、无模型health、真实Pi→actor→完成回执、EOF/坏帧/有界stdout和stderr、迟到token/call、取消不释放真实占用、deadline中断不读stdin的大帧、最终checkpoint先于失败并保留elapsed、panic和owned PID清理。
 - Memory UI便携行为：所见快照、Attention不可应用、同id/input保存重试、多行输入归一化/原草稿保留；真实SQLite标签投影只读以及跨启动新操作id验证。
 - Host与Windows all-targets严格Clippy/check通过；fmt/diff通过。Windows-only fixtures只编译，未在开发主机执行。新增WinHTTP localhost fixture验证真实序列化请求与signed/redacted thinking的规范化，只列编译证据。
 - Windows GNU Release及共享Release core-check通过；core-check的内存可查、保存前磁盘无历史、退出恢复三个断言均true。
-- 初版447项后的health按钮修正已纳入本轮451项shared full。该全套后仅补Windows-only最小缩窗尺寸保护（320×280逻辑尺寸并按工作区夹取），重新通过Windows严格Clippy/check/Release；共享逻辑未变，未重复shared full。
+- 最终全套已纳入本批全部 Rust 修改，包括保存重试、空 IME 组合、反馈长度、显式滚动坐标及原 Windows 最小缩窗保护。全套之后生产源码冻结；Windows-only fixtures 仅编译，不能用宿主 0 项运行声称实机通过。
 - 固定Node24.19.0/pnpm11.25.0、禁用生命周期脚本的frozen安装后重新构建Pi bundle，212602bytes。用户启动不下载，不需要全局Node。
 - 本机5次拥有的ready-only子进程：启动47.198–51.665ms，RSS采样最大值55,920–56,112KiB（约54.61–54.80MiB）。不含模型，不是Windows测试，也不代表实际峰值。
 - 全新ZIP含EXE、Node、Pi模块、Node/Pi/TypeBox及原有依赖许可、最新README和docs。逐成员精确集合/字节/CRC/SHA校验；最终EXE/ZIP/每个成员哈希在ZIP外的dist/SHA256SUMS及package-manifest.json。
 
 需要Windows实机继续验收原生窗口、中文输入法、多屏DPI/小屏布局、WinHTTP/DPAPI与Job对象生命周期；开发过程未抓屏或操作用户剪贴板。CI准备步骤已更新，但本轮未触发CI或推送。
 
+## 最终审查修复
+
+- 保存重试按同一 pending 请求记录首次 RAM 接纳，并绑定发往 actor 时的旧 session token；只有首次且 token 匹配才取消旧 worker。重复保存成功或再次失败都保留后来启动的任务。真实 actor、SQLite 失败触发器、Pi 子进程和生产 portable policy 覆盖反馈/编辑/删除 × 重试成功/再失败六流程，校验新任务预算不变、正常完成、无重复记忆、下一批继续。
+- 反馈窗口以 WM_IME_STARTCOMPOSITION/ENDCOMPOSITION 生命周期配合当前组合串检测保护 Esc/Enter/Tab，空组合期间继续交给输入法。便携策略已执行，中文输入法实际效果仍待 Windows 验收。
+- 反馈原因统一为 1–256 字符，记忆规则仍为 1–512 字符；换行/制表符在提交时转为空格，失败保留 raw 输入，路径/别名不采用此归一化。256/257 与 512/513 边界已验证。
+- 内容 viewport 按共享 geometry 减 scroll_y 显式批量定位全部子控件，使用 DeferWindowPos（失败回退 SetWindowPos），不再依赖 SW_SCROLLCHILDREN。部分裁剪坐标、原 18 组小屏/DPI geometry、正反向 Tab/resize clamp 已验证；实际 Win32 重绘仍待验收。
+- fresh 打包仅清理废弃生成文件 dist/SHA256SUMS.txt，先校验 owned path；实际测试确认软链接拒绝且目标保留、其他 dist 文件保持。最终校验仅使用 dist/SHA256SUMS，全部 23 成员再次核对 source/stage/ZIP、CRC、体积与 SHA。
+- 本批 focused 80/80（14 worker + 32 portable UI + 2 coordinator + 32 actor）；source-final full 457/0/2，所有生产修改已包含。Node 源码与 bundle 未变，沿用此前 30/30 真实 Pi suite，不重复未变化的套件。
+
 ## 本轮 Task 3 审查修复
 
-最终451项全套包含以下回归，Node生产协议与bundle未改，沿用已通过的30项Node验证：
+Task 3 的451项全套包含以下回归（亦保留在最终457项中），Node生产协议与bundle未改，沿用已通过的30项Node验证：
 
 - stdout reader独立合并通过协议校验且关联当前request的checkpoint/typed失败，HTTP阻塞时也不会丢失已接收的最终预算。真实Pi恢复elapsed119750并阻塞transport跨剩余时限，最终cp120000先于HarnessFailed(deadline,false)，后到的网络错误不覆盖终态。陌生request与未settled transcript拒绝，不进入actor。
 - 记忆/反馈窗口新增内容级viewport、scrollbar/wheel、Tab焦点自动滚入视野；底部保存/重试/删除/关闭独立固定，窄窗口使用两行。共享geometry测试覆盖96/144/192 DPI、三种小屏客户区、记忆及反馈两模式（18组），逐字段无重叠、可完全滚入、footer不遮挡；另覆盖反向Tab和resize后的scroll clamp。原ListBox/编辑器自身滚动、raw草稿、IME、theme/DPI字体保持。
