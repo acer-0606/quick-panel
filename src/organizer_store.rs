@@ -27,6 +27,12 @@ pub(crate) struct OrganizerStore {
     pub saturated: bool,
     #[serde(skip)]
     pub dirty: bool,
+    // Runtime headroom for the actor Work, one delivered worker Work, and the
+    // eventual Ready growth. Every enqueue observes these reservations too.
+    #[serde(skip)]
+    resident_reservation: usize,
+    #[serde(skip)]
+    serialized_reservation: usize,
 }
 impl OrganizerStore {
     pub fn load(db: &Connection) -> Result<Self, String> {
@@ -124,8 +130,8 @@ impl OrganizerStore {
             saturated: self.saturated || self.ready_count() >= MAX_READY_PROPOSALS,
         }
     }
-    pub fn fits(&self) -> bool {
-        let memory = std::mem::size_of::<Self>()
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
             + self.records.capacity() * std::mem::size_of::<Record>()
             + self
                 .records
@@ -141,11 +147,82 @@ impl OrganizerStore {
                             0
                         }
                 })
-                .sum::<usize>();
+                .sum::<usize>()
+    }
+    fn serialized_bytes(&self) -> usize {
+        serde_json::to_vec(self).map_or(MAX_STORE_BYTES + 1, |b| b.len())
+    }
+    pub fn fits(&self) -> bool {
         self.records.len() <= MAX_RECORDS
             && self.ready_count() <= MAX_READY_PROPOSALS
-            && memory <= MAX_STORE_BYTES
-            && serde_json::to_vec(self).is_ok_and(|b| b.len() <= MAX_STORE_BYTES)
+            && self
+                .memory_bytes()
+                .saturating_add(self.resident_reservation)
+                <= MAX_STORE_BYTES
+            && self
+                .serialized_bytes()
+                .saturating_add(self.serialized_reservation)
+                <= MAX_STORE_BYTES
+    }
+    fn evict_oldest_done(&mut self) -> bool {
+        let Some(index) = self
+            .records
+            .iter()
+            .position(|r| matches!(r.status, Status::Done))
+        else {
+            return false;
+        };
+        self.records.remove(index);
+        self.records.shrink_to_fit();
+        self.dirty = true;
+        true
+    }
+    pub fn release_reservation(&mut self) {
+        self.resident_reservation = 0;
+        self.serialized_reservation = 0;
+    }
+    /// Called on a prospective store, committed by the actor only on success.
+    /// Reclaim completed receipts for BOTH live and future-result headroom.
+    pub fn reserve_work(&mut self, work: &Work) -> bool {
+        self.records.shrink_to_fit();
+        for record in &mut self.records {
+            if work.candidates.contains(&record.candidate) {
+                record.status = Status::Processing;
+            }
+        }
+        loop {
+            let mut future = self.clone();
+            future.release_reservation();
+            if work.organizer_settings.mode == OrganizerMode::Suggest {
+                for record in &mut future.records {
+                    if work.candidates.contains(&record.candidate) {
+                        record.status = Status::Ready(Proposal {
+                            candidate: record.candidate.clone(),
+                            alias: Some("𐐀".repeat(MAX_ALIAS_CHARS)),
+                            tags: (0..MAX_TAGS)
+                                .map(|i| format!("{i}{}", "𐐀".repeat(MAX_TAG_CHARS - 1)))
+                                .collect(),
+                            reason: "𐐀".repeat(MAX_REASON_CHARS),
+                        });
+                    }
+                }
+            }
+            // These are alternative long-lived states, not simultaneous: the
+            // Work reservation is released before converting Processing to Ready.
+            self.resident_reservation = work_bytes(work)
+                .saturating_mul(2)
+                .max(future.memory_bytes().saturating_sub(self.memory_bytes()));
+            self.serialized_reservation = future
+                .serialized_bytes()
+                .saturating_sub(self.serialized_bytes());
+            if self.fits() && future.ready_count() <= MAX_READY_PROPOSALS {
+                self.saturated = false;
+                return true;
+            }
+            if !self.evict_oldest_done() {
+                return false;
+            }
+        }
     }
     pub fn enqueue(&mut self, candidate: Candidate) -> bool {
         if self.blocked {
@@ -166,17 +243,12 @@ impl OrganizerStore {
         });
         next.records.shrink_to_fit();
         while !next.fits() {
-            let Some(i) = next
-                .records
-                .iter()
-                .position(|r| matches!(r.status, Status::Done))
-            else {
+            if !next.evict_oldest_done() {
                 let changed = !self.saturated;
                 self.saturated = true;
                 self.dirty |= changed;
                 return changed;
-            };
-            next.records.remove(i);
+            }
         }
         next.saturated = false;
         next.dirty = true;
@@ -221,6 +293,15 @@ impl OrganizerStore {
     pub fn committed(&mut self) {
         self.dirty = false;
     }
+}
+fn work_bytes(work: &Work) -> usize {
+    std::mem::size_of::<Work>()
+        + work.candidates.capacity() * std::mem::size_of::<Candidate>()
+        + work.candidates.iter().map(candidate_bytes).sum::<usize>()
+        + work.ai_settings.endpoint.capacity()
+        + work.ai_settings.model.capacity()
+        + work.ai_settings.encrypted_key.capacity()
+        + work.organizer_settings.instructions.capacity()
 }
 fn tags_bytes(tags: &Vec<String>) -> usize {
     tags.capacity() * std::mem::size_of::<String>()

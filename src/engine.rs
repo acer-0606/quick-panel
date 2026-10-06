@@ -585,6 +585,7 @@ impl Actor {
     }
     fn organizer_cancel(&mut self) {
         self.organizer_work = None;
+        self.repo.organizer.release_reservation();
         self.repo.organizer.recover();
     }
     fn organizer_reconcile(&mut self) -> Result<(), String> {
@@ -649,31 +650,31 @@ impl Actor {
             return Ok(());
         }
         let mut reserved = self.repo.organizer.clone();
-        let mut candidates = Vec::new();
-        for index in 0..reserved.records.len() {
-            if candidates.len() == count {
+        let mut work = crate::organizer::Work {
+            token: self.organizer_token.wrapping_add(1),
+            ai_settings: self.settings.ai.clone(),
+            organizer_settings: self.settings.organizer.clone(),
+            candidates: Vec::new(),
+        };
+        for record in self
+            .repo
+            .organizer
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, Status::Queued))
+            .take(count)
+        {
+            let mut trial = reserved.clone();
+            let mut expanded = work.clone();
+            expanded.candidates.push(record.candidate.clone());
+            expanded.candidates.shrink_to_fit();
+            if !trial.reserve_work(&expanded) {
                 break;
             }
-            if !matches!(reserved.records[index].status, Status::Queued) {
-                continue;
-            }
-            let candidate = reserved.records[index].candidate.clone();
-            if self.settings.organizer.mode == crate::organizer::OrganizerMode::Suggest {
-                // Reserve worst-case validated output before transmitting any source.
-                // Four-byte scalar values also dominate JSON quote escaping.
-                reserved.records[index].status = Status::Ready(crate::organizer::Proposal {
-                    candidate: candidate.clone(),
-                    alias: Some("𐐀".repeat(48)),
-                    tags: (0..4).map(|i| format!("{i}{}", "𐐀".repeat(23))).collect(),
-                    reason: "𐐀".repeat(256),
-                });
-            }
-            if !reserved.fits() {
-                break;
-            }
-            candidates.push(candidate);
+            reserved = trial;
+            work = expanded;
         }
-        if candidates.is_empty() {
+        if work.candidates.is_empty() {
             if !self.repo.organizer.saturated
                 && self
                     .repo
@@ -688,18 +689,8 @@ impl Actor {
             }
             return Ok(());
         }
-        self.organizer_token = self.organizer_token.wrapping_add(1);
-        let work = crate::organizer::Work {
-            token: self.organizer_token,
-            ai_settings: self.settings.ai.clone(),
-            organizer_settings: self.settings.organizer.clone(),
-            candidates,
-        };
-        for r in &mut self.repo.organizer.records {
-            if work.candidates.contains(&r.candidate) {
-                r.status = Status::Processing;
-            }
-        }
+        self.organizer_token = work.token;
+        self.repo.organizer = reserved;
         self.repo.organizer.next_at_ms =
             now.saturating_add(i64::from(self.settings.organizer.interval_seconds) * 1000);
         self.repo.organizer.dirty = true;
@@ -747,6 +738,7 @@ impl Actor {
             return Ok(());
         }
         self.organizer_work = None;
+        self.repo.organizer.release_reservation();
         let proposals = match result {
             Ok(p)
                 if p.len() == work.candidates.len()
@@ -2358,6 +2350,164 @@ impl Actor {
 #[cfg(test)]
 mod status_scheduling_tests {
     use super::*;
+
+    #[test]
+    fn automatic_dispatch_accounts_for_live_work_and_later_enqueues() {
+        use crate::organizer::{MAX_STORE_BYTES, OrganizerMode, Source};
+        use crate::organizer_store::{Record, Status};
+        fn strings(v: &Vec<String>) -> usize {
+            v.capacity() * std::mem::size_of::<String>()
+                + v.iter().map(String::capacity).sum::<usize>()
+        }
+        fn candidate(c: &crate::organizer::Candidate) -> usize {
+            let source = match &c.source {
+                Source::SavedItem { id } => id,
+                Source::ObservedPath { normalized_path } => normalized_path,
+            };
+            source.capacity()
+                + c.fingerprint.capacity()
+                + c.expected_version.capacity()
+                + c.title.capacity()
+                + c.alias.capacity()
+                + strings(&c.tags)
+                + c.context.capacity()
+        }
+        // Independent capacity walk: do not assert the production fits() result.
+        fn work_bytes(w: &crate::organizer::Work) -> usize {
+            std::mem::size_of_val(w)
+                + w.candidates.capacity() * std::mem::size_of::<crate::organizer::Candidate>()
+                + w.candidates.iter().map(candidate).sum::<usize>()
+                + w.ai_settings.endpoint.capacity()
+                + w.ai_settings.model.capacity()
+                + w.ai_settings.encrypted_key.capacity()
+                + w.organizer_settings.instructions.capacity()
+        }
+        fn actual_owned_bytes(actor: &Actor) -> usize {
+            let store = &actor.repo.organizer;
+            let record_bytes = std::mem::size_of_val(store)
+                + store.records.capacity() * std::mem::size_of::<Record>()
+                + store
+                    .records
+                    .iter()
+                    .map(|r| {
+                        candidate(&r.candidate)
+                            + match &r.status {
+                                Status::Ready(p) => {
+                                    candidate(&p.candidate)
+                                        + p.alias.as_ref().map_or(0, String::capacity)
+                                        + strings(&p.tags)
+                                        + p.reason.capacity()
+                                }
+                                _ => 0,
+                            }
+                    })
+                    .sum::<usize>();
+            record_bytes + actor.organizer_work.as_ref().map_or(0, work_bytes)
+        }
+        let (mut actor, events) = actor_fixture();
+        actor.settings.organizer.enabled = true;
+        actor.settings.organizer.mode = OrganizerMode::Automatic;
+        actor.settings.organizer.batch_size = 8;
+        actor.settings.ai.model = "memory-fixture".into();
+        actor.settings.ai.encrypted_key = vec![1];
+        for i in 0..180 {
+            let id = format!("resident-{i}");
+            let target = format!("C:/{}", "𐐀".repeat(1021));
+            actor.pending.insert(
+                id.clone(),
+                PendingItem {
+                    mutation: Mutation::Content,
+                    item: StoredItem {
+                        summary: ItemSummary {
+                            id: id.clone(),
+                            kind: ItemKind::Folder,
+                            title: "𐐀".repeat(256),
+                            subtitle: target.clone(),
+                            alias: "𐐀".repeat(256),
+                            tags: (0..32)
+                                .map(|n| format!("{n:02}{}", "𐐀".repeat(62)))
+                                .collect(),
+                            pinned: false,
+                            created_at_ms: now_ms(),
+                            last_used_ms: now_ms(),
+                            use_count: 0,
+                        },
+                        text: String::new(),
+                        representations: vec![],
+                        target: Some(target),
+                        open_with: None,
+                    },
+                },
+            );
+            actor.organizer_enqueue(Source::SavedItem { id }).unwrap();
+        }
+        assert!(actor.repo.organizer.saturated);
+        assert!(actor.flush());
+        assert!(actual_owned_bytes(&actor) <= MAX_STORE_BYTES);
+        actor.organizer_tick().unwrap();
+        assert!(
+            actual_owned_bytes(&actor) <= MAX_STORE_BYTES,
+            "store plus actor-owned Work exceeds resident limit"
+        );
+        // Free a few receipt-sized sources, then dispatch a smaller fitting batch.
+        let sources: Vec<_> = actor
+            .repo
+            .organizer
+            .records
+            .iter()
+            .rev()
+            .take(4)
+            .map(|r| r.candidate.source.clone())
+            .collect();
+        for source in sources {
+            actor.repo.organizer.forget(&source);
+        }
+        actor.repo.organizer.reset();
+        actor.organizer_tick().unwrap();
+        assert!(actor.organizer_work.is_some());
+        assert!(actual_owned_bytes(&actor) <= MAX_STORE_BYTES);
+        let published = events
+            .try_iter()
+            .find_map(|event| {
+                if let Event::OrganizerWork(work) = event {
+                    Some(work)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            actual_owned_bytes(&actor) + work_bytes(&published) <= MAX_STORE_BYTES,
+            "published worker copy also needs dispatch headroom"
+        );
+        for i in 0..180 {
+            actor
+                .organizer_enqueue(Source::SavedItem {
+                    id: format!("resident-{i}"),
+                })
+                .unwrap();
+        }
+        assert!(
+            actual_owned_bytes(&actor) <= MAX_STORE_BYTES,
+            "new sources consumed the active Work reservation"
+        );
+        assert!(actual_owned_bytes(&actor) + work_bytes(&published) <= MAX_STORE_BYTES);
+        drop(published);
+        let before = actor.repo.organizer.records.len();
+        actor.organizer_cancel();
+        for i in 0..180 {
+            actor
+                .organizer_enqueue(Source::SavedItem {
+                    id: format!("resident-{i}"),
+                })
+                .unwrap();
+        }
+        assert!(
+            actor.repo.organizer.records.len() > before,
+            "cancelled work must release its resident reservation"
+        );
+        assert!(actual_owned_bytes(&actor) <= MAX_STORE_BYTES);
+    }
 
     fn actor_fixture() -> (Actor, Receiver<Event>) {
         let (events, received) = mpsc::channel();

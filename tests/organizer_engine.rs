@@ -718,6 +718,82 @@ fn byte_budget_stops_network_before_ready_growth_and_preserves_all_sources() {
         .unwrap();
     assert!(n <= MAX_STORE_BYTES as i64);
 }
+
+#[test]
+fn ready_reservation_reclaims_done_before_stalling_and_preserves_ready_sources() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    favorite(&e, "small-ready", "", vec![]);
+    let w = work(&e);
+    complete(&e, &w);
+    let ready = snapshot(&e).proposals;
+    for i in 0..180 {
+        e.send(Command::SaveFavorite(FavoriteInput {
+            id: Some(format!("reclaim-{i}")),
+            kind: ItemKind::Folder,
+            title: "𐐀".repeat(256),
+            target: format!("C:/{}", "𐐀".repeat(1021)),
+            alias: "𐐀".repeat(256),
+            tags: (0..32)
+                .map(|n| format!("{n:02}{}", "𐐀".repeat(62)))
+                .collect(),
+            open_with: None,
+        }))
+        .unwrap();
+        wait(&e, |v| matches!(v, Event::Saved(_)));
+    }
+    let full = snapshot(&e);
+    assert!(full.saturated);
+    assert!(full.queued < 180);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    let raw: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    let mut state: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    // A valid cache image after metadata-neutral Automatic completions, followed
+    // by switching to Suggest: identity/version/Ready/source rows remain real.
+    let records = state["records"].as_array_mut().unwrap();
+    let done_sources: Vec<_> = records
+        .iter_mut()
+        .filter(|r| r["status"] == "Queued")
+        .take(16)
+        .map(|r| {
+            r["status"] = "Done".into();
+            r["candidate"]["source"].clone()
+        })
+        .collect();
+    let before = records.len();
+    state["next_at_ms"] = 0.into();
+    db.execute("UPDATE organizer_state SET data=?1", [state.to_string()])
+        .unwrap();
+    drop(db);
+    let e = open(&p);
+    let w = work(&e);
+    assert!(!w.candidates.is_empty());
+    assert_eq!(snapshot(&e).proposals, ready);
+    flush(&e);
+    let db = Connection::open(&p).unwrap();
+    let raw: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    let after: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let records = after["records"].as_array().unwrap();
+    assert!(records.len() < before);
+    assert!(
+        !records
+            .iter()
+            .any(|r| r["candidate"]["source"] == done_sources[0])
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        181
+    );
+    stop(&e);
+}
 #[test]
 fn oversized_durable_state_pauses_only_organizer_without_discarding_it() {
     let d = tempfile::tempdir().unwrap();
