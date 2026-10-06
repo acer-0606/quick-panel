@@ -1,6 +1,34 @@
 # 验证记录
 
-当前 AI 管家集成验证日期：2026-10-06；产品源码为 `1bb5874f95424e094676f95b276cb1d45b8b858f`，此后只更新验证和实施记录。此前外部路径与截图基线为 `fb9d8b1`，对应旧记录保留在后文。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
+当前交付为单条 AI 整理状态补充，日期 2026-10-06；产品源码 `c281c12375cd16a10a88fe84d5ccab10606a7ccd`，之后只更新验证文档。代码与交付继续保留在原项目目录和 `codex/quick-panel` 分支。macOS aarch64 宿主，Windows 使用 `x86_64-pc-windows-gnu` 交叉构建。
+
+## 单条整理状态与当前交付
+
+主列表只给实际 Queued、Processing、Ready 来源显示“待整理”“整理中”“有整理建议”；关闭、范围外、未入队旧内容及 Done 不标记。原名称、正文、执行目标和本地路径区分保持可用；确认前不采用建议别名。启用时有可点击的 AI 管家入口，统一显示冷却、暂停、容量或建议数量，无逐行报错、估算百分比、动画和新增快捷键。
+
+轻量状态命令只投影最多 256 条内存记录，不读取正文/SQLite、不执行 reconciliation、不标记 dirty。一个实际在途请求加代次合并，隐藏/配置变化前的回包不能恢复旧标记；显示缓存按 revision、结果与查询复用，不在绘制时查询后台。AI 元数据变更以带前值守卫的 alias/tags 补丁更新现有行，不触发搜索；已在途结果保留已有行的相对顺序并追加新匹配项，下一次搜索恢复正常排序。原生只替换变化行的辅助文字并保留选择/顶部位置，界面编辑内容不被重设。
+
+独立审查确认两项边界问题并修复：冷却自然到期后仍显示 cooling，以及同查询晚到结果间接重载当前预览。修后按当前时间投影冷却，保留原调度/失败计数且不安排保存；晚到结果仅在来源、目标、类型和标题仍一致时保留原预览，实际选中身份再次校验，用户显式选择/重试仍沿原路径。两项均经过真实 RED→GREEN 与定点复审，无开放发现。
+
+| 当前检查 | 结果 |
+|---|---|
+| 修后完整共享测试 | **389 passed / 0 failed / 2 既有 ignored**，35 个 suite summaries |
+| 初版 focused / 修复 focused | 101 / 69 项通过；容量用例均在最终 full 中执行 |
+| host / Windows all-target strict Clippy | 最终源码均通过，`-D warnings`；Windows 38 个专用 fixtures 仅编译、0 执行 |
+| fmt / diff check | 通过 |
+| Windows GNU Release | 最终源码构建通过，30.73s；PE32+ GUI x64，4,734,976 字节，只导入系统 DLL / CRT |
+| 最终共享 `--core-check` | 内存可查、保存前磁盘无历史、正常退出可恢复，三项均为 true |
+| 独立审查 | `70fe96a..fcf8f83` 初审；`fcf8f83..c281c12` 定点复审通过 |
+
+最终 EXE SHA-256：`3dd0b33b9852d355c56f956f7686d0bfe071bf3bba18e2aa5a60c60424a3d9d3`。新建 ZIP 打包当前 EXE、README、许可与 docs，校验 CRC 和全部成员字节；当前 ZIP/EXE 校验值位于 `dist/SHA256SUMS.txt`。
+
+本轮在原 SSD 工作区执行，磁盘空间已充足，不使用 RAM 副本或迁移缓存。固定环境 `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`；Cargo 串行。最终完整命令为 `cargo test --locked`，编译为 `cargo build --locked --release --target x86_64-pc-windows-gnu`。证据与两轮审查记录保留 `target/verification-2026-10-06-organizer-status/`；较早 `fcf8f83` 的 387 项结果不冒充最后源码结果。
+
+新增回归覆盖真实 actor 的入队/处理中/Ready/Done、范围与关闭、原内容可用、状态读不提交事务，以及旧回包、人工前值保护、晚到结果保序、冷却到期和预览来源保护。没有使用真实 API、密钥、剪贴板或屏幕；未重测性能基准。Windows 原生界面、滚动/文字选择、Tab/Enter、DPI/主题及实际模型效果仍需实机验收，交叉编译不代表这些交互已执行。
+
+## AI 管家基础交付（历史验证 `1bb5874`）
+
+AI 管家基础集成验证日期：2026-10-06；该阶段产品源码为 `1bb5874f95424e094676f95b276cb1d45b8b858f`。此前外部路径与截图基线为 `fb9d8b1`，对应旧记录保留在后文。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
 
 共享核心和 Windows 源码编译通过；Windows 原生界面的实际运行尚未在本机验证。最终源码的验证结果如下，后文较早阶段的测试数量不代表当前版本：
 
@@ -13,7 +41,7 @@
 | 共享 `--core-check` | `pending_visible`、`disk_empty_before_flush`、`exit_restored` 均为 true |
 | Windows-only fixtures | **38 项仅交叉编译、0 项执行**：AI 22、Embedding 8、images 8 |
 
-最终 EXE 的 SHA-256 为 `464e0d95fab8c3aebc002c419c2a48affb3c0854d021bff2acf03535b07880cd`。ZIP 与 EXE 的交付校验值位于 `dist/SHA256SUMS.txt`，使用新建归档避免旧文件残留。
+该历史版本 EXE 的 SHA-256 为 `464e0d95fab8c3aebc002c419c2a48affb3c0854d021bff2acf03535b07880cd`；当前版本以文档开头和 `dist/SHA256SUMS.txt` 的校验值为准。
 
 ## AI 管家、模型与原生审阅（2026-10-06）
 
