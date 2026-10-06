@@ -22,6 +22,12 @@ pub enum MemoryScope {
     Directory { path: String },
     Global,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FeedbackTarget {
+    pub source: Source,
+    pub expected_version: String,
+    pub rejected_alias: Option<String>,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum FeedbackScope {
     Item,
@@ -77,6 +83,7 @@ pub struct MemorySnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attention {
     pub source: Source,
+    pub expected_version: String,
     pub code: String,
     pub message: String,
 }

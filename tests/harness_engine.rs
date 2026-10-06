@@ -397,7 +397,7 @@ fn feedback_persists_reason_scope_negative_alias_and_duplicate_request_is_idempo
     assert_eq!(snapshot(&e).proposals.len(), 1);
     let cmd = Command::HarnessFeedback {
         request_id: 80,
-        sources: vec![w.candidates[0].source.clone()],
+        sources: vec![seen_target(&snapshot(&e).proposals[0])],
         reason: "要保留项目标识".into(),
         scope: FeedbackScope::Item,
     };
@@ -717,23 +717,7 @@ fn confirmed_capacity_never_evicts_human_rules_and_save_failure_retains_pending_
         },
     })
     .unwrap();
-    let mut got = None;
-    let end = Instant::now() + Duration::from_secs(5);
-    while got.is_none() {
-        match e.try_recv() {
-            Ok(Event::HarnessMemoryReceipt {
-                request_id: 201,
-                result,
-                pending_save,
-            }) => got = Some((result, pending_save)),
-            Ok(_) => {}
-            Err(_) => {
-                assert!(Instant::now() < end);
-                std::thread::sleep(Duration::from_millis(2));
-            }
-        }
-    }
-    let (result, pending) = got.unwrap();
+    let (result, pending) = receipt_after_failed_write(&e, 201);
     assert!(result.is_err() && pending);
     assert_eq!(memory(&e).records[0].text, "失败但保留");
     db.execute_batch("DROP TRIGGER fail_harness").unwrap();
@@ -1059,7 +1043,7 @@ fn editing_rejected_feedback_retains_negative_alias_and_feedback_capacity_preser
     let _ = snapshot(&e);
     e.send(Command::HarnessFeedback {
         request_id: 600,
-        sources: vec![w.candidates[0].source.clone()],
+        sources: vec![seen_target(&snapshot(&e).proposals[0])],
         reason: "保留目录标识".into(),
         scope: FeedbackScope::Directory,
     })
@@ -1311,7 +1295,7 @@ fn directory_feedback_normalizes_drive_and_unc_share_roots_before_durable_receip
         let _ = snapshot(&e);
         e.send(Command::HarnessFeedback {
             request_id: 1000,
-            sources: vec![w.candidates[0].source.clone()],
+            sources: vec![seen_target(&snapshot(&e).proposals[0])],
             reason: "保留根目录标识".into(),
             scope: FeedbackScope::Directory,
         })
@@ -1333,4 +1317,479 @@ fn directory_feedback_normalizes_drive_and_unc_share_roots_before_durable_receip
         );
         stop(&e);
     }
+}
+
+fn seed_near_capacity_memories(
+    path: &std::path::Path,
+    confirmed: bool,
+) -> Vec<quick_panel::harness_tools::MemoryRecord> {
+    use quick_panel::harness_tools::*;
+    let make = |id: u64, source: String, protected: bool| MemoryRecord {
+        id,
+        scope: if id == 1 {
+            MemoryScope::Global
+        } else {
+            MemoryScope::Item {
+                source: Source::SavedItem { id: source },
+            }
+        },
+        kind: MemoryKind::Rule,
+        origin: MemoryOrigin::Human,
+        proposed_by_ai: false,
+        text: if id == 1 {
+            "保护规则".into()
+        } else {
+            "😀".repeat(512)
+        },
+        alias: None,
+        tags: vec![],
+        evidence_ids: vec![],
+        confirmed: protected,
+        enabled: true,
+        created_at_ms: 1,
+    };
+    let encode = |records: &Vec<MemoryRecord>| {
+        serde_json::to_vec(&serde_json::json!({"version":0,"next_id":records.last().unwrap().id,"memories":records,"run":null,"human_requests":[]})).unwrap()
+    };
+    let mut records = vec![make(1, String::new(), true)];
+    loop {
+        let id = records.len() as u64 + 1;
+        records.push(make(id, format!("{}-{id}", "界".repeat(4090)), confirmed));
+        if encode(&records).len() > 512_000 {
+            records.pop();
+            break;
+        }
+    }
+    let id = records.len() as u64 + 1;
+    let (mut low, mut high) = (0usize, 4090usize);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        records.push(make(id, format!("{}-{id}", "😀".repeat(mid)), confirmed));
+        let fits = encode(&records).len() <= 512_000;
+        records.pop();
+        if fits {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    records.push(make(id, format!("{}-{id}", "😀".repeat(low)), confirmed));
+    let data = encode(&records);
+    assert!((511_984..=512_000).contains(&data.len()));
+    let db = Connection::open(path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE harness_state(id INTEGER PRIMARY KEY CHECK(id=1),data TEXT NOT NULL)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO harness_state VALUES(1,?1)",
+        [String::from_utf8(data).unwrap()],
+    )
+    .unwrap();
+    records
+}
+fn large_favorite(e: &Engine) {
+    e.send(Command::SaveFavorite(FavoriteInput {
+        id: Some("large".into()),
+        kind: ItemKind::Folder,
+        title: "😀".repeat(256),
+        target: format!("C:/{}", "😀".repeat(300)),
+        alias: "😀".repeat(256),
+        tags: (0..32).map(|i| format!("{i}{}", "😀".repeat(60))).collect(),
+        open_with: None,
+    }))
+    .unwrap();
+    wait(e, |v| matches!(v, Event::Saved(_)));
+}
+#[test]
+fn beginning_larger_batch_reclaims_oldest_ordinary_memory_without_search_error_or_losing_rule() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("begin-evict");
+    let e = open(&p);
+    settings(&e, config());
+    large_favorite(&e);
+    favorite(&e, "small");
+    stop(&e);
+    let before = seed_near_capacity_memories(&p, false);
+    let e = open(&p);
+    assert!(memory(&e).storage_error.is_none());
+    let w = work(&e);
+    assert_eq!(w.candidates.len(), 2);
+    let after = memory(&e);
+    assert!(after.records.len() < before.len());
+    assert_eq!(after.records[0].text, "保护规则");
+    assert!(after.records[0].confirmed);
+    assert!(!after.records.iter().any(|m| m.id == before[1].id));
+    assert_eq!(snapshot(&e).failures, 0);
+    stop(&e);
+}
+#[test]
+fn unstartable_capacity_item_becomes_local_attention_and_later_item_and_explicit_retry_recover() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("begin-attention");
+    let e = open(&p);
+    settings(&e, config());
+    large_favorite(&e);
+    favorite(&e, "small");
+    stop(&e);
+    let protected = seed_near_capacity_memories(&p, true);
+    let e = open(&p);
+    assert!(memory(&e).storage_error.is_none());
+    e.send(Command::OrganizerTick).unwrap();
+    let s = snapshot(&e);
+    assert_eq!(s.attention.len(), 1);
+    assert_eq!(s.attention[0].code, "CAPACITY");
+    assert_eq!(
+        s.attention[0].source,
+        Source::SavedItem { id: "large".into() }
+    );
+    assert_eq!(s.queued, 1);
+    assert_eq!(s.failures, 0);
+    assert!(!s.paused && s.retry_at_ms.is_none());
+    assert_eq!(memory(&e).records, protected);
+    let next = work(&e);
+    assert_eq!(
+        next.candidates[0].source,
+        Source::SavedItem { id: "small".into() }
+    );
+    assert_eq!(snapshot(&e).attention.len(), 1);
+    submit(&e, &next, "small-submit", "可容纳小项").unwrap();
+    let proposals = finish(&e, &next).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: next.token,
+        result: Ok(proposals),
+    })
+    .unwrap();
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    e.send(Command::HarnessMemoryDelete {
+        request_id: 2001,
+        ids: protected.iter().map(|m| m.id).collect(),
+    })
+    .unwrap();
+    assert!(receipt(&e, 2001).0.is_ok());
+    e.send(Command::OrganizerRetry).unwrap();
+    assert!(snapshot(&e).attention.is_empty());
+    let resumed = work(&e);
+    assert_eq!(resumed.candidates.len(), 1);
+    assert_eq!(
+        resumed.candidates[0].source,
+        Source::SavedItem { id: "large".into() }
+    );
+    stop(&e);
+}
+#[test]
+fn disabled_feedback_returns_correlated_error_without_learning_or_requeue() {
+    use quick_panel::harness_tools::*;
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("feedback-off"));
+    let mut settings_value = config();
+    settings_value.organizer.memory_enabled = false;
+    settings(&e, settings_value);
+    favorite(&e, "a");
+    let w = work(&e);
+    submit(&e, &w, "s", "所见别名").unwrap();
+    let p = finish(&e, &w).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Ok(p),
+    })
+    .unwrap();
+    let before = snapshot(&e);
+    e.send(Command::HarnessFeedback {
+        request_id: 2002,
+        sources: vec![seen_target(&snapshot(&e).proposals[0])],
+        reason: "保留输入".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    let (result, pending) = receipt(&e, 2002);
+    assert!(result.unwrap_err().contains("启用"));
+    assert!(!pending);
+    let after = snapshot(&e);
+    assert_eq!(after.proposals, before.proposals);
+    assert_eq!(after.queued, before.queued);
+    assert!(memory(&e).records.is_empty());
+    stop(&e);
+}
+
+fn seen_target(p: &Proposal) -> quick_panel::harness_tools::FeedbackTarget {
+    quick_panel::harness_tools::FeedbackTarget {
+        source: p.candidate.source.clone(),
+        expected_version: p.candidate.expected_version.clone(),
+        rejected_alias: p.alias.clone(),
+    }
+}
+#[test]
+fn feedback_rejects_same_version_ready_alias_advanced_after_the_user_snapshot() {
+    use quick_panel::harness_tools::*;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("seen-alias");
+    let e = open(&p);
+    settings(&e, config());
+    favorite(&e, "a");
+    let w = work(&e);
+    submit(&e, &w, "s", "用户所见").unwrap();
+    let ps = finish(&e, &w).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Ok(ps),
+    })
+    .unwrap();
+    let shown = seen_target(&snapshot(&e).proposals[0]);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    db.execute("UPDATE organizer_state SET data=json_set(data,'$.records[0].status.Ready.alias','已推进新建议')",[]).unwrap();
+    drop(db);
+    let e = open(&p);
+    let before = snapshot(&e);
+    assert_eq!(before.proposals[0].alias.as_deref(), Some("已推进新建议"));
+    assert_eq!(
+        before.proposals[0].candidate.expected_version,
+        shown.expected_version
+    );
+    e.send(Command::HarnessFeedback {
+        request_id: 2100,
+        sources: vec![shown],
+        reason: "旧界面反馈".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    let (result, pending) = receipt(&e, 2100);
+    assert!(result.is_err());
+    assert!(!pending);
+    assert!(memory(&e).records.is_empty());
+    assert_eq!(snapshot(&e).proposals, before.proposals);
+    stop(&e);
+}
+#[test]
+fn feedback_on_processing_and_attention_without_displayed_alias_never_learns_hidden_staged_alias() {
+    use quick_panel::harness_tools::*;
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("hidden-stage"));
+    settings(&e, config());
+    favorite(&e, "a");
+    let w = work(&e);
+    submit(&e, &w, "s", "未展示的暂存名称").unwrap();
+    let target = FeedbackTarget {
+        source: w.candidates[0].source.clone(),
+        expected_version: w.candidates[0].expected_version.clone(),
+        rejected_alias: None,
+    };
+    e.send(Command::HarnessFeedback {
+        request_id: 2101,
+        sources: vec![target],
+        reason: "调整当前内容".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    assert!(receipt(&e, 2101).0.is_ok());
+    assert!(memory(&e).records[0].alias.is_none());
+    let w = work(&e);
+    submit(&e, &w, "s2", "另一隐藏名称").unwrap();
+    e.send(Command::HarnessFailed {
+        token: w.token,
+        code: "incomplete".into(),
+        message: "合成需处理".into(),
+        retryable: false,
+    })
+    .unwrap();
+    let attention = snapshot(&e).attention[0].clone();
+    let target = FeedbackTarget {
+        source: attention.source,
+        expected_version: attention.expected_version,
+        rejected_alias: None,
+    };
+    e.send(Command::HarnessFeedback {
+        request_id: 2102,
+        sources: vec![target],
+        reason: "调整需处理内容".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    assert!(receipt(&e, 2102).0.is_ok());
+    assert!(memory(&e).records.iter().all(|m| m.alias.is_none()));
+    stop(&e);
+}
+#[test]
+fn feedback_rejects_old_seen_source_version_after_actual_title_edit_and_same_alias_ready() {
+    use quick_panel::harness_tools::*;
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("seen-version"));
+    settings(&e, config());
+    favorite(&e, "a");
+    let first = work(&e);
+    submit(&e, &first, "s", "相同显示名称").unwrap();
+    let ps = finish(&e, &first).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: first.token,
+        result: Ok(ps),
+    })
+    .unwrap();
+    let shown = seen_target(&snapshot(&e).proposals[0]);
+    e.send(Command::SaveFavorite(FavoriteInput {
+        id: Some("a".into()),
+        kind: ItemKind::Folder,
+        title: "人工修改后的标题".into(),
+        target: "C:/Project/a".into(),
+        alias: String::new(),
+        tags: vec![],
+        open_with: None,
+    }))
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    e.send(Command::OrganizerRetry).unwrap();
+    let _ = snapshot(&e);
+    let changed = work(&e);
+    assert_ne!(
+        changed.candidates[0].expected_version,
+        shown.expected_version
+    );
+    submit(&e, &changed, "s2", "相同显示名称").unwrap();
+    let ps = finish(&e, &changed).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: changed.token,
+        result: Ok(ps),
+    })
+    .unwrap();
+    let before = snapshot(&e);
+    assert_eq!(before.proposals[0].alias, shown.rejected_alias);
+    e.send(Command::HarnessFeedback {
+        request_id: 2200,
+        sources: vec![shown],
+        reason: "旧版本所见反馈".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    let (result, pending) = receipt(&e, 2200);
+    assert!(result.is_err());
+    assert!(!pending);
+    assert!(memory(&e).records.is_empty());
+    assert_eq!(snapshot(&e).proposals, before.proposals);
+    stop(&e);
+}
+fn receipt_after_failed_write(e: &Engine, id: u64) -> (Result<(), String>, bool) {
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        match e.try_recv() {
+            Ok(Event::HarnessMemoryReceipt {
+                request_id,
+                result,
+                pending_save,
+            }) if request_id == id => return (result, pending_save),
+            Ok(_) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(Instant::now() < end);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+}
+#[test]
+fn disabled_memory_allows_same_submitted_feedback_save_retry_and_explicit_memory_management() {
+    use quick_panel::harness_tools::*;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("feedback-save-retry");
+    let e = open(&p);
+    settings(&e, config());
+    favorite(&e, "a");
+    let w = work(&e);
+    submit(&e, &w, "s", "所见名称").unwrap();
+    let ps = finish(&e, &w).unwrap();
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Ok(ps),
+    })
+    .unwrap();
+    let shown = seen_target(&snapshot(&e).proposals[0]);
+    e.send(Command::Flush).unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    let db = Connection::open(&p).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_feedback BEFORE UPDATE ON harness_state BEGIN SELECT RAISE(FAIL,'synthetic denied'); END;").unwrap();
+    let cmd = Command::HarnessFeedback {
+        request_id: 2201,
+        sources: vec![shown.clone()],
+        reason: "待保存的已提交反馈".into(),
+        scope: FeedbackScope::Item,
+    };
+    e.send(cmd.clone()).unwrap();
+    let (result, pending) = receipt_after_failed_write(&e, 2201);
+    assert!(result.is_err() && pending);
+    let mut off = config();
+    off.organizer.memory_enabled = false;
+    e.send(Command::SaveSettings(off)).unwrap();
+    e.send(Command::HarnessMemorySnapshot { request_id: 2202 })
+        .unwrap();
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < end);
+        if let Ok(Event::HarnessMemoryState {
+            request_id: 2202,
+            snapshot,
+        }) = e.try_recv()
+        {
+            assert_eq!(snapshot.records.len(), 1);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    db.execute_batch("DROP TRIGGER fail_feedback").unwrap();
+    e.send(cmd).unwrap();
+    let (result, pending) = receipt(&e, 2201);
+    assert!(result.is_ok() && !pending);
+    assert_eq!(memory(&e).records.len(), 1);
+    e.send(Command::HarnessFeedback {
+        request_id: 2203,
+        sources: vec![shown],
+        reason: "关闭后新反馈".into(),
+        scope: FeedbackScope::Item,
+    })
+    .unwrap();
+    assert!(receipt(&e, 2203).0.unwrap_err().contains("启用"));
+    let saved = memory(&e).records[0].clone();
+    e.send(Command::HarnessMemoryEdit {
+        request_id: 2204,
+        input: MemoryEdit {
+            id: Some(saved.id),
+            scope: saved.scope,
+            text: "关闭时明确编辑".into(),
+            enabled: false,
+            confirmed: true,
+        },
+    })
+    .unwrap();
+    assert!(receipt(&e, 2204).0.is_ok());
+    e.send(Command::HarnessMemoryDelete {
+        request_id: 2205,
+        ids: vec![saved.id],
+    })
+    .unwrap();
+    assert!(receipt(&e, 2205).0.is_ok());
+    assert!(memory(&e).records.is_empty());
+    stop(&e);
+}
+#[test]
+fn start_capacity_shrinks_new_batch_prefix_without_evicting_confirmed_memory_or_losing_tail() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("begin-prefix");
+    let e = open(&p);
+    settings(&e, config());
+    favorite(&e, "small");
+    large_favorite(&e);
+    stop(&e);
+    let protected = seed_near_capacity_memories(&p, true);
+    let e = open(&p);
+    assert!(memory(&e).storage_error.is_none());
+    let w = work(&e);
+    assert_eq!(w.candidates.len(), 1);
+    assert_eq!(
+        w.candidates[0].source,
+        Source::SavedItem { id: "small".into() }
+    );
+    let state = snapshot(&e);
+    assert_eq!(state.queued, 1);
+    assert!(state.attention.is_empty());
+    assert_eq!(state.failures, 0);
+    assert_eq!(memory(&e).records, protected);
+    stop(&e);
 }

@@ -192,7 +192,7 @@ pub enum Command {
     },
     HarnessFeedback {
         request_id: u64,
-        sources: Vec<crate::organizer::Source>,
+        sources: Vec<crate::harness_tools::FeedbackTarget>,
         reason: String,
         scope: crate::harness_tools::FeedbackScope,
     },

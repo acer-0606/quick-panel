@@ -623,7 +623,7 @@ impl Actor {
     fn harness_feedback(
         &mut self,
         request_id: u64,
-        sources: Vec<crate::organizer::Source>,
+        sources: Vec<crate::harness_tools::FeedbackTarget>,
         reason: String,
         scope: crate::harness_tools::FeedbackScope,
     ) -> Result<(), String> {
@@ -632,16 +632,25 @@ impl Actor {
         if self.repo.harness.human_seen(request_id, &signature)? {
             return Ok(());
         }
+        if !self.settings.organizer.memory_enabled {
+            return Err("请先启用“记住整理反馈”；反馈输入已保留".into());
+        }
         if !text_valid(&reason, 256, false)
             || sources.is_empty()
             || sources.len() > 8
-            || sources.iter().collect::<HashSet<_>>().len() != sources.len()
+            || sources
+                .iter()
+                .map(|t| &t.source)
+                .collect::<HashSet<_>>()
+                .len()
+                != sources.len()
         {
             return Err("反馈原因或选择无效，请保留编辑后修正".into());
         }
         let mut next = self.repo.harness.clone();
         let mut candidates = Vec::new();
-        for source in &sources {
+        for target in &sources {
+            let source = &target.source;
             let record = self
                 .repo
                 .organizer
@@ -652,8 +661,24 @@ impl Actor {
             let current = self
                 .organizer_candidate(source)?
                 .ok_or("来源不再符合整理范围，反馈尚未保存")?;
-            if current != record.candidate {
+            if !text_valid(&target.expected_version, 128, false)
+                || target
+                    .rejected_alias
+                    .as_ref()
+                    .is_some_and(|alias| !text_valid(alias, 48, false))
+            {
+                return Err("反馈的所见版本或别名无效，输入已保留".into());
+            }
+            if current != record.candidate || current.expected_version != target.expected_version {
                 return Err("来源已变化，请核对后保存反馈".into());
+            }
+            match &record.status {
+                Status::Ready(proposal) if proposal.alias == target.rejected_alias => {}
+                Status::Ready(_) => {
+                    return Err("整理建议已变化，反馈输入已保留；请核对当前建议".into());
+                }
+                _ if target.rejected_alias.is_none() => {}
+                _ => return Err("当前没有该已展示别名，反馈输入已保留".into()),
             }
             let memory_scope = match scope {
                 FeedbackScope::Item => MemoryScope::Item {
@@ -666,19 +691,7 @@ impl Actor {
                 },
                 FeedbackScope::Global => MemoryScope::Global,
             };
-            let alias = match &record.status {
-                Status::Ready(p) => p.alias.clone(),
-                _ => next
-                    .run
-                    .as_ref()
-                    .and_then(|r| {
-                        r.staged
-                            .iter()
-                            .flatten()
-                            .find(|p| &p.candidate.source == source)
-                    })
-                    .and_then(|p| p.alias.clone()),
-            };
+            let alias = target.rejected_alias.clone();
             next.insert(MemoryRecord {
                 id: 0,
                 scope: memory_scope,
@@ -1522,12 +1535,44 @@ impl Actor {
             }
             return Ok(());
         }
-        if let Err(e) = self
-            .repo
-            .harness
-            .begin(self.harness_profile(), work.candidates.clone())
-        {
-            return Err(e.message);
+        let original_first = work.candidates[0].clone();
+        let original_len = work.candidates.len();
+        loop {
+            match self
+                .repo
+                .harness
+                .begin(self.harness_profile(), work.candidates.clone())
+            {
+                Ok(()) => break,
+                Err(e) if e.code == "CAPACITY" && resume.is_none() && work.candidates.len() > 1 => {
+                    work.candidates.pop();
+                }
+                Err(e) => {
+                    for record in &mut self.repo.organizer.records {
+                        if record.candidate == original_first
+                            || (resume.is_some() && work.candidates.contains(&record.candidate))
+                        {
+                            record.status = Status::Attention {
+                                code: e.code.clone(),
+                                message: e.message.clone(),
+                            };
+                        }
+                    }
+                    self.repo.organizer.next_at_ms = 0;
+                    self.repo.organizer.dirty = true;
+                    self.organizer_changed();
+                    return Ok(());
+                }
+            }
+        }
+        if work.candidates.len() != original_len {
+            reserved = self.repo.organizer.clone();
+            if !reserved.reserve_work(&work) {
+                self.repo.organizer.saturated = true;
+                self.repo.organizer.dirty = true;
+                self.organizer_changed();
+                return Ok(());
+            }
         }
         self.organizer_token = work.token;
         self.repo.organizer = reserved;

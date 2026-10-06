@@ -200,8 +200,12 @@ impl HarnessStore {
             finished: false,
             receipts: vec![],
         });
-        if !next.fits() {
-            return Err(error("CAPACITY", "Pi 状态容量已满", false));
+        while !next.fits() {
+            let Some(index) = next.memories.iter().position(|m| !authoritative(m)) else {
+                return Err(error("CAPACITY", "Pi 状态容量已满", false));
+            };
+            next.memories.remove(index);
+            next.memories.shrink_to_fit();
         }
         next.dirty = true;
         *self = next;
