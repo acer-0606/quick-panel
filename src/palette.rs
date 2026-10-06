@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 
 #[derive(Clone)]
 pub struct RowDetail {
+    pub organizer_stage: Option<crate::organizer_display::Stage>,
     pub title: String,
     pub text: String,
     pub saved_at_ms: Option<i64>,
@@ -156,6 +157,7 @@ impl Entry {
             }
         }
         RowDetail {
+            organizer_stage: None,
             title: self.title().into(),
             text,
             saved_at_ms: self.saved().map(|item| item.created_at_ms),
@@ -267,6 +269,56 @@ impl Entry {
             None
         }
     }
+}
+
+/// Keep already-visible rows in place when an older in-flight query completes
+/// after a metadata-only AI update. New matches keep their order at the end.
+pub fn preserve_visible_order(previous: &[Entry], mut next: Vec<Entry>) -> Vec<Entry> {
+    let positions: std::collections::HashMap<_, _> = previous
+        .iter()
+        .enumerate()
+        .map(|(i, row)| (row.id(), i))
+        .collect();
+    next.sort_by_key(|row| positions.get(row.id()).copied().unwrap_or(usize::MAX));
+    next
+}
+
+pub fn row_details_with_progress(
+    rows: &[Entry],
+    query: &str,
+    progress: &crate::organizer_display::Progress,
+) -> Vec<RowDetail> {
+    use crate::organizer::Source;
+    let mut details = row_details(rows, query);
+    for (row, detail) in rows.iter().zip(&mut details) {
+        detail.organizer_stage = progress.items.iter().find_map(|(source, stage)| {
+            let matched = match (source, row) {
+                (Source::SavedItem { id }, Entry::Saved(item)) => *id == item.id,
+                (Source::ObservedPath { normalized_path }, Entry::Suggested(path)) => {
+                    *normalized_path == path.path.key
+                }
+                _ => false,
+            };
+            matched.then_some(*stage)
+        });
+    }
+    details
+}
+pub fn apply_organizer_metadata(
+    rows: &mut [Entry],
+    updates: &[crate::organizer_display::MetadataUpdate],
+) -> bool {
+    let mut changed = false;
+    for row in rows {
+        for update in updates {
+            changed |= match row {
+                Entry::Saved(item) => update.apply_saved(item),
+                Entry::Suggested(path) => update.apply_path(&mut path.path),
+                Entry::Function(_) => false,
+            };
+        }
+    }
+    changed
 }
 
 /// Display metadata is built once for a result snapshot, never persisted.

@@ -183,6 +183,9 @@ pub enum Command {
     OrganizerSnapshot {
         request_id: u64,
     },
+    OrganizerProgress {
+        request_id: u64,
+    },
     OrganizerApply {
         proposals: Vec<crate::organizer::Proposal>,
     },
@@ -229,6 +232,11 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    OrganizerProgress {
+        request_id: u64,
+        progress: crate::organizer_display::Progress,
+    },
+    OrganizerMetadataUpdated(Vec<crate::organizer_display::MetadataUpdate>),
     OrganizerDetail {
         request_id: u64,
         result: Result<String, String>,

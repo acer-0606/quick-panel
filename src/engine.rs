@@ -867,6 +867,7 @@ impl Actor {
         }
         let mut saved = Vec::new();
         let mut paths = Vec::new();
+        let mut updates = Vec::new();
         for p in proposals {
             let mut alias = p.candidate.alias.clone();
             if (!automatic || alias.is_empty())
@@ -879,6 +880,15 @@ impl Actor {
                 if !tags.contains(tag) && tags.len() < 32 {
                     tags.push(tag.clone());
                 }
+            }
+            if alias != p.candidate.alias || tags != p.candidate.tags {
+                updates.push(crate::organizer_display::MetadataUpdate {
+                    source: p.candidate.source.clone(),
+                    previous_alias: p.candidate.alias.clone(),
+                    previous_tags: p.candidate.tags.clone(),
+                    alias: alias.clone(),
+                    tags: tags.clone(),
+                });
             }
             match &p.candidate.source {
                 Source::SavedItem { id } => {
@@ -902,7 +912,6 @@ impl Actor {
             self.queries
                 .semantic_revision
                 .fetch_add(1, Ordering::AcqRel);
-            self.emit(Event::Changed);
         }
         for (id, alias, tags, item) in saved {
             if let Some(p) = self.pending.get_mut(&id) {
@@ -923,11 +932,11 @@ impl Actor {
                 );
             }
         }
-        if !paths.is_empty() {
-            self.emit(Event::PathActivityChanged);
-        }
         for (path, alias, tags) in paths {
             self.repo.paths.annotate(&path, alias, tags);
+        }
+        if !updates.is_empty() {
+            self.emit(Event::OrganizerMetadataUpdated(updates));
         }
         self.mark_dirty();
         Ok(())
@@ -2206,6 +2215,16 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::OrganizerProgress { request_id } => {
+                    self.emit(Event::OrganizerProgress {
+                        request_id,
+                        progress: self
+                            .repo
+                            .organizer
+                            .progress(self.settings.organizer.enabled),
+                    });
+                    Ok(())
+                }
                 Command::OrganizerDetail {
                     request_id,
                     source,

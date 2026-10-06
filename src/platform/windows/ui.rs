@@ -265,6 +265,7 @@ struct RenderState {
     font: HFONT,
     saved_times: Rc<Vec<String>>,
     row_details: Rc<Vec<palette::RowDetail>>,
+    organizer_revision: u64,
     query: String,
     items: Vec<PaletteEntry>,
     image: Option<Arc<Image>>,
@@ -443,6 +444,9 @@ type OrganizerWorker = crate::connection_test::ConnectionTestWorker<
     (u64, Result<Vec<crate::organizer::Proposal>, String>),
 >;
 struct App {
+    organizer_progress: crate::organizer_display::ProgressCache,
+    organizer_label: HWND,
+    organizer_preserve_order: bool,
     organizer_worker: Option<OrganizerWorker>,
     organizer_session: crate::organizer_ui::OrganizerSession,
     organizer_tick_pending: bool,
@@ -566,6 +570,9 @@ pub fn run() -> Result<(), String> {
         let (tx, work_rx) = mpsc::channel();
         let (done_tx, rx) = mpsc::channel();
         let app_data = App {
+            organizer_progress: crate::organizer_display::ProgressCache::default(),
+            organizer_label: HWND::default(),
+            organizer_preserve_order: false,
             organizer_worker: None,
             organizer_session: crate::organizer_ui::OrganizerSession::default(),
             organizer_tick_pending: false,
@@ -637,6 +644,7 @@ pub fn run() -> Result<(), String> {
                 colors: host_colors,
                 saved_times: Rc::new(Vec::new()),
                 row_details: Rc::new(Vec::new()),
+                organizer_revision: 0,
                 query: String::new(),
                 font: HFONT::default(),
                 items: Vec::new(),
@@ -743,6 +751,10 @@ pub fn run() -> Result<(), String> {
 }
 impl App {
     unsafe fn update_organizer_timer(&mut self) {
+        self.organizer_progress.clear();
+        self.update_organizer_label();
+        self.refresh_organizer_rows();
+        self.layout();
         let warning = if self.settings.organizer.enabled {
             crate::organizer_ui::organizer_config_warning(&self.settings.ai)
         } else {
@@ -768,6 +780,127 @@ impl App {
         }
         if self.organizer_page_open {
             self.organizer_snapshot();
+        }
+    }
+    fn request_organizer_progress(&mut self) {
+        if self.state.visible
+            && self.settings.organizer.enabled
+            && self.state.lifecycle == Lifecycle::Running
+            && let Some(request_id) = self.organizer_progress.request()
+        {
+            self.send(Command::OrganizerProgress { request_id });
+        }
+    }
+    unsafe fn update_organizer_label(&self) {
+        if self.organizer_label.is_invalid() {
+            return;
+        }
+        let text = if self.settings.organizer.enabled
+            && crate::organizer_ui::organizer_config_warning(&self.settings.ai).is_some()
+        {
+            "AI 管家 · 检查配置".into()
+        } else {
+            self.organizer_progress.snapshot().label()
+        };
+        let _ = SetWindowTextW(self.organizer_label, PCWSTR(wide(&text).as_ptr()));
+        let _ = ShowWindow(
+            self.organizer_label,
+            if self.settings.organizer.enabled {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+    }
+    /// Update only affected native rows at their existing indices. Never search,
+    /// reorder, change focus, reload the preview, or replace an editor's contents.
+    unsafe fn refresh_organizer_rows(&self) {
+        let Some(host) = self.host.as_ref() else {
+            return;
+        };
+        let previous = host.render.borrow().clone();
+        self.sync_render();
+        let current = host.render.borrow().clone();
+        let changed: Vec<_> = current
+            .row_details
+            .iter()
+            .enumerate()
+            .filter(|(i, row)| {
+                previous.row_details.get(*i).is_some_and(|old| {
+                    old.title != row.title
+                        || old.text != row.text
+                        || old.organizer_stage != row.organizer_stage
+                })
+            })
+            .collect();
+        if changed.is_empty() {
+            return;
+        }
+        let top = SendMessageW(self.list, LB_GETTOPINDEX, None, None);
+        let selected = SendMessageW(self.list, LB_GETCURSEL, None, None);
+        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
+        for (index, row) in &changed {
+            let text = palette_row_text(row);
+            // Keep native text in sync for keyboard/type-ahead and accessibility.
+            SendMessageW(self.list, LB_DELETESTRING, Some(WPARAM(*index)), None);
+            SendMessageW(
+                self.list,
+                LB_INSERTSTRING,
+                Some(WPARAM(*index)),
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+        }
+        SendMessageW(
+            self.list,
+            LB_SETCURSEL,
+            Some(WPARAM(selected.0 as usize)),
+            None,
+        );
+        SendMessageW(
+            self.list,
+            LB_SETTOPINDEX,
+            Some(WPARAM(top.0.max(0) as usize)),
+            None,
+        );
+        SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
+        for (index, _) in changed {
+            let mut rect = RECT::default();
+            if SendMessageW(
+                self.list,
+                LB_GETITEMRECT,
+                Some(WPARAM(index)),
+                Some(LPARAM((&mut rect as *mut RECT) as isize)),
+            )
+            .0 != LB_ERR as isize
+            {
+                let _ = InvalidateRect(Some(self.list), Some(&rect), false);
+            }
+        }
+    }
+    unsafe fn organizer_metadata_updated(
+        &mut self,
+        updates: &[crate::organizer_display::MetadataUpdate],
+    ) {
+        if updates
+            .iter()
+            .any(|u| matches!(u.source, crate::organizer::Source::SavedItem { .. }))
+        {
+            self.semantic_status.mark_dirty();
+            self.update_index_label();
+        }
+        for update in updates {
+            for item in &mut self.saved_items {
+                update.apply_saved(item);
+            }
+            for path in &mut self.suggested_items {
+                update.apply_path(path);
+            }
+        }
+        // Keep pending saved/path replies alive; they may be the user's current
+        // query. Their results keep the visible order until the next search.
+        self.organizer_preserve_order |= self.saved_ready;
+        if palette::apply_organizer_metadata(&mut self.items, updates) {
+            self.refresh_organizer_rows();
         }
     }
     fn cancel_organizer_for_settings(&mut self, next: &Settings) {
@@ -867,33 +1000,40 @@ impl App {
         unsafe {
             if let Some(host) = self.host.as_ref() {
                 let previous = host.render.borrow().clone();
-                let (row_details, saved_times) =
-                    if previous.items == self.items && previous.query == self.query {
-                        (previous.row_details.clone(), previous.saved_times.clone())
-                    } else {
-                        let details = palette::row_details(&self.items, &self.query);
-                        let times = details
-                            .iter()
-                            .map(|detail| {
-                                detail
-                                    .saved_at_ms
-                                    .map(local_saved_time)
-                                    .or_else(|| {
-                                        detail
-                                            .visited_at_ms
-                                            .map(|time| format!("访 {}", local_saved_time(time)))
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-                        (Rc::new(details), Rc::new(times))
-                    };
+                let (row_details, saved_times) = if previous.items == self.items
+                    && previous.query == self.query
+                    && previous.organizer_revision == self.organizer_progress.revision()
+                {
+                    (previous.row_details.clone(), previous.saved_times.clone())
+                } else {
+                    let details = palette::row_details_with_progress(
+                        &self.items,
+                        &self.query,
+                        self.organizer_progress.snapshot(),
+                    );
+                    let times = details
+                        .iter()
+                        .map(|detail| {
+                            detail
+                                .saved_at_ms
+                                .map(local_saved_time)
+                                .or_else(|| {
+                                    detail
+                                        .visited_at_ms
+                                        .map(|time| format!("访 {}", local_saved_time(time)))
+                                })
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    (Rc::new(details), Rc::new(times))
+                };
                 *host.render.borrow_mut() = Rc::new(RenderState {
                     dpi: self.dpi,
                     colors: self.colors.clone(),
                     font: self.font,
                     saved_times,
                     row_details,
+                    organizer_revision: self.organizer_progress.revision(),
                     query: self.query.clone(),
                     items: self.items.clone(),
                     image: self.image.clone(),
@@ -1612,6 +1752,12 @@ impl App {
             WS_TABSTOP | WINDOW_STYLE((BS_FLAT | BS_LEFT) as u32),
             INDEX_STATUS,
         )?;
+        self.organizer_label = self.control(
+            w!("BUTTON"),
+            "AI 管家",
+            WS_TABSTOP | WINDOW_STYLE((BS_FLAT | BS_LEFT) as u32),
+            ORGANIZER_REVIEW,
+        )?;
         let _ = ShowWindow(self.preview, SW_HIDE);
         for (id, title) in [
             (ADD, "添加 ＋"),
@@ -1657,7 +1803,7 @@ impl App {
         for h in [self.edit, self.list, self.footer, self.preview]
             .into_iter()
             .chain(self.buttons.iter().copied())
-            .chain([self.smart_button, self.index_label])
+            .chain([self.smart_button, self.index_label, self.organizer_label])
         {
             SendMessageW(
                 h,
@@ -1676,6 +1822,7 @@ impl App {
             },
         );
         self.update_index_label();
+        self.update_organizer_label();
         self.smart_button_label();
         self.layout();
         SendMessageW(
@@ -1743,12 +1890,24 @@ impl App {
             0
         };
         mov(self.index_label, edge, self.s(102), list_width, self.s(26));
+        let organizer_height = if self.settings.organizer.enabled {
+            self.s(30)
+        } else {
+            0
+        };
+        mov(
+            self.organizer_label,
+            edge,
+            self.s(102) + index_height,
+            list_width,
+            self.s(26),
+        );
         mov(
             self.list,
             edge,
-            self.s(110) + index_height,
+            self.s(110) + index_height + organizer_height,
             list_width,
-            h - self.s(165) - index_height,
+            h - self.s(165) - index_height - organizer_height,
         );
         mov(
             self.footer,
@@ -1867,6 +2026,8 @@ impl App {
             SendMessageW(self.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
         }
         self.refresh_semantic_status();
+        self.organizer_progress.mark_dirty();
+        self.request_organizer_progress();
         self.search();
     }
     unsafe fn hide(&mut self) {
@@ -1881,12 +2042,14 @@ impl App {
         self.cancel_actions();
         self.clear_preview();
         self.state.hide();
+        self.organizer_progress.clear();
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
     unsafe fn search(&mut self) {
         if self.state.lifecycle != Lifecycle::Running {
             return;
         }
+        self.organizer_preserve_order = false;
         let current = match self.scope {
             Scope::All => 0,
             Scope::Clipboard => 1,
@@ -1999,6 +2162,11 @@ impl App {
                 vec![]
             },
         );
+        let items = if self.organizer_preserve_order {
+            palette::preserve_visible_order(&self.items, items)
+        } else {
+            items
+        };
         if self.items == items {
             self.sync_render();
             let _ = InvalidateRect(Some(self.list), None, false);
@@ -2041,13 +2209,11 @@ impl App {
             .as_ref()
             .map(|host| host.render.borrow().row_details.clone());
         for (index, item) in self.items.iter().enumerate() {
-            let title = wide(
-                details
-                    .as_ref()
-                    .and_then(|details| details.get(index))
-                    .map(|detail| detail.title.as_str())
-                    .unwrap_or_else(|| item.title()),
-            );
+            let title = details
+                .as_ref()
+                .and_then(|details| details.get(index))
+                .map(palette_row_text)
+                .unwrap_or_else(|| wide(item.title()));
             SendMessageW(
                 self.list,
                 LB_ADDSTRING,
@@ -2252,6 +2418,19 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
+                Event::OrganizerProgress {
+                    request_id,
+                    progress,
+                } => {
+                    if self.organizer_progress.complete(request_id, progress) {
+                        self.update_organizer_label();
+                        self.refresh_organizer_rows();
+                    }
+                    self.request_organizer_progress();
+                }
+                Event::OrganizerMetadataUpdated(updates) => {
+                    self.organizer_metadata_updated(&updates)
+                }
                 Event::OrganizerWork(work) => self.organizer_start(work),
                 Event::OrganizerDetail { request_id, result } => {
                     self.organizer_review
@@ -2278,6 +2457,8 @@ impl App {
                         .adopt_snapshot(request_id, snapshot);
                 }
                 Event::OrganizerChanged => {
+                    self.organizer_progress.mark_dirty();
+                    self.request_organizer_progress();
                     if self.organizer_page_open {
                         self.organizer_snapshot();
                     }
@@ -2306,6 +2487,8 @@ impl App {
                     }
                 }
                 Event::PathActivityChanged => {
+                    self.organizer_progress.mark_dirty();
+                    self.request_organizer_progress();
                     if self.state.visible && self.state.lifecycle == Lifecycle::Running {
                         self.search();
                     }
@@ -2466,6 +2649,8 @@ impl App {
                     }
                 }
                 Event::Changed => {
+                    self.organizer_progress.mark_dirty();
+                    self.request_organizer_progress();
                     self.semantic_status.mark_dirty();
                     self.update_index_label();
                     if self.state.visible {
@@ -3666,6 +3851,13 @@ unsafe fn app_message(
     None
 }
 
+fn palette_row_text(row: &palette::RowDetail) -> Vec<u16> {
+    wide(&match row.organizer_stage {
+        Some(stage) => format!("{} · {}", row.title, stage.label()),
+        None => row.title.clone(),
+    })
+}
+
 unsafe fn render_message(
     host: &Host,
     hwnd: HWND,
@@ -3750,15 +3942,48 @@ unsafe fn render_message(
                     .get(draw.itemID as usize)
                     .map(String::as_str)
                     .unwrap_or_default();
-                rect.right =
-                    draw.rcItem.right - render.s(if saved_time.is_empty() { 14 } else { 150 });
-                DrawTextW(
-                    draw.hDC,
-                    &mut subtitle,
-                    &mut rect,
-                    DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
-                );
-                if !saved_time.is_empty() {
+                let stage = render
+                    .row_details
+                    .get(draw.itemID as usize)
+                    .and_then(|d| d.organizer_stage);
+                let show_time = !saved_time.is_empty()
+                    && (stage.is_none() || draw.rcItem.right - draw.rcItem.left >= render.s(340));
+                rect.right = draw.rcItem.right - render.s(if show_time { 150 } else { 14 });
+                if let Some(stage) = stage {
+                    let mut badge = wide(&format!("● {}", stage.label()));
+                    let width = render.s(if stage == crate::organizer_display::Stage::Ready {
+                        112
+                    } else {
+                        86
+                    });
+                    let mut badge_rect = rect;
+                    badge_rect.right = (badge_rect.left + width).min(rect.right);
+                    SetTextColor(
+                        draw.hDC,
+                        if stage == crate::organizer_display::Stage::Waiting {
+                            p.muted
+                        } else {
+                            p.accent
+                        },
+                    );
+                    DrawTextW(
+                        draw.hDC,
+                        &mut badge,
+                        &mut badge_rect,
+                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                    rect.left += width;
+                }
+                SetTextColor(draw.hDC, p.muted);
+                if rect.right > rect.left {
+                    DrawTextW(
+                        draw.hDC,
+                        &mut subtitle,
+                        &mut rect,
+                        DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                    );
+                }
+                if show_time {
                     let mut time = wide(saved_time);
                     let mut time_rect = rect;
                     time_rect.left = draw.rcItem.right - render.s(145);
@@ -3957,7 +4182,8 @@ impl Host {
         if key == VK_RETURN.0 as u32
             && (app.buttons.contains(&msg.hwnd)
                 || msg.hwnd == app.smart_button
-                || msg.hwnd == app.index_label)
+                || msg.hwnd == app.index_label
+                || msg.hwnd == app.organizer_label)
         {
             return false;
         }

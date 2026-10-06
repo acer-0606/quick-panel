@@ -105,6 +105,32 @@ impl OrganizerStore {
             .filter(|r| matches!(r.status, Status::Ready(_)))
             .count()
     }
+    /// Pure in-memory projection: no candidate/context clone, reconciliation or dirty flag.
+    pub fn progress(&self, enabled: bool) -> crate::organizer_display::Progress {
+        use crate::organizer_display::{Progress, Stage};
+        if !enabled {
+            return Progress::default();
+        }
+        Progress {
+            items: self
+                .records
+                .iter()
+                .filter_map(|r| {
+                    let stage = match r.status {
+                        Status::Queued => Stage::Waiting,
+                        Status::Processing => Stage::Processing,
+                        Status::Ready(_) => Stage::Ready,
+                        Status::Done => return None,
+                    };
+                    Some((r.candidate.source.clone(), stage))
+                })
+                .collect(),
+            paused: self.paused,
+            cooling: self.retry_at_ms.is_some(),
+            saturated: self.saturated || self.ready_count() >= MAX_READY_PROPOSALS,
+            storage_error: self.blocked,
+        }
+    }
     pub fn snapshot(&self, in_flight: bool) -> Snapshot {
         Snapshot {
             storage_error: self

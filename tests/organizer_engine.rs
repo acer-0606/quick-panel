@@ -543,6 +543,144 @@ fn wait(e: &Engine, f: impl Fn(&Event) -> bool) -> Event {
         }
     }
 }
+fn progress(e: &Engine) -> quick_panel::organizer_display::Progress {
+    e.send(Command::OrganizerProgress { request_id: 918 })
+        .unwrap();
+    match wait(e, |v| {
+        matches!(
+            v,
+            Event::OrganizerProgress {
+                request_id: 918,
+                ..
+            }
+        )
+    }) {
+        Event::OrganizerProgress { progress, .. } => progress,
+        _ => unreachable!(),
+    }
+}
+
+// Status reads must describe only accepted work and cannot commit pending data.
+#[test]
+fn progress_tracks_real_queue_without_marking_old_or_out_of_scope_content() {
+    use quick_panel::organizer_display::Stage;
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("progress-db");
+    let e = open(&path);
+    favorite(&e, "old", "", vec![]);
+    let mut s = config(OrganizerMode::Suggest);
+    s.organizer.scope = OrganizerScope::SavedAndPaths;
+    settings(&e, s.clone());
+    capture(&e, "ordinary clipboard outside organizer scope");
+    assert!(progress(&e).items.is_empty());
+    favorite(&e, "new", "", vec![]);
+    let source = Source::SavedItem { id: "new".into() };
+    assert_eq!(progress(&e).items, [(source.clone(), Stage::Waiting)]);
+    let db = Connection::open(&path).unwrap();
+    let version: i64 = db
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    let w = work(&e);
+    assert_eq!(progress(&e).items, [(source.clone(), Stage::Processing)]);
+    assert_eq!(load(&e, "new").summary.alias, "");
+    complete(&e, &w);
+    for _ in 0..5 {
+        assert_eq!(progress(&e).items, [(source.clone(), Stage::Ready)]);
+    }
+    assert_eq!(load(&e, "new").summary.alias, "");
+    assert_eq!(
+        version,
+        db.query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    );
+    s.organizer.enabled = false;
+    settings(&e, s.clone());
+    assert!(progress(&e).items.is_empty());
+    s.organizer.enabled = true;
+    s.organizer.scope = OrganizerScope::PathsOnly;
+    settings(&e, s);
+    assert!(progress(&e).items.is_empty());
+    observe(&e, "C:/ObservedCase/Logs");
+    assert_eq!(
+        progress(&e).items,
+        [(
+            Source::ObservedPath {
+                normalized_path: "c:\\observedcase\\logs".into()
+            },
+            Stage::Waiting
+        )]
+    );
+    stop(&e);
+}
+
+#[test]
+fn progress_reports_cooldown_and_resume_without_losing_usable_sources() {
+    use quick_panel::organizer_display::Stage;
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("cooldown-db"));
+    settings(&e, config(OrganizerMode::Suggest));
+    favorite(&e, "original", "", vec![]);
+    let w = work(&e);
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Err("fixture failure".into()),
+    })
+    .unwrap();
+    let p = progress(&e);
+    assert!(p.cooling);
+    assert_eq!(p.items[0].1, Stage::Waiting);
+    assert_eq!(
+        load(&e, "original").target.as_deref(),
+        Some("C:/Fixture/original")
+    );
+    e.send(Command::OrganizerRetry).unwrap();
+    assert!(!progress(&e).cooling);
+    let w = work(&e);
+    assert_eq!(progress(&e).items[0].1, Stage::Processing);
+    complete(&e, &w);
+    e.send(Command::OrganizerDismiss {
+        sources: vec![w.candidates[0].source.clone()],
+    })
+    .unwrap();
+    assert!(progress(&e).items.is_empty());
+    stop(&e);
+}
+
+// The UI needs a metadata patch, not a requery notification that reorders its live rows.
+#[test]
+fn organizer_metadata_is_emitted_as_guarded_patches_instead_of_search_refreshes() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("patch-db"));
+    settings(&e, config(OrganizerMode::Automatic));
+    favorite(&e, "saved", "", vec![]);
+    observe(&e, "C:/OriginalCase/Logs");
+    let w = work(&e);
+    complete(&e, &w);
+    let event = wait(&e, |event| {
+        assert!(
+            !matches!(event, Event::Changed | Event::PathActivityChanged),
+            "AI metadata must not reorder the active query"
+        );
+        matches!(event, Event::OrganizerMetadataUpdated(_))
+    });
+    let Event::OrganizerMetadataUpdated(updates) = event else {
+        unreachable!()
+    };
+    assert_eq!(updates.len(), 2);
+    for update in &updates {
+        assert_eq!(update.previous_alias, "");
+        assert!(update.previous_tags.is_empty());
+        assert_eq!(update.alias, "项目资料");
+        assert_eq!(update.tags, ["工作"]);
+    }
+    assert!(progress(&e).items.is_empty());
+    assert_eq!(load(&e, "saved").summary.alias, "项目资料");
+    assert_eq!(
+        load(&e, "saved").target.as_deref(),
+        Some("C:/Fixture/saved")
+    );
+    stop(&e);
+}
 fn open(p: &std::path::Path) -> Engine {
     let e = Engine::start(EngineOptions::new(p.into()), Arc::new(|| {})).unwrap();
     wait(&e, |v| matches!(v, Event::Ready(_)));

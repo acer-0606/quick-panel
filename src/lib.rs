@@ -12,6 +12,7 @@ pub mod engine;
 pub mod hotkeys;
 pub mod model;
 pub mod organizer;
+pub mod organizer_display;
 mod organizer_store;
 pub mod organizer_ui;
 pub mod palette;
