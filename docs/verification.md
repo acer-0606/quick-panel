@@ -1,8 +1,33 @@
 # 验证记录
 
-当前验证日期：2026-10-05。产品源码提交：`fb9d8b1`。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
+当前 AI 管家集成验证日期：2026-10-06；此前外部路径与截图基线为 `fb9d8b1`，对应旧记录保留在后文。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
 
 已实现并生成 Windows x64 便携包。共享核心、Windows 源码编译与静态审查通过；Windows 原生界面的实际运行尚未在本机验证。
+
+## AI 管家、模型与原生审阅（2026-10-06）
+
+[设计](superpowers/specs/2026-10-06-ai-organizer-design.md)；[实施计划](superpowers/plans/2026-10-06-ai-organizer.md)。Task 3 基线 `c2b84d7`，包含 Task 1/2 已审查实现和源保留路径标签 `2790380`。本节记录本轮集成证据，不把 macOS 交叉编译当作 Windows 执行。
+
+原生 AI 设置提供可输入模型 ID 的下拉框、异步获取模型与现有连接测试，以及默认/low/medium/high/xhigh/max 强度。列表、测试均使用当前未保存配置，能力缓存随地址/认证/密钥变化失效。缺 capabilities 是未知，只有明确 reported unsupported 才本地提醒；默认完全省略 effort，不静默降级重试。共享单槽设置 worker 在取消后保持实际占用，关闭和重开不能叠加请求；panic 有终态回执。
+
+管家设置与检索开关独立，缺接口配置在本地设置和管家状态说明；路径范围提示独立观察开关，不自动开启监控。后台 timer 只在启用且本地配置有效时创建，间隔为用户选择的 30–3600 秒。原生管家 worker 惰性启动，一次一个真实请求、无待发网络队列，取消保留物理占用直到结束，不 join。Work 使用派发时的精确 AI/管家快照，结果仍由 actor 验证 token、配置和来源版本。
+
+审阅窗口读取已有本地建议，真实 ListView 复选框支持多条应用/忽略，原名/别名/标签/依据与可选文字的上下文在页内展示，选中项可编辑。一个当前 Snapshot、一个未完成 Snapshot 请求；编辑绑定 expected_version，不自动转移到新版本。来源/保存错误保留编辑直到显式刷新，存储失败保留 pending save。只认 `OrganizerReceipt.request_id` 对应的事务/保存屏障，旧 Saved 或 RAM Ready 消失不会显示本次成功。只读 `OrganizerDetail` 使用来源与版本守卫另取完整原样 target，最多 32767 UTF-16 单元，一个未完成详情请求，切换选择/闭窗 epoch 拒旧结果，不读 BLOB/文件系统、不发网络、不写盘。
+
+视觉沿用 theme::Colors、Segoe UI 和实际 DPI 字体。长设置表单使用原生滚动 viewport、固定保存/取消按钮及焦点滚动，高 DPI 不通过缩小字体隐藏字段。审阅窗口采用顶部状态、中部真实列表、下部可选择详情与编辑区、底部明确动作；复用明暗主题和窗口工作区边界。界面截图、100/150/200% DPI 鼠标与键盘/IME、焦点、窗口实际关闭/重开仍需 Windows 实机验收。
+
+| 本轮检查 | 结果 |
+|---|---|
+| 最终 focused（跳过两项此前已验证的大容量用例） | **75 passed / 0 failed**：lib 8、连接生命周期 6、organizer actor 21、UI 11、palette 22、path_names 7 |
+| 一次完整共享 suite | **363 passed / 0 failed / 2 项既有 ignored**，33 个 suite summaries；organizer actor 23 项含两项容量测试 |
+| macOS / Windows all-target strict Clippy | 两者 `-D warnings` 通过 |
+| Windows fixtures cross-check | **38 项只编译、0 项执行**：AI 22、Embedding 8、images 8 |
+| fmt / diff check | 通过；交付前再次检查 |
+| Windows GNU Release | 通过，优化构建 1m 50s；可执行文件保留 RAM target 后由主控同步 |
+
+真实 RED 包括：缺便携解析/生命周期模块；取消/关闭状态槽过早释放；新版本错误接收旧编辑；worker panic 无终态；回执接口缺失；混合 stale Dismiss 被当作成功；容量释放后 saturated 粘滞；完整原路径接口/详情 gate 缺失；关闭 AI 时管家入口不可查的目录回归。SQLite 回执测试构造真实 UPDATE 失败触发器，验证磁盘别名/Ready 同时保持旧值、RAM Ready 已移除仍明确失败、后续关联 SavePending 确认实际提交。详情测试验证超出 1024 摘要的原大小写 target、PRAGMA data_version 不变和改源版本拒绝。
+
+所有 Cargo 在 `/Volumes/QPPathNamesBuild/workspace/quick-panel` RAM 副本串行执行，环境统一为 `TMPDIR=/Volumes/QPPathNamesBuild/tmp CARGO_TARGET_DIR=/Volumes/QPPathNamesBuild/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。日志保留 `/Volumes/QPPathNamesBuild/tmp/task3-*.log`。共享 SQLite/线程用例是功能证据，不证明 SSD 耐久性、Windows 性能或模型语义效果。未访问用户真实密钥、API、剪贴板、屏幕或文件正文；未派子代理。本轮没有修改 SSD 旧 WIP，最终同步和临时卷管理由主控负责。
 
 ## 外部常用路径与区域截图（当前版本）
 

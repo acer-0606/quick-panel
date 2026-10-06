@@ -4,6 +4,7 @@ mod ai_time;
 pub mod clipboard;
 mod dialogs;
 pub mod images;
+mod organizer_ui;
 mod path_monitor;
 mod screenshot;
 mod theme;

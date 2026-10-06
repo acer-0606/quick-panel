@@ -572,14 +572,51 @@ impl Actor {
         }
         self.emit(Event::OrganizerChanged);
     }
+    fn organizer_detail(
+        &self,
+        source: &crate::organizer::Source,
+        version: &str,
+    ) -> Result<String, String> {
+        use crate::organizer::Source;
+        use rusqlite::OptionalExtension;
+        let candidate = self
+            .organizer_candidate(source)?
+            .ok_or("来源已变化，请刷新建议")?;
+        if candidate.expected_version != version || candidate.kind == ItemKind::Clipboard {
+            return Err("来源已变化，请刷新建议".into());
+        }
+        let target = match source {
+            Source::SavedItem { id } => {
+                if let Some(p) = self.pending.get(id) {
+                    p.item.target.clone()
+                } else {
+                    let stored = self.repo.connection.query_row(
+                        "SELECT target FROM items WHERE id=?1 AND length(CAST(target AS BLOB))<=131068",
+                        [id],
+                        |row| row.get::<_, Option<String>>(0),
+                    ).optional().map_err(|_| "无法读取本地路径")?;
+                    stored.flatten()
+                }
+            }
+            Source::ObservedPath { normalized_path } => self
+                .repo
+                .paths
+                .organizer_item(normalized_path, &self.settings.path_activity, now_ms())
+                .map(|item| item.0),
+        };
+        let target = target.ok_or("来源路径不可用，请刷新建议")?;
+        if target.encode_utf16().take(32768).count() > 32767 {
+            return Err("来源路径超过 Windows 支持的长度".into());
+        }
+        Ok(target)
+    }
     fn organizer_enqueue(&mut self, source: crate::organizer::Source) -> Result<(), String> {
         if self.settings.organizer.enabled
             && !self.exiting
             && let Some(c) = self.organizer_candidate(&source)?
+            && self.repo.organizer.enqueue(c)
         {
-            if self.repo.organizer.enqueue(c) {
-                self.organizer_changed();
-            }
+            self.organizer_changed();
         }
         Ok(())
     }
@@ -900,6 +937,7 @@ impl Actor {
             }
         }
         self.repo.organizer.dirty = true;
+        self.repo.organizer.capacity_released();
         self.organizer_changed();
         self.flush();
         Ok(())
@@ -916,6 +954,7 @@ impl Actor {
                 self.repo.organizer.dirty = true;
             }
         }
+        self.repo.organizer.capacity_released();
         self.organizer_changed();
         self.flush();
         Ok(())
@@ -2144,6 +2183,15 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::OrganizerDetail {
+                    request_id,
+                    source,
+                    expected_version,
+                } => {
+                    let result = self.organizer_detail(&source, &expected_version);
+                    self.emit(Event::OrganizerDetail { request_id, result });
+                    Ok(())
+                }
                 Command::OrganizerTick => self.organizer_tick(),
                 Command::OrganizerComplete { token, result } => {
                     self.organizer_complete(token, result)
@@ -2157,6 +2205,55 @@ impl Actor {
                     result
                 }
                 Command::OrganizerApply { proposals } => self.organizer_apply(proposals),
+                Command::OrganizerReview {
+                    request_id,
+                    decision,
+                } => {
+                    use crate::organizer_ui::ReviewDecision;
+                    // Apply/Dismiss stage RAM and attempt flush; only this correlated
+                    // receipt, after that flush, confirms the durable transaction.
+                    let staged = match decision {
+                        ReviewDecision::Apply(proposals) => self.organizer_apply(proposals),
+                        ReviewDecision::Dismiss(sources) => {
+                            self.organizer_reconcile().and_then(|()| {
+                                let unique: HashSet<_> = sources.iter().collect();
+                                if sources.is_empty()
+                                    || unique.len() != sources.len()
+                                    || sources.iter().any(|source| {
+                                        !self.repo.organizer.records.iter().any(|r| {
+                                            &r.candidate.source == source
+                                                && matches!(
+                                                    r.status,
+                                                    crate::organizer_store::Status::Ready(_)
+                                                )
+                                        })
+                                    })
+                                {
+                                    return Err("整理建议已过期，请刷新后重试".into());
+                                }
+                                self.organizer_dismiss(sources)
+                            })
+                        }
+                        ReviewDecision::SavePending => {
+                            self.flush();
+                            Ok(())
+                        }
+                    };
+                    let pending_save = staged.is_ok() && self.dirty();
+                    let result = staged.and_then(|()| {
+                        if pending_save {
+                            Err("本地写入未完成，待写内容已保留".into())
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    self.emit(Event::OrganizerReceipt {
+                        request_id,
+                        result,
+                        pending_save,
+                    });
+                    Ok(())
+                }
                 Command::OrganizerDismiss { sources } => self.organizer_dismiss(sources),
                 Command::OrganizerRetry => {
                     self.organizer_cancel();
@@ -2182,14 +2279,13 @@ impl Actor {
                         self.mark_dirty();
                         self.emit(Event::PathActivityChanged);
                         for (path, revision) in before {
-                            if self.repo.paths.observation_revision(&path) != revision {
-                                if let Err(e) =
+                            if self.repo.paths.observation_revision(&path) != revision
+                                && let Err(e) =
                                     self.organizer_enqueue(crate::organizer::Source::ObservedPath {
                                         normalized_path: path,
                                     })
-                                {
-                                    self.error(e);
-                                }
+                            {
+                                self.error(e);
                             }
                         }
                     }

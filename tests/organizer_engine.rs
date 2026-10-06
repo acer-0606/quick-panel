@@ -10,6 +10,245 @@ fn now() -> i64 {
         .unwrap()
         .as_millis() as i64
 }
+
+// An unrelated Saved event cannot confirm this decision; its explicit receipt must follow a committed SQLite update.
+#[test]
+fn reviewed_decision_receipt_confirms_only_its_own_commit_and_reports_stale() {
+    use quick_panel::organizer_ui::ReviewDecision;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    capture(&e, "receipt body");
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    e.send(Command::OrganizerReview {
+        request_id: 41,
+        decision: ReviewDecision::Apply(proposals.clone()),
+    })
+    .unwrap();
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerReceipt { request_id: 41, .. }
+        )),
+        Event::OrganizerReceipt {
+            result: Ok(()),
+            pending_save: false,
+            ..
+        }
+    ));
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT json_extract(summary,'$.alias') FROM items",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "项目资料"
+    );
+    e.send(Command::OrganizerReview {
+        request_id: 42,
+        decision: ReviewDecision::Apply(proposals),
+    })
+    .unwrap();
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerReceipt { request_id: 42, .. }
+        )),
+        Event::OrganizerReceipt {
+            result: Err(_),
+            pending_save: false,
+            ..
+        }
+    ));
+    stop(&e);
+}
+
+// A failed transaction must acknowledge failure for this request, preserve both disk fields and Ready, and allow a correlated flush retry.
+#[test]
+fn reviewed_failure_receipt_is_not_success_when_ready_has_disappeared_in_ram() {
+    use quick_panel::organizer_ui::ReviewDecision;
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    favorite(&e, "receipt", "", vec![]);
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    flush(&e);
+    let db = Connection::open(&p).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_review BEFORE UPDATE ON items BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+    e.send(Command::OrganizerReview {
+        request_id: 51,
+        decision: ReviewDecision::Apply(proposals),
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Error { .. }));
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerReceipt { request_id: 51, .. }
+        )),
+        Event::OrganizerReceipt {
+            result: Err(_),
+            pending_save: true,
+            ..
+        }
+    ));
+    assert!(snapshot(&e).proposals.is_empty());
+    assert_eq!(
+        db.query_row(
+            "SELECT json_extract(summary,'$.alias') FROM items WHERE id='receipt'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        ""
+    );
+    let raw: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(raw.contains("Ready"));
+    db.execute_batch("DROP TRIGGER fail_review").unwrap();
+    e.send(Command::OrganizerReview {
+        request_id: 52,
+        decision: ReviewDecision::SavePending,
+    })
+    .unwrap();
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerReceipt { request_id: 52, .. }
+        )),
+        Event::OrganizerReceipt {
+            result: Ok(()),
+            pending_save: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        db.query_row(
+            "SELECT json_extract(summary,'$.alias') FROM items WHERE id='receipt'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "项目资料"
+    );
+    stop(&e);
+}
+
+// A stale multi-dismiss must fail atomically instead of reporting a no-op as a saved decision.
+#[test]
+fn reviewed_dismiss_rejects_a_missing_source_without_ignoring_other_ready_rows() {
+    use quick_panel::organizer_ui::ReviewDecision;
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    settings(&e, config(OrganizerMode::Suggest));
+    capture(&e, "dismiss fixture");
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    e.send(Command::OrganizerReview {
+        request_id: 53,
+        decision: ReviewDecision::Dismiss(vec![
+            proposals[0].candidate.source.clone(),
+            Source::SavedItem {
+                id: "missing".into(),
+            },
+        ]),
+    })
+    .unwrap();
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerReceipt { request_id: 53, .. }
+        )),
+        Event::OrganizerReceipt {
+            result: Err(_),
+            pending_save: false,
+            ..
+        }
+    ));
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    stop(&e);
+}
+
+// A review detail read must return original case beyond the AI excerpt, without writes or a BLOB load, and reject a changed source version.
+#[test]
+fn organizer_details_are_versioned_local_metadata_reads_with_full_original_targets() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    let target = format!(
+        "C:/MiXeD/{}/Logs",
+        (0..8)
+            .map(|i| format!("P{i}{}", "a".repeat(190)))
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    e.send(Command::SaveFavorite(FavoriteInput {
+        id: Some("long".into()),
+        kind: ItemKind::Folder,
+        title: "long".into(),
+        target: target.clone(),
+        alias: String::new(),
+        tags: vec![],
+        open_with: None,
+    }))
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    observe(&e, &target);
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    flush(&e);
+    let db = Connection::open(&p).unwrap();
+    let before: i64 = db
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    for (i, p) in proposals.iter().enumerate() {
+        assert_eq!(p.candidate.context.chars().count(), 1024);
+        e.send(Command::OrganizerDetail {
+            request_id: 70 + i as u64,
+            source: p.candidate.source.clone(),
+            expected_version: p.candidate.expected_version.clone(),
+        })
+        .unwrap();
+        assert!(
+            matches!(wait(&e,|v|matches!(v,Event::OrganizerDetail {request_id,..} if *request_id==70+i as u64)),Event::OrganizerDetail {result:Ok(ref full),..} if full==&target || full==&target.replace('/',"\\"))
+        );
+    }
+    let after: i64 = db
+        .query_row("PRAGMA data_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+    let source = proposals
+        .iter()
+        .find(|p| matches!(&p.candidate.source, Source::SavedItem { .. }))
+        .unwrap();
+    favorite(&e, "long", "changed", vec![]);
+    e.send(Command::OrganizerDetail {
+        request_id: 79,
+        source: source.candidate.source.clone(),
+        expected_version: source.candidate.expected_version.clone(),
+    })
+    .unwrap();
+    assert!(matches!(
+        wait(&e, |v| matches!(
+            v,
+            Event::OrganizerDetail { request_id: 79, .. }
+        )),
+        Event::OrganizerDetail { result: Err(_), .. }
+    ));
+    stop(&e);
+}
 #[test]
 fn reading_a_dirty_snapshot_does_not_emit_change_and_retrigger_itself() {
     let d = tempfile::tempdir().unwrap();
@@ -430,8 +669,35 @@ fn queue_budget_preserves_source_content_and_exposes_saturation() {
         )
         .unwrap();
     assert!(bytes <= MAX_STORE_BYTES as i64);
+    let raw: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    let mut cached: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    cached["saturated"] = serde_json::json!(true);
+    db.execute("UPDATE organizer_state SET data=?1", [cached.to_string()])
+        .unwrap();
     let e = open(&p);
     assert_eq!(snapshot(&e).proposals.len(), 128);
+    let first = snapshot(&e).proposals[0].candidate.source.clone();
+    e.send(Command::OrganizerDismiss {
+        sources: vec![first],
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    let remaining = snapshot(&e);
+    assert_eq!(remaining.proposals.len(), 127);
+    assert!(
+        !remaining.saturated,
+        "dismiss must release visible capacity"
+    );
+    e.send(Command::OrganizerApply {
+        proposals: vec![remaining.proposals[0].clone()],
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    let remaining = snapshot(&e);
+    assert_eq!(remaining.proposals.len(), 126);
+    assert!(!remaining.saturated, "apply must release visible capacity");
     stop(&e);
 }
 fn favorite(e: &Engine, id: &str, alias: &str, tags: Vec<String>) {

@@ -166,6 +166,15 @@ pub struct SaveStats {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    OrganizerDetail {
+        request_id: u64,
+        source: crate::organizer::Source,
+        expected_version: String,
+    },
+    OrganizerReview {
+        request_id: u64,
+        decision: crate::organizer_ui::ReviewDecision,
+    },
     OrganizerTick,
     OrganizerComplete {
         token: u64,
@@ -220,6 +229,15 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    OrganizerDetail {
+        request_id: u64,
+        result: Result<String, String>,
+    },
+    OrganizerReceipt {
+        request_id: u64,
+        result: Result<(), String>,
+        pending_save: bool,
+    },
     OrganizerWork(crate::organizer::Work),
     OrganizerState {
         request_id: u64,

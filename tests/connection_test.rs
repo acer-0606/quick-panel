@@ -6,6 +6,22 @@ use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(3);
 
+// A transport panic must not leave the actual occupied slot stuck forever.
+#[test]
+fn panic_produces_terminal_error_and_releases_real_slot() {
+    let (done, received) = mpsc::channel();
+    let worker = quick_panel::organizer_ui::request_worker(
+        |_: ()| -> Result<(), String> { panic!("fixture panic") },
+        Arc::new(move || {
+            done.send(()).unwrap();
+        }),
+    );
+    worker.submit(()).unwrap();
+    received.recv_timeout(WAIT).unwrap();
+    assert!(!worker.busy());
+    assert!(worker.try_result().unwrap().result.is_err());
+}
+
 // Removing the active-slot check would run a second request before the first finishes.
 #[test]
 fn one_click_runs_off_thread_and_in_flight_clicks_are_rejected() {

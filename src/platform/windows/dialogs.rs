@@ -95,6 +95,10 @@ pub unsafe fn screenshot_settings_form(
     }
 }
 enum Field {
+    Model(String),
+    EffortChoice(usize),
+    OrganizerModeChoice(usize),
+    OrganizerScopeChoice(usize),
     Text(String),
     Multiline(String),
     Password(String),
@@ -129,21 +133,34 @@ struct Form {
     test_button: Option<HWND>,
     test_result: Option<HWND>,
     save_button: Option<HWND>,
+    model_button: Option<HWND>,
+    models: Vec<crate::ai_models::ModelInfo>,
+    choices: Vec<usize>,
+    switches: Vec<usize>,
+    viewport: HWND,
+    scroll_y: i32,
+    content_height: i32,
 }
 
 #[derive(Clone)]
 enum TestForm {
     Ai(crate::ai::AiSettings),
     Embedding(crate::semantic::EmbeddingSettings),
+    Organizer {
+        ai: crate::ai::AiSettings,
+        path_enabled: bool,
+    },
 }
 struct TestRequest {
     config: TestForm,
     key: ai_client::SecretString,
     clear_key: bool,
+    list_models: bool,
 }
 enum TestSuccess {
     Ai,
     Embedding(usize),
+    Models(Vec<crate::ai_models::ModelInfo>),
 }
 impl Drop for Form {
     fn drop(&mut self) {
@@ -156,17 +173,132 @@ impl Drop for Form {
 }
 const TEST_BUTTON: usize = 3;
 const TEST_TIMER: usize = 1;
+const MODEL_BUTTON: usize = 4;
+unsafe fn scroll_form(ptr: *const RefCell<Form>, position: i32) {
+    unsafe {
+        let (viewport, old, content) = {
+            let form = (*ptr).borrow();
+            (form.viewport, form.scroll_y, form.content_height)
+        };
+        let mut rect = RECT::default();
+        let _ = GetClientRect(viewport, &mut rect);
+        let position = crate::organizer_ui::clamp_scroll(position, content, rect.bottom);
+        (*ptr).borrow_mut().scroll_y = position;
+        let info = SCROLLINFO {
+            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+            fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
+            nMin: 0,
+            nMax: content - 1,
+            nPage: rect.bottom.max(1) as u32,
+            nPos: position,
+            ..Default::default()
+        };
+        windows::Win32::UI::Controls::SetScrollInfo(viewport, SB_VERT, &info, true);
+        ScrollWindowEx(
+            viewport,
+            0,
+            old - position,
+            None,
+            None,
+            None,
+            None,
+            SW_SCROLLCHILDREN | SW_INVALIDATE,
+        );
+    }
+}
+unsafe extern "system" fn viewport_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    unsafe {
+        let ptr = data as *const RefCell<Form>;
+        if msg == WM_COMMAND {
+            let owner = GetParent(hwnd).unwrap_or_default();
+            let notification = (wp.0 >> 16) as u32;
+            if [EN_SETFOCUS, CBN_SETFOCUS, BN_SETFOCUS].contains(&notification) {
+                let edit = HWND(lp.0 as *mut _);
+                let mut rect = RECT::default();
+                let _ = GetWindowRect(edit, &mut rect);
+                let mut points = [
+                    POINT {
+                        x: rect.left,
+                        y: rect.top,
+                    },
+                    POINT {
+                        x: rect.right,
+                        y: rect.bottom,
+                    },
+                ];
+                windows::Win32::Graphics::Gdi::MapWindowPoints(None, Some(hwnd), &mut points);
+                let mut viewport = RECT::default();
+                let _ = GetClientRect(hwnd, &mut viewport);
+                let old = (*ptr).borrow().scroll_y;
+                if points[0].y < 0 {
+                    scroll_form(ptr, old + points[0].y);
+                } else if points[1].y > viewport.bottom {
+                    scroll_form(ptr, old + points[1].y - viewport.bottom);
+                }
+            }
+            return SendMessageW(owner, msg, Some(wp), Some(lp));
+        }
+        if msg == WM_VSCROLL || msg == WM_MOUSEWHEEL {
+            let (position, dpi) = {
+                let f = (*ptr).borrow();
+                (f.scroll_y, f.dpi)
+            };
+            let step = 24 * dpi as i32 / 96;
+            let mut rect = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rect);
+            let command = (wp.0 & 0xffff) as u32;
+            let next = if msg == WM_MOUSEWHEEL {
+                position - ((wp.0 >> 16) as u16 as i16 as i32) / 120 * step * 3
+            } else {
+                match command {
+                    0 => position - step,
+                    1 => position + step,
+                    2 => position - rect.bottom,
+                    3 => position + rect.bottom,
+                    4 | 5 => {
+                        let mut info = SCROLLINFO {
+                            cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                            fMask: SIF_TRACKPOS,
+                            ..Default::default()
+                        };
+                        let _ = GetScrollInfo(hwnd, SB_VERT, &mut info);
+                        info.nTrackPos
+                    }
+                    6 => 0,
+                    7 => i32::MAX,
+                    _ => position,
+                }
+            };
+            scroll_form(ptr, next);
+            return LRESULT(0);
+        }
+        if [WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_CTLCOLORLISTBOX].contains(&msg) {
+            let owner = GetParent(hwnd).unwrap_or_default();
+            return SendMessageW(owner, msg, Some(wp), Some(lp));
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+}
 thread_local! {
     // Shared across forms so closing one does not allow a second concurrent paid call.
     // The worker creates its first thread only after an explicit click.
-    static TEST_WORKER: ConnectionTestWorker<TestRequest, TestSuccess> = ConnectionTestWorker::new(
+    static TEST_WORKER: ConnectionTestWorker<TestRequest, TestSuccess> = crate::organizer_ui::request_worker(
         |request: TestRequest| match request.config {
+            TestForm::Ai(settings) if request.list_models => ai_client::list_models_with_key(&settings, request.key, request.clear_key).map(TestSuccess::Models),
             TestForm::Ai(settings) => ai_client::test_ai_connection_with_key(
                 &settings, request.key, request.clear_key,
             ).map(|()| TestSuccess::Ai),
             TestForm::Embedding(settings) => ai_client::test_embedding_connection_with_key(
                 &settings, request.key, request.clear_key,
             ).map(TestSuccess::Embedding),
+            TestForm::Organizer { .. } => Err("管家设置无需测试请求".into()),
         },
         Arc::new(|| {}),
     );
@@ -184,9 +316,14 @@ unsafe fn test_status(ptr: *const RefCell<Form>, message: &str) {
 
 unsafe fn test_controls(ptr: *const RefCell<Form>, running: bool) {
     // EnableWindow can dispatch messages synchronously. Never keep a Form borrow across it.
-    let (edits, save, test) = unsafe {
+    let (edits, save, test, model) = unsafe {
         let form = (*ptr).borrow();
-        (form.edits.clone(), form.save_button, form.test_button)
+        (
+            form.edits.clone(),
+            form.save_button,
+            form.test_button,
+            form.model_button,
+        )
     };
     unsafe {
         for edit in edits {
@@ -199,6 +336,9 @@ unsafe fn test_controls(ptr: *const RefCell<Form>, running: bool) {
             let available = !running && !TEST_WORKER.with(|worker| worker.busy());
             let _ = EnableWindow(test, available);
         }
+        if let Some(model) = model {
+            let _ = EnableWindow(model, !running && !TEST_WORKER.with(|worker| worker.busy()));
+        }
     }
 }
 
@@ -209,7 +349,7 @@ unsafe fn cancel_test(ptr: *const RefCell<Form>) {
     }
 }
 
-unsafe fn begin_test(ptr: *const RefCell<Form>) {
+unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
     let (config, edits) = unsafe {
         let form = (*ptr).borrow();
         if form.done || form.test_gate.busy() {
@@ -221,6 +361,7 @@ unsafe fn begin_test(ptr: *const RefCell<Form>) {
     let (password_index, clear_index) = match config {
         TestForm::Ai(_) => (4, 5),
         TestForm::Embedding(_) => (3, 4),
+        TestForm::Organizer { .. } => return,
     };
     // Password text enters an erasing owner immediately; no plain-text result vector is made.
     let key = ai_client::SecretString(unsafe { text(edits[password_index]) });
@@ -235,22 +376,45 @@ unsafe fn begin_test(ptr: *const RefCell<Form>) {
                 } else {
                     crate::ai::AuthMethod::ApiKey
                 };
+                settings.effort = crate::organizer_ui::EFFORTS
+                    .get(SendMessageW(edits[6], CB_GETCURSEL, None, None).0.max(0) as usize)
+                    .copied()
+                    .unwrap_or_default();
+                if !list_models
+                    && let Some(message) = crate::organizer_ui::effort_warning(
+                        &(*ptr).borrow().models,
+                        &settings.model,
+                        settings.effort,
+                    )
+                {
+                    test_status(ptr, &message);
+                    return;
+                }
             }
             TestForm::Embedding(settings) => {
                 settings.endpoint = text(edits[1]).trim().into();
                 settings.model = text(edits[2]).trim().into();
             }
+            TestForm::Organizer { .. } => return,
         }
     }
     let request = TestRequest {
         config,
         key,
         clear_key,
+        list_models,
     };
     match TEST_WORKER.with(|worker| worker.submit(request)) {
         Ok(id) => unsafe {
             (*ptr).borrow_mut().test_gate.begin(id);
-            test_status(ptr, "正在测试连接… 仅发送内置测试文本");
+            test_status(
+                ptr,
+                if list_models {
+                    "正在获取模型… 不发送推理请求"
+                } else {
+                    "正在测试连接… 仅发送内置测试文本"
+                },
+            );
             test_controls(ptr, true);
         },
         Err(message) => unsafe { test_status(ptr, &format!("测试失败：{message}")) },
@@ -271,6 +435,20 @@ unsafe fn poll_test(ptr: *const RefCell<Form>) {
                 Ok(TestSuccess::Embedding(dimensions)) => {
                     format!("连接成功 · 向量维度 {dimensions} · {elapsed} ms")
                 }
+                Ok(TestSuccess::Models(models)) => unsafe {
+                    let edit = (*ptr).borrow().edits[2];
+                    let manual = text(edit);
+                    SendMessageW(edit, CB_RESETCONTENT, None, None);
+                    for model in &models {
+                        let id = wide(&model.id);
+                        SendMessageW(edit, CB_ADDSTRING, None, Some(LPARAM(id.as_ptr() as isize)));
+                    }
+                    let manual = wide(&manual);
+                    let _ = SetWindowTextW(edit, PCWSTR(manual.as_ptr()));
+                    let count = models.len();
+                    (*ptr).borrow_mut().models = models;
+                    format!("已获取 {count} 个模型；可选择 ID 或手动输入")
+                },
                 Err(error) => format!("测试失败：{error} · {elapsed} ms"),
             };
             unsafe {
@@ -279,15 +457,81 @@ unsafe fn poll_test(ptr: *const RefCell<Form>) {
             }
         }
     }
-    let (running, button) = unsafe {
+    let (running, button, model) = unsafe {
         let form = (*ptr).borrow();
-        (form.test_gate.busy(), form.test_button)
+        (form.test_gate.busy(), form.test_button, form.model_button)
     };
     if let Some(button) = button {
         let available = !running && !TEST_WORKER.with(|worker| worker.busy());
         unsafe {
             let _ = EnableWindow(button, available);
         }
+    }
+    if let Some(button) = model {
+        unsafe {
+            let _ = EnableWindow(
+                button,
+                !running && !TEST_WORKER.with(|worker| worker.busy()),
+            );
+        }
+    }
+}
+unsafe fn validate_form(ptr: *const RefCell<Form>) -> Result<(), String> {
+    let (config, edits, choices, switches, models) = unsafe {
+        let form = (*ptr).borrow();
+        (
+            form.test.clone(),
+            form.edits.clone(),
+            form.choices.clone(),
+            form.switches.clone(),
+            form.models.clone(),
+        )
+    };
+    let mut values: Vec<String> = edits
+        .iter()
+        .enumerate()
+        .map(|(i, edit)| unsafe {
+            if choices.contains(&i) {
+                SendMessageW(*edit, CB_GETCURSEL, None, None).0.to_string()
+            } else if switches.contains(&i) {
+                SendMessageW(*edit, BM_GETCHECK, None, None).0.to_string()
+            } else {
+                text(*edit)
+            }
+        })
+        .collect();
+    match config {
+        Some(TestForm::Ai(mut saved)) => {
+            let key = ai_client::SecretString(std::mem::take(&mut values[4]));
+            if values[5] == "1" && !key.0.is_empty() {
+                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
+            }
+            if !key.0.is_empty() {
+                if key.0.len() > 4096 || !key.0.bytes().all(|b| (33..=126).contains(&b)) {
+                    return Err("API Key 格式无效".into());
+                }
+                saved.encrypted_key = vec![1];
+            }
+            let next = crate::organizer_ui::parse_ai_fields(&saved, &values)?;
+            if let Some(error) =
+                crate::organizer_ui::effort_warning(&models, &next.model, next.effort)
+            {
+                return Err(error);
+            }
+            Ok(())
+        }
+        Some(TestForm::Organizer { mut ai, .. }) => {
+            let organizer = crate::organizer_ui::parse_organizer_fields(&values)?;
+            if organizer.enabled {
+                if let Some(message) = crate::organizer_ui::organizer_config_warning(&ai) {
+                    return Err(message);
+                }
+                ai.enabled = true;
+                ai_client::validate_settings(&ai)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -304,6 +548,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     if accept && (*ptr).borrow().test_gate.busy() {
                         return LRESULT(0);
                     }
+                    if accept && let Err(message) = validate_form(ptr) {
+                        test_status(ptr, &message);
+                        scroll_form(ptr, i32::MAX);
+                        return LRESULT(0);
+                    }
                     {
                         let mut f = (*ptr).borrow_mut();
                         f.accepted = accept;
@@ -313,7 +562,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     return LRESULT(0);
                 }
                 WM_COMMAND if (wp.0 & 0xffff) == TEST_BUTTON => {
-                    begin_test(ptr);
+                    begin_test(ptr, false);
+                    return LRESULT(0);
+                }
+                WM_COMMAND if (wp.0 & 0xffff) == MODEL_BUTTON => {
+                    begin_test(ptr, true);
                     return LRESULT(0);
                 }
                 WM_COMMAND => {
@@ -324,7 +577,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                             && form.edits.iter().any(|edit| edit.0 as isize == lp.0)
                     };
                     let notification = (wp.0 >> 16) as u32;
-                    if changed && [EN_CHANGE, CBN_SELCHANGE, BN_CLICKED].contains(&notification) {
+                    if changed
+                        && [EN_CHANGE, CBN_SELCHANGE, CBN_EDITCHANGE, BN_CLICKED]
+                            .contains(&notification)
+                    {
+                        let credential_change = {
+                            let form = (*ptr).borrow();
+                            matches!(form.test, Some(TestForm::Ai(_)))
+                                && [1usize, 3, 4, 5]
+                                    .iter()
+                                    .any(|i| form.edits[*i].0 as isize == lp.0)
+                        };
+                        if credential_change {
+                            (*ptr).borrow_mut().models.clear();
+                        }
                         test_status(ptr, "配置已修改，请重新测试连接");
                     }
                 }
@@ -383,7 +649,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         ];
                         windows::Win32::Graphics::Gdi::MapWindowPoints(
                             None,
-                            Some(hwnd),
+                            GetParent(control).ok(),
                             &mut points,
                         );
                         let scale = |n: i32| n * dpi as i32 / old_dpi.max(1) as i32;
@@ -405,21 +671,98 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     let old_font = {
                         let mut form = (*ptr).borrow_mut();
                         form.dpi = dpi;
+                        form.content_height =
+                            form.content_height * dpi as i32 / old_dpi.max(1) as i32;
+                        form.scroll_y = form.scroll_y * dpi as i32 / old_dpi.max(1) as i32;
                         std::mem::replace(&mut form.font, new_font)
                     };
                     if !old_font.is_invalid() {
                         let _ = DeleteObject(old_font.into());
                     }
                     let rect = &*(lp.0 as *const RECT);
+                    let mut monitor = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let _ = GetMonitorInfoW(
+                        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                        &mut monitor,
+                    );
+                    let work = monitor.rcWork;
+                    let width = (rect.right - rect.left).min(work.right - work.left);
+                    let height = (rect.bottom - rect.top).min(work.bottom - work.top);
                     let _ = SetWindowPos(
                         hwnd,
                         None,
-                        rect.left,
-                        rect.top,
-                        rect.right - rect.left,
-                        rect.bottom - rect.top,
+                        rect.left.clamp(work.left, work.right - width),
+                        rect.top.clamp(work.top, work.bottom - height),
+                        width,
+                        height,
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
+                    let (viewport, scroll, edits, all, save) = {
+                        let form = (*ptr).borrow();
+                        (
+                            form.viewport,
+                            form.scroll_y,
+                            form.edits.len(),
+                            form.controls.clone(),
+                            form.save_button,
+                        )
+                    };
+                    let scale = |n: i32| n * dpi as i32 / 96;
+                    let mut client = RECT::default();
+                    let _ = GetClientRect(hwnd, &mut client);
+                    let _ = MoveWindow(
+                        viewport,
+                        0,
+                        0,
+                        client.right,
+                        (client.bottom - scale(58)).max(1),
+                        true,
+                    );
+                    for control in all.iter().take(edits * 2) {
+                        let mut r = RECT::default();
+                        let _ = GetWindowRect(*control, &mut r);
+                        let mut points = [POINT {
+                            x: r.left,
+                            y: r.top,
+                        }];
+                        windows::Win32::Graphics::Gdi::MapWindowPoints(
+                            None,
+                            Some(viewport),
+                            &mut points,
+                        );
+                        let _ = MoveWindow(
+                            *control,
+                            points[0].x,
+                            points[0].y,
+                            (client.right - scale(48)).max(1),
+                            r.bottom - r.top,
+                            true,
+                        );
+                    }
+                    if let Some(save) = save {
+                        let _ = MoveWindow(
+                            save,
+                            client.right - scale(218),
+                            client.bottom - scale(46),
+                            scale(90),
+                            scale(30),
+                            true,
+                        );
+                    }
+                    if let Some(cancel) = all.last() {
+                        let _ = MoveWindow(
+                            *cancel,
+                            client.right - scale(120),
+                            client.bottom - scale(46),
+                            scale(90),
+                            scale(30),
+                            true,
+                        );
+                    }
+                    scroll_form(ptr, scroll);
                     return LRESULT(0);
                 }
                 WM_CLOSE => {
@@ -522,7 +865,7 @@ pub unsafe fn ai_settings_form(
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "AI检索设置 · 仅发送查询与功能目录",
+            "AI 设置 · 共用于检索与管家",
             &[
                 (
                     "可选功能",
@@ -534,7 +877,7 @@ pub unsafe fn ai_settings_form(
                 ),
                 (
                     "模型 ID（由服务商提供）",
-                    Field::Text(settings.model.clone()),
+                    Field::Model(settings.model.clone()),
                 ),
                 (
                     "认证方式",
@@ -548,8 +891,70 @@ pub unsafe fn ai_settings_form(
                     "密钥管理",
                     Field::Switch(false, "清除已保存密钥（同时关闭 AI）"),
                 ),
+                (
+                    "推理强度（默认不发送参数，兼容性最佳）",
+                    Field::EffortChoice(
+                        crate::organizer_ui::EFFORTS
+                            .iter()
+                            .position(|e| *e == settings.effort)
+                            .unwrap_or(0),
+                    ),
+                ),
             ],
             Some(TestForm::Ai(settings.clone())),
+            appearance,
+        )
+    }
+}
+pub unsafe fn organizer_settings_form(
+    owner: HWND,
+    settings: &crate::organizer::OrganizerSettings,
+    ai: &crate::ai::AiSettings,
+    path_enabled: bool,
+    appearance: Theme,
+) -> Option<Vec<String>> {
+    use crate::organizer::{OrganizerMode, OrganizerScope};
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            "AI 管家设置",
+            &[
+                (
+                    "发送摘要、路径与元数据；不读取文件正文或图片",
+                    Field::Switch(settings.enabled, "启用 AI 管家（默认关闭）"),
+                ),
+                (
+                    "整理模式",
+                    Field::OrganizerModeChoice(usize::from(
+                        settings.mode == OrganizerMode::Automatic,
+                    )),
+                ),
+                (
+                    "发送范围（只处理启用后的新内容和观察）",
+                    Field::OrganizerScopeChoice(match settings.scope {
+                        OrganizerScope::SavedAndPaths => 0,
+                        OrganizerScope::SavedOnly => 1,
+                        OrganizerScope::PathsOnly => 2,
+                        OrganizerScope::AllTextAndPaths => 3,
+                    }),
+                ),
+                (
+                    "整理间隔（30–3600 秒）",
+                    Field::Text(settings.interval_seconds.to_string()),
+                ),
+                (
+                    "每批数量（1–8 条）",
+                    Field::Text(settings.batch_size.to_string()),
+                ),
+                (
+                    "整理说明（最多 512 字符）",
+                    Field::Multiline(settings.instructions.clone()),
+                ),
+            ],
+            Some(TestForm::Organizer {
+                ai: ai.clone(),
+                path_enabled,
+            }),
             appearance,
         )
     }
@@ -615,7 +1020,9 @@ unsafe fn form_fields_with_test_theme(
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let testing = test.is_some();
+        let testing = matches!(test, Some(TestForm::Ai(_) | TestForm::Embedding(_)));
+        let validating = test.is_some();
+        let model_listing = matches!(test, Some(TestForm::Ai(_)));
         let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
             controls: Vec::new(),
@@ -630,6 +1037,35 @@ unsafe fn form_fields_with_test_theme(
             test_button: None,
             test_result: None,
             save_button: None,
+            model_button: None,
+            models: Vec::new(),
+            choices: fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, f))| {
+                    matches!(
+                        f,
+                        Field::Choice(_)
+                            | Field::AuthChoice(_)
+                            | Field::IndexChoice(_)
+                            | Field::SmartChoice(_)
+                            | Field::EffortChoice(_)
+                            | Field::OrganizerModeChoice(_)
+                            | Field::OrganizerScopeChoice(_)
+                    )
+                    .then_some(i)
+                })
+                .collect(),
+            switches: fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, f))| {
+                    matches!(f, Field::Toggle(_) | Field::Switch(_, _)).then_some(i)
+                })
+                .collect(),
+            viewport: HWND::default(),
+            scroll_y: 0,
+            content_height: 0,
         }));
         let title = wide(title);
         let owner_dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
@@ -648,19 +1084,24 @@ unsafe fn form_fields_with_test_theme(
             .count() as i32
             * 92;
         let logical_height =
-            104 + fields.len() as i32 * 62 + multiline_extra + if testing { 96 } else { 0 };
-        let fit = ((work.bottom - work.top - 24).max(1) * 96 / logical_height).max(96) as u32;
-        let dpi = owner_dpi.min(fit);
+            104 + fields.len() as i32 * 62 + multiline_extra + if validating { 96 } else { 0 };
+        let dpi = owner_dpi;
+        let fit = crate::organizer_ui::fit_form(
+            work.right - work.left,
+            work.bottom - work.top,
+            dpi,
+            logical_height,
+        );
         let scale = |v: i32| v * (dpi as i32) / 96;
-        let height = scale(logical_height);
+        let height = fit.height;
         let hwnd = CreateWindowExW(
             WS_EX_DLGMODALFRAME,
             class,
             PCWSTR(title.as_ptr()),
             WS_CAPTION | WS_SYSMENU | WS_POPUP,
-            work.left + ((work.right - work.left - scale(520)) / 2).max(0),
+            work.left + ((work.right - work.left - fit.width) / 2).max(0),
             work.top + ((work.bottom - work.top - height) / 2).max(0),
-            scale(520),
+            fit.width,
             height,
             Some(owner),
             None,
@@ -669,6 +1110,38 @@ unsafe fn form_fields_with_test_theme(
         )
         .ok()?;
         let _window_guard = FormWindow(hwnd);
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let viewport = CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            w!("STATIC"),
+            PCWSTR::null(),
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+            0,
+            0,
+            client.right,
+            (client.bottom - scale(58)).max(1),
+            Some(hwnd),
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+        if !SetWindowSubclass(
+            viewport,
+            Some(viewport_proc),
+            4,
+            (&*state as *const RefCell<Form>) as usize,
+        )
+        .as_bool()
+        {
+            return None;
+        }
+        {
+            let mut form = state.borrow_mut();
+            form.viewport = viewport;
+            form.content_height = fit.content_height;
+        }
         let font = theme::font(dpi);
         {
             let mut form = state.borrow_mut();
@@ -681,11 +1154,14 @@ unsafe fn form_fields_with_test_theme(
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
             let value = wide(match value {
-                Field::Text(t) | Field::Password(t) | Field::Multiline(t) => t,
+                Field::Text(t) | Field::Password(t) | Field::Multiline(t) | Field::Model(t) => t,
                 Field::Choice(_)
                 | Field::AuthChoice(_)
                 | Field::IndexChoice(_)
-                | Field::SmartChoice(_) => "",
+                | Field::SmartChoice(_)
+                | Field::EffortChoice(_)
+                | Field::OrganizerModeChoice(_)
+                | Field::OrganizerScopeChoice(_) => "",
                 Field::Toggle(_) => "暂停剪贴板记录",
                 Field::Switch(_, label) => label,
             });
@@ -703,9 +1179,9 @@ unsafe fn form_fields_with_test_theme(
                 WS_CHILD | WS_VISIBLE,
                 scale(18),
                 y,
-                scale(470),
+                (client.right - scale(48)).max(1),
                 scale(22),
-                Some(hwnd),
+                Some(viewport),
                 None,
                 None,
                 None,
@@ -721,6 +1197,10 @@ unsafe fn form_fields_with_test_theme(
                     | Field::SmartChoice(_) => {
                         w!("COMBOBOX")
                     }
+                    Field::Model(_)
+                    | Field::EffortChoice(_)
+                    | Field::OrganizerModeChoice(_)
+                    | Field::OrganizerScopeChoice(_) => w!("COMBOBOX"),
                     Field::Toggle(_) | Field::Switch(_, _) => w!("BUTTON"),
                 },
                 PCWSTR(value.as_ptr()),
@@ -729,6 +1209,10 @@ unsafe fn form_fields_with_test_theme(
                     | WS_TABSTOP
                     | WINDOW_STYLE(match fields[i].1 {
                         Field::Text(_) => ES_AUTOHSCROLL as u32,
+                        Field::Model(_) => (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32,
+                        Field::EffortChoice(_)
+                        | Field::OrganizerModeChoice(_)
+                        | Field::OrganizerScopeChoice(_) => CBS_DROPDOWNLIST as u32,
                         Field::Multiline(_) => {
                             (ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32 | WS_VSCROLL.0
                         }
@@ -741,7 +1225,7 @@ unsafe fn form_fields_with_test_theme(
                     }),
                 scale(18),
                 y + scale(24),
-                scale(470),
+                (client.right - scale(48)).max(1),
                 scale(
                     if matches!(
                         fields[i].1,
@@ -749,6 +1233,10 @@ unsafe fn form_fields_with_test_theme(
                             | Field::AuthChoice(_)
                             | Field::IndexChoice(_)
                             | Field::SmartChoice(_)
+                            | Field::Model(_)
+                            | Field::EffortChoice(_)
+                            | Field::OrganizerModeChoice(_)
+                            | Field::OrganizerScopeChoice(_)
                     ) {
                         150
                     } else if matches!(fields[i].1, Field::Multiline(_)) {
@@ -757,7 +1245,7 @@ unsafe fn form_fields_with_test_theme(
                         28
                     },
                 ),
-                Some(hwnd),
+                Some(viewport),
                 None,
                 None,
                 None,
@@ -794,6 +1282,42 @@ unsafe fn form_fields_with_test_theme(
                     }
                     SendMessageW(e, CB_SETCURSEL, Some(WPARAM(selected)), None);
                 }
+                Field::EffortChoice(selected)
+                | Field::OrganizerModeChoice(selected)
+                | Field::OrganizerScopeChoice(selected) => {
+                    let choices: &[&str] = match fields[i].1 {
+                        Field::EffortChoice(_) => &[
+                            "默认（省略 effort）",
+                            "low",
+                            "medium",
+                            "high",
+                            "xhigh",
+                            "max",
+                        ],
+                        Field::OrganizerModeChoice(_) => {
+                            &["后台生成建议，由我确认", "后台自动应用空别名与标签"]
+                        }
+                        _ => &[
+                            "收藏、固定剪贴板和外部路径",
+                            "仅收藏和固定剪贴板",
+                            "仅外部常用路径",
+                            "上述范围加普通剪贴板文本",
+                        ],
+                    };
+                    for choice in choices {
+                        let choice = wide(choice);
+                        SendMessageW(
+                            e,
+                            CB_ADDSTRING,
+                            None,
+                            Some(LPARAM(choice.as_ptr() as isize)),
+                        );
+                    }
+                    SendMessageW(e, CB_SETCURSEL, Some(WPARAM(selected)), None);
+                }
+                Field::Model(_) => {
+                    SendMessageW(e, CB_LIMITTEXT, Some(WPARAM(256)), None);
+                }
                 Field::Toggle(checked) | Field::Switch(checked, _) => {
                     SendMessageW(e, BM_SETCHECK, Some(WPARAM(usize::from(checked))), None);
                 }
@@ -808,7 +1332,7 @@ unsafe fn form_fields_with_test_theme(
                 form.controls.extend([l, e]);
             }
         }
-        if testing {
+        if validating {
             let y = scale(field_y);
             let button = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
@@ -819,22 +1343,49 @@ unsafe fn form_fields_with_test_theme(
                 y,
                 scale(136),
                 scale(30),
-                Some(hwnd),
+                Some(viewport),
                 Some(HMENU(TEST_BUTTON as *mut _)),
                 None,
                 None,
             )
             .ok()?;
+            if !testing {
+                let _ = ShowWindow(button, SW_HIDE);
+            }
+            if model_listing {
+                let models = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("BUTTON"),
+                    w!("获取模型"),
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                    scale(166),
+                    y,
+                    scale(116),
+                    scale(30),
+                    Some(viewport),
+                    Some(HMENU(MODEL_BUTTON as *mut _)),
+                    None,
+                    None,
+                )
+                .ok()?;
+                SendMessageW(models, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+                state.borrow_mut().controls.push(models);
+                state.borrow_mut().model_button = Some(models);
+            }
             let output = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
-                w!("点击测试仅发送内置测试文本，不保存设置"),
+                if testing {
+                    w!("获取模型不发推理请求；测试只发送内置文本")
+                } else {
+                    w!("管家复用 AI 设置；保存配置后立即生效")
+                },
                 WS_CHILD | WS_VISIBLE,
                 scale(18),
                 y + scale(36),
-                scale(470),
+                (client.right - scale(48)).max(1),
                 scale(42),
-                Some(hwnd),
+                Some(viewport),
                 None,
                 None,
                 None,
@@ -848,22 +1399,44 @@ unsafe fn form_fields_with_test_theme(
                 form.test_button = Some(button);
                 form.test_result = Some(output);
             }
+            let note = {
+                let form = state.borrow();
+                match &form.test {
+                    Some(TestForm::Organizer { ai, path_enabled }) => Some(format!(
+                        "{}{}",
+                        crate::organizer_ui::organizer_config_warning(ai)
+                            .unwrap_or_else(|| "复用 AI 设置；检索开关可保持关闭".into()),
+                        if *path_enabled {
+                            ""
+                        } else {
+                            "\r\n路径范围需在“常用推荐设置”中启用观察"
+                        }
+                    )),
+                    _ => None,
+                }
+            };
+            if let Some(note) = note {
+                test_status(&*state, &note);
+            }
             let available = !TEST_WORKER.with(|worker| worker.busy());
             let _ = EnableWindow(button, available);
-            if SetTimer(Some(hwnd), TEST_TIMER, 50, None) == 0 {
+            if testing && SetTimer(Some(hwnd), TEST_TIMER, 100, None) == 0 {
                 let _ = EnableWindow(button, false);
                 test_status(&*state, "无法启动连接测试状态更新，请重新打开设置");
             }
         }
-        for (id, label, x) in [(1, "保存", 300), (2, "取消", 398)] {
+        for (id, label, x) in [
+            (1, "保存", client.right - scale(218)),
+            (2, "取消", client.right - scale(120)),
+        ] {
             let s = wide(label);
             let b = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 PCWSTR(s.as_ptr()),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                scale(x),
-                height - scale(80),
+                x,
+                client.bottom - scale(46),
                 scale(90),
                 scale(30),
                 Some(hwnd),
@@ -878,6 +1451,7 @@ unsafe fn form_fields_with_test_theme(
                 state.borrow_mut().save_button = Some(b);
             }
         }
+        scroll_form(&*state, 0);
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let first_edit = state.borrow().edits.first().copied();
@@ -931,11 +1505,16 @@ unsafe fn form_fields_with_test_theme(
                 .iter()
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
-                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) => text(*e),
+                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) | Field::Model(_) => {
+                        text(*e)
+                    }
                     Field::Choice(_)
                     | Field::AuthChoice(_)
                     | Field::IndexChoice(_)
-                    | Field::SmartChoice(_) => {
+                    | Field::SmartChoice(_)
+                    | Field::EffortChoice(_)
+                    | Field::OrganizerModeChoice(_)
+                    | Field::OrganizerScopeChoice(_) => {
                         SendMessageW(*e, CB_GETCURSEL, None, None).0.to_string()
                     }
                     Field::Toggle(_) | Field::Switch(_, _) => {

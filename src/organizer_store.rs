@@ -3,6 +3,9 @@ use crate::organizer::*;
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize)]
+// Inline proposals keep the existing serde/memory accounting contract; Record
+// capacity includes this payload, so boxing here would require a budget redesign.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Status {
     Queued,
     Processing,
@@ -265,6 +268,7 @@ impl OrganizerStore {
         self.retry_at_ms = None;
         self.paused = false;
         self.next_at_ms = 0;
+        self.capacity_released();
     }
     pub fn recover(&mut self) {
         for r in &mut self.records {
@@ -278,6 +282,24 @@ impl OrganizerStore {
         let old = self.records.len();
         self.records.retain(|r| &r.candidate.source != source);
         self.dirty |= old != self.records.len();
+        if old != self.records.len() {
+            self.records.shrink_to_fit();
+            self.capacity_released();
+        }
+    }
+    pub fn capacity_released(&mut self) {
+        if self.blocked {
+            return;
+        }
+        let saturated = self.ready_count() >= MAX_READY_PROPOSALS
+            || (self.records.len() >= MAX_RECORDS
+                && !self
+                    .records
+                    .iter()
+                    .any(|r| matches!(r.status, Status::Done)))
+            || !self.fits();
+        self.dirty |= self.saturated != saturated;
+        self.saturated = saturated;
     }
     pub fn write(&self, tx: &Transaction<'_>) -> Result<(), String> {
         if !self.dirty || self.blocked {
@@ -319,4 +341,41 @@ fn candidate_bytes(c: &Candidate) -> usize {
         + c.alias.capacity()
         + tags_bytes(&c.tags)
         + c.context.capacity()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn freed_ready_capacity_clears_saturation_without_requeueing_sources() {
+        let candidate = Candidate {
+            source: Source::SavedItem { id: "one".into() },
+            fingerprint: "fingerprint".into(),
+            expected_version: "version".into(),
+            kind: crate::model::ItemKind::Clipboard,
+            title: "标题".into(),
+            alias: String::new(),
+            tags: vec![],
+            context: "摘要".into(),
+        };
+        let mut store = OrganizerStore {
+            saturated: true,
+            ..Default::default()
+        };
+        store.records.push(Record {
+            candidate: candidate.clone(),
+            status: Status::Ready(Proposal {
+                candidate,
+                alias: None,
+                tags: vec![],
+                reason: "依据".into(),
+            }),
+        });
+        store.forget(&Source::SavedItem { id: "one".into() });
+        assert!(!store.snapshot(false).saturated);
+        assert!(store.records.is_empty());
+        store.saturated = true;
+        store.reset();
+        assert!(!store.snapshot(false).saturated);
+    }
 }

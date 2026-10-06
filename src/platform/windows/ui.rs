@@ -3,6 +3,7 @@ use super::{
     actions, ai_client, ai_time, clipboard,
     dialogs::{self, wide},
     images::{self, Image},
+    organizer_ui,
     path_monitor::PathMonitor,
     screenshot, theme,
 };
@@ -48,6 +49,7 @@ const WORK_WAKE: u32 = WM_APP + 2;
 const TRAY: u32 = WM_APP + 3;
 const DEFERRED_WAKE: u32 = WM_APP + 4;
 const SHOW_EXISTING: u32 = WM_APP + 5;
+const ORGANIZER_UI_WAKE: u32 = WM_APP + 6;
 const SEARCH: usize = 100;
 const LIST: usize = 101;
 const ADD: usize = 102;
@@ -63,6 +65,9 @@ const INDEX_CANCEL: usize = 111;
 const PATH_SETTINGS: usize = 112;
 const SCREENSHOT: usize = 113;
 const SCREENSHOT_SETTINGS: usize = 114;
+const ORGANIZER_SETTINGS: usize = 115;
+const ORGANIZER_REVIEW: usize = 116;
+const ORGANIZER_TIMER: usize = 401;
 const PATH_TIMER: usize = 400;
 const FAVORITE_PATH: usize = 210;
 const SUPPRESS_PATH: usize = 211;
@@ -270,6 +275,17 @@ impl RenderState {
     }
 }
 enum UiEffect {
+    OrganizerSettings {
+        owner: HWND,
+        settings: crate::organizer::OrganizerSettings,
+    },
+    OrganizerReview {
+        owner: HWND,
+        state: Rc<RefCell<crate::organizer_ui::ReviewState>>,
+        outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
+        appearance: Theme,
+        enabled: bool,
+    },
     ScreenshotSelect {
         owner: HWND,
         target: HWND,
@@ -422,7 +438,17 @@ impl Drop for WindowGuard {
         }
     }
 }
+type OrganizerWorker = crate::connection_test::ConnectionTestWorker<
+    crate::organizer::Work,
+    (u64, Result<Vec<crate::organizer::Proposal>, String>),
+>;
 struct App {
+    organizer_worker: Option<OrganizerWorker>,
+    organizer_active: Option<(u64, u64)>,
+    organizer_tick_pending: bool,
+    organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
+    organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
+    organizer_page_open: bool,
     host: *const Host,
     effects: VecDeque<UiEffect>,
     hotkey_bindings: HotkeyBindings,
@@ -540,6 +566,12 @@ pub fn run() -> Result<(), String> {
         let (tx, work_rx) = mpsc::channel();
         let (done_tx, rx) = mpsc::channel();
         let app_data = App {
+            organizer_worker: None,
+            organizer_active: None,
+            organizer_tick_pending: false,
+            organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
+            organizer_outbox: Rc::new(RefCell::new((None, None))),
+            organizer_page_open: false,
             host: std::ptr::null(),
             effects: VecDeque::new(),
             hotkey_bindings: HotkeyBindings::default(),
@@ -710,6 +742,123 @@ pub fn run() -> Result<(), String> {
     }
 }
 impl App {
+    unsafe fn update_organizer_timer(&mut self) {
+        let warning = if self.settings.organizer.enabled {
+            crate::organizer_ui::organizer_config_warning(&self.settings.ai)
+        } else {
+            None
+        };
+        {
+            let mut review = self.organizer_review.borrow_mut();
+            review.config_warning = warning.clone();
+            review.revision += 1;
+        }
+        self.organizer_tick_pending = false;
+        if let Some((id, _)) = self.organizer_active.take()
+            && let Some(worker) = &self.organizer_worker
+        {
+            worker.cancel(id);
+        }
+        let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
+        if self.settings.organizer.enabled
+            && warning.is_none()
+            && self.state.lifecycle == Lifecycle::Running
+        {
+            SetTimer(
+                Some(self.hwnd),
+                ORGANIZER_TIMER,
+                self.settings.organizer.interval_seconds.clamp(30, 3600) * 1000,
+                None,
+            );
+        }
+        if self.organizer_page_open {
+            self.organizer_snapshot();
+        }
+    }
+    fn organizer_snapshot(&self) {
+        let request_id = self.organizer_review.borrow_mut().request_snapshot();
+        if let Some(request_id) = request_id {
+            self.send(Command::OrganizerSnapshot { request_id });
+        }
+    }
+    fn organizer_tick(&mut self) {
+        if self.settings.organizer.enabled
+            && self.state.lifecycle == Lifecycle::Running
+            && !self.organizer_tick_pending
+            && !self.organizer_worker.as_ref().is_some_and(|w| w.busy())
+        {
+            let request_id = self.organizer_review.borrow_mut().request_snapshot();
+            let Some(request_id) = request_id else { return };
+            self.organizer_tick_pending = true;
+            self.send(Command::OrganizerTick);
+            // FIFO local barrier acknowledges even an empty/cooling tick, avoiding
+            // a queue of timer commands while the actor is busy.
+            self.send(Command::OrganizerSnapshot { request_id });
+        }
+    }
+    unsafe fn organizer_start(&mut self, work: crate::organizer::Work) {
+        if self.state.lifecycle != Lifecycle::Running
+            || work.ai_settings != self.settings.ai
+            || work.organizer_settings != self.settings.organizer
+        {
+            return;
+        }
+        if self.organizer_worker.is_none() {
+            let address = self.hwnd.0 as usize;
+            self.organizer_worker = Some(crate::organizer_ui::request_worker(
+                |work: crate::organizer::Work| {
+                    let settings = Settings {
+                        ai: work.ai_settings.clone(),
+                        organizer: work.organizer_settings.clone(),
+                        ..Settings::default()
+                    };
+                    let token = work.token;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        ai_client::organize(&settings, &work)
+                    }))
+                    .unwrap_or_else(|_| Err("后台整理请求失败，可稍后重试".into()));
+                    Ok((token, result))
+                },
+                Arc::new(move || unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(address as *mut _)),
+                        WORK_WAKE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }),
+            ));
+        }
+        let token = work.token;
+        match self.organizer_worker.as_ref().unwrap().submit(work) {
+            Ok(id) => self.organizer_active = Some((id, token)),
+            Err(_) => self.send(Command::OrganizerComplete {
+                token,
+                result: Err("上一次后台请求仍未结束".into()),
+            }),
+        }
+    }
+    unsafe fn organizer_settings(&mut self) {
+        self.effects.push_back(UiEffect::OrganizerSettings {
+            owner: self.hwnd,
+            settings: self.settings.organizer.clone(),
+        });
+    }
+    unsafe fn review_organizer(&mut self) {
+        if self.organizer_page_open {
+            return;
+        }
+        self.organizer_page_open = true;
+        self.organizer_review.borrow_mut().open();
+        self.organizer_snapshot();
+        self.effects.push_back(UiEffect::OrganizerReview {
+            owner: self.hwnd,
+            state: self.organizer_review.clone(),
+            outbox: self.organizer_outbox.clone(),
+            appearance: self.settings.theme,
+            enabled: self.settings.organizer.enabled,
+        });
+    }
     fn sync_render(&self) {
         unsafe {
             if let Some(host) = self.host.as_ref() {
@@ -1927,6 +2076,28 @@ impl App {
         }
     }
     unsafe fn work_done(&mut self) {
+        if let Some(completion) = self
+            .organizer_worker
+            .as_ref()
+            .and_then(|worker| worker.try_result())
+            && self
+                .organizer_active
+                .is_some_and(|(id, _)| id == completion.id)
+            && self.state.lifecycle == Lifecycle::Running
+        {
+            let (_, token) = self.organizer_active.take().unwrap();
+            match completion.result {
+                Ok((token, result)) => self.send(Command::OrganizerComplete { token, result }),
+                Err(message) => {
+                    self.organizer_review.borrow_mut().message = message;
+                    self.organizer_review.borrow_mut().revision += 1;
+                    self.send(Command::OrganizerComplete {
+                        token,
+                        result: Err("后台请求失败，可稍后重试".into()),
+                    });
+                }
+            }
+        }
         if let Some(done) = self
             .screenshot_worker
             .as_ref()
@@ -2080,10 +2251,51 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
-                // Native organizer integration replaces these explicit adapter arms.
-                Event::OrganizerWork(_)
-                | Event::OrganizerState { .. }
-                | Event::OrganizerChanged => {}
+                Event::OrganizerWork(work) => self.organizer_start(work),
+                Event::OrganizerDetail { request_id, result } => {
+                    self.organizer_review
+                        .borrow_mut()
+                        .adopt_detail(request_id, result);
+                    if self.organizer_page_open {
+                        let request = self.organizer_review.borrow_mut().request_detail();
+                        if let Some((request_id, source, expected_version)) = request {
+                            self.send(Command::OrganizerDetail {
+                                request_id,
+                                source,
+                                expected_version,
+                            });
+                        }
+                    }
+                }
+                Event::OrganizerState {
+                    request_id,
+                    snapshot,
+                } => {
+                    self.organizer_tick_pending = false;
+                    self.organizer_review
+                        .borrow_mut()
+                        .adopt_snapshot(request_id, snapshot);
+                }
+                Event::OrganizerChanged => {
+                    if self.organizer_page_open {
+                        self.organizer_snapshot();
+                    }
+                }
+                Event::OrganizerReceipt {
+                    request_id,
+                    result,
+                    pending_save,
+                } => {
+                    let success = result.is_ok();
+                    if self
+                        .organizer_review
+                        .borrow_mut()
+                        .receipt(request_id, result, pending_save)
+                        && success
+                    {
+                        self.organizer_snapshot();
+                    }
+                }
                 Event::PathSuggestions { request_id, items } => {
                     if self.state.is_current(request_id)
                         && let Some(paths) = self.path_batches.paths(request_id, items)
@@ -2099,6 +2311,7 @@ impl App {
                 }
                 Event::Ready(settings) => {
                     self.settings = settings;
+                    self.update_organizer_timer();
                     self.update_path_monitor();
                     self.retheme();
                     if let Err(e) = self.replace_hotkeys(&self.settings.clone()) {
@@ -2266,7 +2479,9 @@ impl App {
                             self.refresh_semantic_status();
                         }
                     }
-                    if self.state.lifecycle == Lifecycle::Running {
+                    if self.state.lifecycle == Lifecycle::Running
+                        && !self.organizer_review.borrow().pending()
+                    {
                         self.status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
                     }
                 }
@@ -2279,6 +2494,14 @@ impl App {
                             message,
                         });
                     } else if !exiting {
+                        if self.organizer_review.borrow().pending()
+                            || self.organizer_review.borrow().needs_save()
+                        {
+                            let mut review = self.organizer_review.borrow_mut();
+                            review.message = format!("未保存：{message}");
+                            review.revision += 1;
+                            continue;
+                        }
                         // Admission/profile failures have no store acknowledgement.
                         self.cancel_index();
                         self.status(&message);
@@ -2811,6 +3034,8 @@ impl App {
                 (SCREENSHOT, "区域截图"),
                 (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
+                (ORGANIZER_SETTINGS, "AI 管家设置…"),
+                (ORGANIZER_REVIEW, "整理建议…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
             ],
             target: None,
@@ -2834,11 +3059,12 @@ impl App {
         });
     }
     unsafe fn apply_ai_settings(&mut self, mut values: Vec<String>) -> Result<(), String> {
+        let parsed = crate::organizer_ui::parse_ai_fields(&self.settings.ai, &values);
         let password = ai_client::SecretString(std::mem::take(&mut values[4]));
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        let mut next = self.settings.ai.clone();
+        let mut next = parsed?;
         next.enabled = values[0] == "1";
         next.endpoint = values[1].trim().into();
         next.model = values[2].trim().into();
@@ -2874,6 +3100,7 @@ impl App {
         self.cancel_ai();
         self.cancel_preflight();
         self.settings.ai = next;
+        self.update_organizer_timer();
         self.send(Command::SaveSettings(self.settings.clone()));
         self.retheme();
         Ok(())
@@ -2936,6 +3163,8 @@ impl App {
                 (SCREENSHOT, "区域截图"),
                 (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
                 (AI_SETTINGS, "AI 检索设置…"),
+                (ORGANIZER_SETTINGS, "AI 管家设置…"),
+                (ORGANIZER_REVIEW, "整理建议…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
                 (222, "暂停 / 恢复剪贴板记录"),
                 (EXIT, "保存后退出"),
@@ -3023,6 +3252,8 @@ impl App {
             Function::Settings => self.settings(),
             Function::PathActivitySettings => self.path_settings(),
             Function::AiSettings => self.ai_settings(),
+            Function::OrganizerSettings => self.organizer_settings(),
+            Function::OrganizerReview => self.review_organizer(),
             Function::AiSearch => self.begin_smart(Some(SmartSearchMode::Claude)),
             Function::EmbeddingSettings => self.embedding_settings(),
             Function::SemanticSearch => self.begin_smart(Some(SmartSearchMode::Semantic)),
@@ -3078,6 +3309,8 @@ impl App {
             FAVORITE_PATH => self.request(Action::Favorite),
             SUPPRESS_PATH => self.request(Action::Suppress),
             AI_SETTINGS => self.ai_settings(),
+            ORGANIZER_SETTINGS => self.organizer_settings(),
+            ORGANIZER_REVIEW => self.review_organizer(),
             SMART_FIND => self.begin_smart(None),
             INDEX_STATUS if self.semantic_index.active() => self.cancel_index(),
             INDEX_STATUS => self.begin_index(),
@@ -3118,6 +3351,12 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
+                if let Some((id, _)) = self.organizer_active.take()
+                    && let Some(worker) = &self.organizer_worker
+                {
+                    worker.cancel(id);
+                }
                 self.screenshot_gate.close();
                 self.cancel_preflight();
                 self.cancel_index();
@@ -3197,10 +3436,12 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Err(_) => {
                 match msg {
                     WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
-                    ENGINE_WAKE | WORK_WAKE | SHOW_EXISTING | WM_CLIPBOARDUPDATE | WM_HOTKEY
-                    | WM_CLOSE | WM_ACTIVATE | WM_SIZE | WM_SETTINGCHANGE | WM_COMMAND
-                    | WM_THEMECHANGED | WM_CONTEXTMENU | TRAY | WM_DROPFILES | WM_ENDSESSION
-                    | WM_DESTROY | WM_DISPLAYCHANGE => host.defer(Deferred::Message(msg, wp, lp)),
+                    ENGINE_WAKE | WORK_WAKE | ORGANIZER_UI_WAKE | SHOW_EXISTING
+                    | WM_CLIPBOARDUPDATE | WM_HOTKEY | WM_CLOSE | WM_ACTIVATE | WM_SIZE
+                    | WM_SETTINGCHANGE | WM_COMMAND | WM_THEMECHANGED | WM_CONTEXTMENU | TRAY
+                    | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY | WM_DISPLAYCHANGE => {
+                        host.defer(Deferred::Message(msg, wp, lp))
+                    }
                     WM_QUERYENDSESSION => return LRESULT(1),
                     _ => return DefWindowProcW(hwnd, msg, wp, lp),
                 }
@@ -3237,6 +3478,25 @@ unsafe fn app_message(
         }
         ENGINE_WAKE => {
             app.events();
+            return Some(LRESULT(0));
+        }
+        ORGANIZER_UI_WAKE => {
+            let commands = {
+                let mut outbox = app.organizer_outbox.borrow_mut();
+                [outbox.0.take(), outbox.1.take()]
+            };
+            for command in commands.into_iter().flatten() {
+                if app.state.lifecycle == Lifecycle::Running {
+                    app.send(command);
+                    if app.organizer_page_open {
+                        app.organizer_snapshot();
+                    }
+                }
+            }
+            return Some(LRESULT(0));
+        }
+        WM_TIMER if wp.0 == ORGANIZER_TIMER => {
+            app.organizer_tick();
             return Some(LRESULT(0));
         }
         WM_TIMER if wp.0 == PATH_TIMER => {
@@ -3379,6 +3639,8 @@ unsafe fn app_message(
         }
         WM_QUERYENDSESSION => return Some(LRESULT(1)),
         WM_DESTROY => {
+            let _ = KillTimer(Some(hwnd), ORGANIZER_TIMER);
+            app.organizer_worker.take();
             app.screenshot_gate.close();
             app.stop_path_monitor();
             let _ = RemoveClipboardFormatListener(hwnd);
@@ -3842,6 +4104,75 @@ impl Host {
                 break;
             };
             match effect {
+                UiEffect::OrganizerSettings { owner, settings } => {
+                    let (appearance, ai, path_enabled) = {
+                        let app = self.app.borrow();
+                        (
+                            app.settings.theme,
+                            app.settings.ai.clone(),
+                            app.settings.path_activity.enabled,
+                        )
+                    };
+                    let values = dialogs::organizer_settings_form(
+                        owner,
+                        &settings,
+                        &ai,
+                        path_enabled,
+                        appearance,
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if app.state.lifecycle == Lifecycle::Running
+                        && let Some(values) = values
+                    {
+                        match crate::organizer_ui::parse_organizer_fields(&values) {
+                            Ok(settings) => {
+                                app.settings.organizer = settings;
+                                app.update_organizer_timer();
+                                app.send(Command::SaveSettings(app.settings.clone()));
+                            }
+                            Err(message) => {
+                                let mut review = app.organizer_review.borrow_mut();
+                                review.message = message;
+                                review.revision += 1;
+                            }
+                        }
+                    }
+                }
+                UiEffect::OrganizerReview {
+                    owner,
+                    state,
+                    outbox,
+                    appearance,
+                    enabled,
+                } => {
+                    let address = owner.0 as usize;
+                    organizer_ui::show(
+                        owner,
+                        state,
+                        Rc::new(move |command| {
+                            let detail = matches!(command, Command::OrganizerDetail { .. });
+                            let mut slot = outbox.borrow_mut();
+                            if detail {
+                                slot.1 = Some(command);
+                            } else {
+                                slot.0 = Some(command);
+                            }
+                            drop(slot);
+                            let _ = PostMessageW(
+                                Some(HWND(address as *mut _)),
+                                ORGANIZER_UI_WAKE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }),
+                        appearance,
+                        enabled,
+                    );
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    app.organizer_page_open = false;
+                }
                 UiEffect::ScreenshotSelect {
                     owner,
                     target,
@@ -4106,6 +4437,7 @@ impl Host {
                     } else {
                         app.send(Command::CancelShutdown);
                         app.state.cancel_exit();
+                        app.update_organizer_timer();
                         app.screenshot_gate.resume();
                         app.update_path_monitor();
                         app.last_capture_sequence = 0;

@@ -366,6 +366,22 @@ fn row_detail_prioritizes_source_excerpt_and_keeps_long_alias_out_of_title() {
     assert_eq!(row.saved().unwrap().created_at_ms, 1728117900000);
 }
 
+// Configuration and completed results remain reachable with both AI switches off and no history.
+#[test]
+fn organizer_settings_and_local_reviews_are_searchable_without_ai_opt_in() {
+    for (query, action) in [
+        ("AI管家", Function::OrganizerSettings),
+        ("整理建议", Function::OrganizerReview),
+        ("zljy", Function::OrganizerReview),
+    ] {
+        let rows = quick_panel::palette::results(query, vec![], Context::default());
+        assert!(
+            rows.iter().any(|r| r.function() == Some(action)),
+            "missing {query}"
+        );
+    }
+}
+
 #[test]
 fn row_detail_keeps_body_hit_near_the_start_and_exposes_saved_time_without_loading_body() {
     let mut summary = saved("hit", "保存标题", ItemKind::Clipboard);
