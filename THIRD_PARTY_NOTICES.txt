@@ -18864,3 +18864,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
+
+Pi organizer optional runtime (bundled, on-demand):
+- Node.js 24.19.0 Windows x64. Full Node and included dependency notices: runtime/NODE-LICENSE.txt.
+- Pi Agent Core / Pi AI 1.0.4 and TypeBox 1.3.27 (MIT). Full notices: runtime/PI-LICENSES.txt.
+The self-contained runtime/pi-harness.mjs contains only the six business-tool loop
+and required Pi/TypeBox code. No provider credentials, shell, file, MCP or coding tools.

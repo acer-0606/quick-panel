@@ -1793,3 +1793,61 @@ fn start_capacity_shrinks_new_batch_prefix_without_evicting_confirmed_memory_or_
     assert_eq!(memory(&e).records, protected);
     stop(&e);
 }
+
+#[test]
+fn memory_source_labels_are_bounded_read_only_metadata_and_persisted_receipts_use_fresh_ids() {
+    use quick_panel::{harness_tools::*, organizer_ui::memory_request_id};
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("labels");
+    let e = open(&path);
+    settings(&e, config());
+    favorite(&e, "labels");
+    let id = memory_request_id();
+    let input = MemoryEdit {
+        id: None,
+        scope: MemoryScope::Item {
+            source: Source::SavedItem {
+                id: "labels".into(),
+            },
+        },
+        text: "保留项目名".into(),
+        enabled: true,
+        confirmed: true,
+    };
+    e.send(Command::HarnessMemoryEdit {
+        request_id: id,
+        input: input.clone(),
+    })
+    .unwrap();
+    assert!(receipt(&e, id).0.is_ok());
+    let db = Connection::open(&path).unwrap();
+    let before = data_version(&db);
+    for _ in 0..4 {
+        let snapshot = memory(&e);
+        assert_eq!(
+            snapshot.source_labels,
+            vec![(
+                Source::SavedItem {
+                    id: "labels".into()
+                },
+                "项目日志".into()
+            )]
+        );
+    }
+    assert_eq!(before, data_version(&db));
+    stop(&e);
+    let e = open(&path);
+    let next = memory_request_id();
+    assert_ne!(id, next);
+    let mut input = input;
+    input.text = "重新启动后的明确修改".into();
+    input.id = Some(memory(&e).records[0].id);
+    e.send(Command::HarnessMemoryEdit {
+        request_id: next,
+        input,
+    })
+    .unwrap();
+    assert!(receipt(&e, next).0.is_ok());
+    assert_eq!(memory(&e).records[0].text, "重新启动后的明确修改");
+    stop(&e);
+}

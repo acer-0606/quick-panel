@@ -49,6 +49,8 @@ struct View {
     rendering: bool,
     done: bool,
     enabled: bool,
+    memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
+    feedback_rows: Vec<(String, crate::harness_tools::FeedbackTarget)>,
 }
 impl Drop for View {
     fn drop(&mut self) {
@@ -191,7 +193,7 @@ unsafe fn selected(ptr: *const RefCell<View>) {
         set(alias, &alias_text);
         set(tags, &tags_text);
     }
-    let editable = state.borrow().selected_index().is_some()
+    let editable = state.borrow().selected().is_some()
         && !state.borrow().pending()
         && !state.borrow().needs_save();
     if !composing {
@@ -224,7 +226,9 @@ unsafe fn render(ptr: *const RefCell<View>) {
             s.pending(),
             s.needs_save(),
             s.snapshot.storage_error.is_some(),
-            s.snapshot.paused || s.snapshot.retry_at_ms.is_some(),
+            s.snapshot.paused
+                || s.snapshot.retry_at_ms.is_some()
+                || !s.snapshot.attention.is_empty(),
         )
     };
     if revision == current {
@@ -252,6 +256,8 @@ unsafe fn render(ptr: *const RefCell<View>) {
         .list_refresh
         .replace(&rows, top, old_offset);
     if update.rebuild {
+        (*ptr).borrow_mut().feedback_rows =
+            crate::organizer_ui::displayed_feedback(&state.borrow().snapshot);
         SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
         SendMessageW(list, LVM_DELETEALLITEMS, None, None);
     }
@@ -390,7 +396,7 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
         let v = (*ptr).borrow();
         (v.controls.clone(), v.dpi)
     };
-    if controls.len() != 11 {
+    if controls.len() != 13 {
         return;
     }
     let mut r = RECT::default();
@@ -401,7 +407,7 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
     let bottom = r.bottom - margin;
     let field_h = s(26);
     let footer_h = s(32);
-    let alias_y = bottom - footer_h - s(84);
+    let alias_y = bottom - footer_h - s(120);
     let detail_y = s(66) + ((alias_y - s(66)) / 2).max(s(24));
     let positions = [
         (margin, s(10), width, s(46)),
@@ -420,6 +426,8 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
         (margin + s(122), bottom - footer_h, s(112), footer_h),
         (margin + s(244), bottom - footer_h, s(84), footer_h),
         (r.right - margin - s(84), bottom - footer_h, s(84), footer_h),
+        (margin, bottom - footer_h - s(38), s(148), footer_h),
+        (margin + s(158), bottom - footer_h - s(38), s(148), footer_h),
     ];
     for (control, (x, y, w, h)) in controls.into_iter().zip(positions) {
         let _ = MoveWindow(control, x, y, w.max(1), h.max(1), true);
@@ -472,6 +480,44 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         state.borrow_mut().edit_for(source, version, a, t);
                     }
                 }
+                if id == 5 || id == 6 {
+                    let (memory, submit, appearance, state) = {
+                        let v = (*ptr).borrow();
+                        (
+                            v.memory.clone(),
+                            v.submit.clone(),
+                            v.appearance,
+                            v.state.clone(),
+                        )
+                    };
+                    if id == 6 {
+                        super::harness_memory_ui::show(hwnd, memory, submit, appearance);
+                    } else {
+                        let index = SendMessageW(
+                            (*ptr).borrow().list,
+                            LVM_GETNEXTITEM,
+                            Some(WPARAM(usize::MAX)),
+                            Some(LPARAM(LVNI_SELECTED as isize)),
+                        )
+                        .0;
+                        let target = if index >= 0 {
+                            (*ptr).borrow().feedback_rows.get(index as usize).cloned()
+                        } else {
+                            None
+                        };
+                        if let Some(target) = target {
+                            super::harness_memory_ui::feedback(
+                                hwnd, memory, submit, appearance, target,
+                            );
+                        } else {
+                            let mut s = state.borrow_mut();
+                            s.message = "请先选中一条已完成建议或需处理内容".into();
+                            s.revision += 1;
+                        }
+                    }
+                    render(ptr);
+                    return LRESULT(0);
+                }
                 if [1, 2, 3, 4].contains(&id) {
                     if id == 4 {
                         (*ptr).borrow_mut().done = true;
@@ -483,7 +529,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         if id == 3 {
                             let recoverable = {
                                 let s = state.borrow();
-                                s.snapshot.paused || s.snapshot.retry_at_ms.is_some()
+                                s.snapshot.paused
+                                    || s.snapshot.retry_at_ms.is_some()
+                                    || !s.snapshot.attention.is_empty()
                             };
                             state.borrow_mut().refresh();
                             if recoverable {
@@ -625,6 +673,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 pub unsafe fn show(
     owner: HWND,
     state: Rc<RefCell<ReviewState>>,
+    memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
     enabled: bool,
@@ -683,6 +732,8 @@ pub unsafe fn show(
         rendering: true,
         done: false,
         enabled,
+        memory,
+        feedback_rows: vec![],
     }));
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
@@ -781,11 +832,14 @@ pub unsafe fn show(
     SendMessageW(alias, EM_SETLIMITTEXT, Some(WPARAM(96)), None);
     SendMessageW(tags, EM_SETLIMITTEXT, Some(WPARAM(240)), None);
     let apply = create(w!("BUTTON"), "应用所选", WS_TABSTOP, 1);
-    let dismiss = create(w!("BUTTON"), "忽略所选", WS_TABSTOP, 2);
+    let dismiss = create(w!("BUTTON"), "暂不处理", WS_TABSTOP, 2);
     let retry = create(w!("BUTTON"), "重试", WS_TABSTOP, 3);
     let close = create(w!("BUTTON"), "关闭", WS_TABSTOP, 4);
+    let feedback = create(w!("BUTTON"), "反馈并重做", WS_TABSTOP, 5);
+    let memory = create(w!("BUTTON"), "AI 整理记忆", WS_TABSTOP, 6);
     let controls = vec![
-        status, list, detail, alabel, alias, tlabel, tags, apply, dismiss, retry, close,
+        status, list, detail, alabel, alias, tlabel, tags, apply, dismiss, retry, close, feedback,
+        memory,
     ];
     for c in &controls {
         SendMessageW(*c, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);

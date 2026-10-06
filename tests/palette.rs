@@ -23,6 +23,7 @@ fn saved(id: &str, title: &str, kind: ItemKind) -> ItemSummary {
 fn functional_actions_are_found_by_names_synonyms_pinyin_and_initials() {
     for (query, action) in [
         ("设置", Function::Settings),
+        ("AI 整理记忆", Function::HarnessMemory),
         ("快捷键", Function::Settings),
         ("shezhi", Function::Settings),
         ("sz", Function::Settings),

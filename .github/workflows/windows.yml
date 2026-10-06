@@ -3,16 +3,46 @@ on: [push, pull_request, workflow_dispatch]
 jobs:
   windows:
     runs-on: windows-latest
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '1'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Exact SemVer input documented by actions/setup-node v4.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          architecture: x64
+      - name: Prepare pinned Pi runtime without dependency lifecycle scripts
+        shell: pwsh
+        run: |
+          $node = (Get-Command node.exe).Source
+          $tools = Join-Path $env:RUNNER_TEMP "qp-pnpm"
+          npm install --prefix $tools --ignore-scripts --no-audit --no-fund pnpm@11.25.0
+          if ($LASTEXITCODE -ne 0) { throw "Pinned pnpm installation failed" }
+          $pnpm = Join-Path $tools "node_modules/pnpm/bin/pnpm.cjs"
+          & $node $pnpm --dir agent-runtime install --ignore-scripts --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "Frozen Pi dependency installation failed" }
+          & $node agent-runtime/scripts/build.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Pi bundle build failed" }
+          & $node --test agent-runtime/test/worker.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Pi runtime tests failed" }
+          "QP_TEST_NODE=$node" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QP_CI_PNPM=$pnpm" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $assets = Join-Path $env:RUNNER_TEMP "qp-node-assets"
+          python scripts/fetch-node.py --download --output $assets
+          if ($LASTEXITCODE -ne 0) { throw "Pinned official Node asset verification failed" }
+          "QP_CI_NODE_ASSETS=$assets" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - run: cargo fmt --check
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets -- -D warnings
       - shell: pwsh
-        run: ./scripts/build-windows.ps1
+        run: ./scripts/build-windows.ps1 -Node $env:QP_TEST_NODE -Pnpm $env:QP_CI_PNPM -NodeAssets $env:QP_CI_NODE_ASSETS
       - uses: actions/upload-artifact@v4
         with:
           name: QuickPanel-Windows-x64

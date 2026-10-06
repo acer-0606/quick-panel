@@ -3137,9 +3137,52 @@ impl Actor {
                     Ok(())
                 }
                 Command::HarnessMemorySnapshot { request_id } => {
+                    let mut snapshot = self.repo.harness.snapshot();
+                    let mut seen = std::collections::HashSet::new();
+                    for record in &snapshot.records {
+                        if let crate::harness_tools::MemoryScope::Item { source } = &record.scope
+                            && seen.insert(source.clone())
+                        {
+                            let title = match source {
+                                crate::organizer::Source::SavedItem { id } => self
+                                    .pending
+                                    .get(id)
+                                    .map(|p| p.item.summary.title.clone())
+                                    .or_else(|| {
+                                        self.repo
+                                            .metadata(id)
+                                            .ok()
+                                            .flatten()
+                                            .map(|m| m.summary.title)
+                                    }),
+                                crate::organizer::Source::ObservedPath { normalized_path } => self
+                                    .repo
+                                    .organizer
+                                    .records
+                                    .iter()
+                                    .find(|r| &r.candidate.source == source)
+                                    .map(|r| r.candidate.title.clone())
+                                    .or_else(|| {
+                                        self.repo.paths.observation_revision(normalized_path).map(
+                                            |_| {
+                                                normalized_path
+                                                    .rsplit('\\')
+                                                    .next()
+                                                    .unwrap_or("常用路径")
+                                                    .into()
+                                            },
+                                        )
+                                    }),
+                            }
+                            .unwrap_or_else(|| "原内容已移除".into());
+                            snapshot
+                                .source_labels
+                                .push((source.clone(), title.chars().take(512).collect()));
+                        }
+                    }
                     self.emit(Event::HarnessMemoryState {
                         request_id,
-                        snapshot: self.repo.harness.snapshot(),
+                        snapshot,
                     });
                     Ok(())
                 }

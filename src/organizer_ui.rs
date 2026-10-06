@@ -183,7 +183,7 @@ pub fn clamp_scroll(position: i32, content_height: i32, viewport_height: i32) ->
     position.clamp(0, (content_height - viewport_height).max(0))
 }
 pub fn parse_organizer_fields(values: &[String]) -> Result<OrganizerSettings, String> {
-    if values.len() != 6 {
+    if values.len() != 8 {
         return Err("管家配置字段不完整".into());
     }
     let settings = OrganizerSettings {
@@ -206,7 +206,11 @@ pub fn parse_organizer_fields(values: &[String]) -> Result<OrganizerSettings, St
             .map_err(|_| "间隔请输入 30–3600 秒")?,
         batch_size: values[4].trim().parse().map_err(|_| "每批请输入 1–8 条")?,
         instructions: values[5].trim().into(),
-        ..OrganizerSettings::default()
+        memory_enabled: values[6] == "1",
+        max_rounds: values[7]
+            .trim()
+            .parse()
+            .map_err(|_| "Pi 最大轮次请输入 2–8")?,
     };
     settings.validate()?;
     Ok(settings)
@@ -295,6 +299,12 @@ impl ReviewState {
                 alias: p.alias.clone().unwrap_or_else(|| "保留原别名".into()),
                 tags: p.tags.join("、"),
             })
+            .chain(self.snapshot.attention.iter().map(|a| ReviewRow {
+                source: a.source.clone(),
+                title: a.title.clone(),
+                alias: "需处理".into(),
+                tags: a.message.clone(),
+            }))
             .collect()
     }
     fn id(&mut self) -> u64 {
@@ -390,7 +400,7 @@ impl ReviewState {
     }
     pub fn detail_target(&self) -> Option<&Result<String, String>> {
         let index = self.selected_index()?;
-        let p = &self.snapshot.proposals[index];
+        let p = self.snapshot.proposals.get(index)?;
         self.detail
             .as_ref()
             .filter(|(source, version, _)| {
@@ -399,23 +409,21 @@ impl ReviewState {
             .map(|(_, _, result)| result)
     }
     pub fn select(&mut self, index: Option<usize>) {
-        self.selected_source = index
-            .and_then(|i| self.snapshot.proposals.get(i))
-            .map(|p| p.candidate.source.clone());
+        self.selected_source =
+            index.and_then(|i| self.list_rows().get(i).map(|r| r.source.clone()));
     }
     pub fn selected_index(&self) -> Option<usize> {
-        self.snapshot
-            .proposals
+        self.list_rows()
             .iter()
-            .position(|p| Some(&p.candidate.source) == self.selected_source.as_ref())
+            .position(|p| Some(&p.source) == self.selected_source.as_ref())
     }
     pub fn selected(&self) -> Option<Proposal> {
         self.selected_index()
-            .map(|i| self.snapshot.proposals[i].clone())
+            .and_then(|i| self.snapshot.proposals.get(i).cloned())
     }
     pub fn editor_text(&self) -> Option<(String, String)> {
         let index = self.selected_index()?;
-        let p = &self.snapshot.proposals[index];
+        let p = self.snapshot.proposals.get(index)?;
         Some(if let Some(draft) = self.drafts.get(&p.candidate.source) {
             (draft.alias.clone(), draft.tags.clone())
         } else {
@@ -444,8 +452,8 @@ impl ReviewState {
         p
     }
     pub fn edit(&mut self, alias: String, tags: String) {
-        if let Some(index) = self.selected_index() {
-            let candidate = &self.snapshot.proposals[index].candidate;
+        if let Some(p) = self.selected() {
+            let candidate = &p.candidate;
             self.edit_for(
                 candidate.source.clone(),
                 candidate.expected_version.clone(),
@@ -589,7 +597,7 @@ impl ReviewState {
     fn live_status(&self, enabled: bool) -> String {
         let s = &self.snapshot;
         if s.paused {
-            return "连续失败，已暂停；可点击重试".into();
+            return "整理已暂停，请检查下方原因；修复后可点击重试".into();
         }
         if s.retry_at_ms.is_some() {
             return format!("接口失败 {} 次，正在冷却；可点击重试", s.failures);
@@ -607,6 +615,12 @@ impl ReviewState {
                 s.queued
             );
         }
+        if !s.attention.is_empty() && s.proposals.is_empty() && s.queued == 0 {
+            return format!(
+                "需处理 {} 条；可选中反馈并重做，或点击重试",
+                s.attention.len()
+            );
+        }
         if s.proposals.is_empty() && s.queued == 0 {
             return if enabled {
                 "暂无建议；启用后的新内容会在后台整理"
@@ -622,4 +636,166 @@ impl ReviewState {
             if enabled { "" } else { "；管家已关闭" }
         )
     }
+}
+
+/// Correlated native memory operations retain the exact submitted input for save retry.
+#[derive(Default)]
+pub struct MemoryUiState {
+    pub snapshot: crate::harness_tools::MemorySnapshot,
+    pub message: String,
+    pub revision: u64,
+    pub pending: Option<crate::model::Command>,
+    pub saving: bool,
+    pub pending_save: bool,
+    pub raw_input: String,
+    snapshot_request: Option<u64>,
+}
+/// RandomState uses the platform's random seed; time/PID/sequence avoid counter reuse.
+/// IDs are process-independent because human receipts survive application restarts.
+pub fn memory_request_id() -> u64 {
+    use std::{
+        hash::{BuildHasher, Hasher},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    h.write_u32(std::process::id());
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+    );
+    h.finish().max(1)
+}
+impl MemoryUiState {
+    pub fn request_snapshot(&mut self) -> Option<crate::model::Command> {
+        if self.snapshot_request.is_some() {
+            return None;
+        }
+        let request_id = memory_request_id();
+        self.snapshot_request = Some(request_id);
+        Some(crate::model::Command::HarnessMemorySnapshot { request_id })
+    }
+    pub fn adopt(&mut self, request_id: u64, snapshot: crate::harness_tools::MemorySnapshot) {
+        if self.snapshot_request == Some(request_id) {
+            self.snapshot_request = None;
+            self.snapshot = snapshot;
+            self.revision += 1;
+        }
+    }
+    pub fn submit(
+        &mut self,
+        command: crate::model::Command,
+    ) -> Result<crate::model::Command, String> {
+        if self.saving || self.pending_save {
+            return Err("请先完成当前操作的保存重试".into());
+        }
+        self.pending = Some(command.clone());
+        self.saving = true;
+        self.message = "正在保存…".into();
+        self.revision += 1;
+        Ok(command)
+    }
+    pub fn retry(&mut self) -> Option<crate::model::Command> {
+        if self.saving {
+            return None;
+        }
+        let command = self.pending.clone()?;
+        self.saving = true;
+        self.message = "正在重试保存…".into();
+        self.revision += 1;
+        Some(command)
+    }
+    pub fn receipt(&mut self, id: u64, result: Result<(), String>, pending_save: bool) -> bool {
+        let expected = self.pending.as_ref().and_then(|c| match c {
+            crate::model::Command::HarnessFeedback { request_id, .. }
+            | crate::model::Command::HarnessMemoryEdit { request_id, .. }
+            | crate::model::Command::HarnessMemoryDelete { request_id, .. } => Some(*request_id),
+            _ => None,
+        });
+        if expected != Some(id) {
+            return false;
+        }
+        self.saving = false;
+        self.pending_save = pending_save;
+        self.message = match result {
+            Ok(()) if !pending_save => {
+                self.pending = None;
+                self.raw_input.clear();
+                "已保存".into()
+            }
+            Ok(()) => "尚未落盘，请重试保存".into(),
+            Err(message) => format!("未保存：{message}；输入已保留"),
+        };
+        self.revision += 1;
+        true
+    }
+}
+impl ReviewState {
+    pub fn feedback_target(&self) -> Option<(String, crate::harness_tools::FeedbackTarget)> {
+        let source = self.selected_source.as_ref()?;
+        if let Some(p) = self
+            .snapshot
+            .proposals
+            .iter()
+            .find(|p| &p.candidate.source == source)
+        {
+            return Some((
+                p.candidate.title.clone(),
+                crate::harness_tools::FeedbackTarget {
+                    source: source.clone(),
+                    expected_version: p.candidate.expected_version.clone(),
+                    rejected_alias: p.alias.clone(),
+                },
+            ));
+        }
+        self.snapshot
+            .attention
+            .iter()
+            .find(|a| &a.source == source)
+            .map(|a| {
+                (
+                    a.title.clone(),
+                    crate::harness_tools::FeedbackTarget {
+                        source: source.clone(),
+                        expected_version: a.expected_version.clone(),
+                        rejected_alias: None,
+                    },
+                )
+            })
+    }
+}
+
+pub fn memory_text(raw: &str) -> String {
+    raw.trim().replace(['\r', '\n', '\t'], " ")
+}
+pub fn displayed_feedback(
+    snapshot: &Snapshot,
+) -> Vec<(String, crate::harness_tools::FeedbackTarget)> {
+    snapshot
+        .proposals
+        .iter()
+        .map(|p| {
+            (
+                p.candidate.title.clone(),
+                crate::harness_tools::FeedbackTarget {
+                    source: p.candidate.source.clone(),
+                    expected_version: p.candidate.expected_version.clone(),
+                    rejected_alias: p.alias.clone(),
+                },
+            )
+        })
+        .chain(snapshot.attention.iter().map(|a| {
+            (
+                a.title.clone(),
+                crate::harness_tools::FeedbackTarget {
+                    source: a.source.clone(),
+                    expected_version: a.expected_version.clone(),
+                    rejected_alias: None,
+                },
+            )
+        }))
+        .collect()
 }

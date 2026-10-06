@@ -8,6 +8,7 @@ use crate::{
     connection_test::{CredentialSource, credential_source},
     model::{Scope, Settings},
     organizer::{self, Proposal, Work},
+    pi_harness::{ModelRequest, ModelResponse, ToolError},
 };
 use std::{
     ffi::c_void,
@@ -174,17 +175,29 @@ impl Drop for HeaderBuffer {
     }
 }
 
+fn local_error(code: &str, message: &str) -> ToolError {
+    ToolError::new(code, message, false)
+}
+fn transport_error(err: windows::core::Error) -> ToolError {
+    // Only recognized WinHTTP connectivity failures enter organizer backoff.
+    let code = err.code().0 as u32 & 0xffff;
+    if matches!(code, 12002 | 12007 | 12029 | 12030 | 12031 | 12032) {
+        ToolError::new("TRANSIENT_NETWORK", "网络连接失败或超时，将稍后重试", true)
+    } else {
+        local_error("transport", "网络请求失败，请检查 API 地址和系统网络设置")
+    }
+}
 struct InternetHandle(*mut c_void);
 impl InternetHandle {
-    fn new(pointer: *mut c_void) -> Result<Self, String> {
+    fn new(pointer: *mut c_void) -> Result<Self, ToolError> {
         if pointer.is_null() {
-            Err("无法初始化 AI 网络连接".into())
+            Err(local_error("transport", "无法初始化 AI 网络连接"))
         } else {
             Ok(Self(pointer))
         }
     }
 
-    fn set_u32(&self, option: u32, value: u32) -> Result<(), String> {
+    fn set_u32(&self, option: u32, value: u32) -> Result<(), ToolError> {
         unsafe {
             WinHttpSetOption(
                 Some(self.0.cast_const()),
@@ -192,13 +205,17 @@ impl InternetHandle {
                 Some(&value.to_ne_bytes()),
             )
         }
-        .map_err(|_| "无法设置 AI 网络请求选项".into())
+        .map_err(|_| local_error("configuration", "无法设置 AI 网络请求选项"))
     }
 
-    fn timeouts(&self, deadline: Instant) -> Result<(), String> {
+    fn timeouts(&self, deadline: Instant) -> Result<(), ToolError> {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("AI 请求超时，请稍后重试".into());
+            return Err(ToolError::new(
+                "TRANSIENT_NETWORK",
+                "AI 请求超时，请稍后重试",
+                true,
+            ));
         }
         // 0 means infinite in WinHTTP, so even the final sub-millisecond interval is 1 ms.
         let cap = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
@@ -211,7 +228,7 @@ impl InternetHandle {
                 IO_TIMEOUT_MS.min(cap),
             )
         }
-        .map_err(|_| "无法设置 AI 请求超时".into())
+        .map_err(|_| local_error("configuration", "无法设置 AI 请求超时"))
     }
 }
 impl Drop for InternetHandle {
@@ -226,7 +243,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
-fn query_number(handle: &InternetHandle, kind: u32) -> Result<u32, String> {
+fn query_number(handle: &InternetHandle, kind: u32) -> Result<u32, ToolError> {
     let mut number = 0u32;
     let mut length = size_of::<u32>() as u32;
     unsafe {
@@ -239,7 +256,7 @@ fn query_number(handle: &InternetHandle, kind: u32) -> Result<u32, String> {
             ptr::null_mut(),
         )
     }
-    .map_err(|_| "AI 返回了无效的 HTTP 响应".to_owned())?;
+    .map_err(|_| local_error("protocol", "AI 返回了无效的 HTTP 响应"))?;
     Ok(number)
 }
 
@@ -269,6 +286,16 @@ fn exchange_at(
     method: HttpMethod,
     deadline: Instant,
 ) -> Result<(u16, Vec<u8>), String> {
+    exchange_typed_at(request, response_limit, oversize, method, deadline).map_err(|e| e.message)
+}
+
+fn exchange_typed_at(
+    request: &HttpRequest,
+    response_limit: usize,
+    oversize: &str,
+    method: HttpMethod,
+    deadline: Instant,
+) -> Result<(u16, Vec<u8>), ToolError> {
     let endpoint = &request.endpoint;
     // A loopback endpoint must stay local, even if the current user configured a proxy.
     let access = if endpoint.host.eq_ignore_ascii_case("localhost")
@@ -335,9 +362,10 @@ fn exchange_at(
                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
             )
         }
-        .map_err(|_| "无法设置 AI 请求头".to_owned())?;
+        .map_err(|_| local_error("configuration", "无法设置 AI 请求头"))?;
     }
-    let length = u32::try_from(request.body.len()).map_err(|_| "AI 请求内容过大".to_owned())?;
+    let length = u32::try_from(request.body.len())
+        .map_err(|_| local_error("request_limit", "AI 请求内容过大"))?;
     handle.timeouts(deadline)?;
     // Exactly one attempt per explicit request/page, without resend/status retries.
     unsafe {
@@ -354,19 +382,19 @@ fn exchange_at(
             0,
         )
     }
-    .map_err(|_| "AI 请求发送失败，请检查网络、API 地址和凭据".to_owned())?;
+    .map_err(transport_error)?;
     handle.timeouts(deadline)?;
-    unsafe { WinHttpReceiveResponse(handle.0, ptr::null_mut()) }
-        .map_err(|_| "未能接收 AI 响应，请检查网络或稍后重试".to_owned())?;
+    unsafe { WinHttpReceiveResponse(handle.0, ptr::null_mut()) }.map_err(transport_error)?;
     let status = query_number(&handle, WINHTTP_QUERY_STATUS_CODE)?;
-    let status = u16::try_from(status).map_err(|_| "AI 返回了无效的 HTTP 状态".to_owned())?;
+    let status =
+        u16::try_from(status).map_err(|_| local_error("protocol", "AI 返回了无效的 HTTP 状态"))?;
     if !(200..300).contains(&status) {
         // HTTP status is enough for our redacted error; never drain/display an error body.
         return Ok((status, Vec::new()));
     }
     let declared_size = query_number(&handle, WINHTTP_QUERY_CONTENT_LENGTH).ok();
     if declared_size.is_some_and(|size| size as usize > response_limit) {
-        return Err(oversize.into());
+        return Err(local_error("response_limit", oversize));
     }
     let mut body = Vec::with_capacity(declared_size.unwrap_or(0) as usize);
     let mut buffer = [0u8; 8192];
@@ -383,17 +411,17 @@ fn exchange_at(
                 &mut count,
             )
         }
-        .map_err(|_| "AI 响应读取失败或超时，请稍后重试".to_owned())?;
+        .map_err(transport_error)?;
         if count == 0 {
             break;
         }
         if count as usize > wanted || body.len() + count as usize > response_limit {
-            return Err(oversize.into());
+            return Err(local_error("response_limit", oversize));
         }
         body.extend_from_slice(&buffer[..count as usize]);
     }
     if declared_size.is_some_and(|size| size as usize != body.len()) {
-        return Err("AI 响应不完整，请稍后重试".into());
+        return Err(local_error("protocol", "AI 响应不完整，请稍后重试"));
     }
     Ok((status, body))
 }
@@ -417,6 +445,26 @@ pub fn interpret(
     }
     let key = SecretString(unprotect_key(&settings.encrypted_key)?);
     interpret_with_key(settings, key, query, scope, functions)
+}
+
+/// Pi transport is called only on the occupied process worker thread.
+pub fn harness_model(work: &Work, request: ModelRequest) -> Result<ModelResponse, ToolError> {
+    let key = SecretString(
+        unprotect_key(&work.ai_settings.encrypted_key)
+            .map_err(|_| local_error("AUTH", "无法读取 API Key，请重新配置"))?,
+    );
+    let request = SensitiveRequest(crate::harness_worker::prepare_model(
+        work, &key.0, &request,
+    )?);
+    drop(key);
+    let (status, body) = exchange_typed_at(
+        &request.0,
+        crate::pi_harness::MAX_LLM_RESPONSE_BYTES,
+        "模型响应超过 64 KiB",
+        HttpMethod::Post,
+        Instant::now() + REQUEST_BUDGET,
+    )?;
+    crate::harness_worker::normalize_model(status, &body)
 }
 
 /// One bounded metadata-only POST using the actor's exact revocable snapshot.

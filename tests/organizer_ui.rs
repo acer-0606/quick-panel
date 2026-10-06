@@ -221,11 +221,16 @@ fn capability_guidance_only_rejects_service_reported_unsupported_effort() {
 // Parsing should reject a mode typo and oversized local inputs before any actor/network work.
 #[test]
 fn organizer_form_is_validated_and_does_not_silently_enable() {
-    let mut values = ["0", "1", "2", "60", "4", "按项目分类"].map(str::to_owned);
+    let mut values = ["0", "1", "2", "60", "4", "按项目分类", "1", "4"].map(str::to_owned);
     let settings = parse_organizer_fields(&values).unwrap();
     assert!(!settings.enabled);
     assert_eq!(settings.mode, OrganizerMode::Automatic);
     assert_eq!(settings.scope, OrganizerScope::PathsOnly);
+    values[6] = "0".into();
+    values[7] = "7".into();
+    let changed = parse_organizer_fields(&values).unwrap();
+    assert!(!changed.memory_enabled);
+    assert_eq!(changed.max_rounds, 7);
     values[3] = "29".into();
     assert!(parse_organizer_fields(&values).is_err());
     values[3] = "60".into();
@@ -613,4 +618,81 @@ fn editor_refresh_defers_empty_ime_composition_until_all_editors_end() {
     assert!(!gate.replace(Some(&b), false));
     gate.composition(1, false);
     assert!(gate.replace(Some(&b), false));
+}
+
+#[test]
+fn memory_receipt_keeps_same_input_retry_and_rejects_stale_receipts() {
+    use quick_panel::{
+        harness_tools::{MemoryEdit, MemoryScope},
+        model::Command,
+    };
+    let mut state = MemoryUiState::default();
+    let id = memory_request_id();
+    let command = Command::HarnessMemoryEdit {
+        request_id: id,
+        input: MemoryEdit {
+            id: Some(5),
+            scope: MemoryScope::Global,
+            text: "保留项目名".into(),
+            enabled: true,
+            confirmed: true,
+        },
+    };
+    state.submit(command).unwrap();
+    assert!(!state.receipt(id + 1, Ok(()), false));
+    assert!(state.saving);
+    assert!(state.receipt(id, Err("磁盘不可写".into()), true));
+    assert!(!state.message.contains("已保存"));
+    let Command::HarnessMemoryEdit { request_id, input } = state.retry().unwrap() else {
+        panic!()
+    };
+    assert_eq!(request_id, id);
+    assert_eq!(input.text, "保留项目名");
+    assert!(state.receipt(id, Ok(()), false));
+    assert!(state.pending.is_none());
+    let independent: std::collections::HashSet<_> = (0..256).map(|_| memory_request_id()).collect();
+    assert_eq!(independent.len(), 256);
+}
+#[test]
+fn memory_multiline_input_is_explicitly_normalized_without_losing_raw_draft() {
+    let raw = "  保留项目名\r\n\t不要用日期  ";
+    assert_eq!(memory_text(raw), "保留项目名   不要用日期");
+    assert_eq!(raw, "  保留项目名\r\n\t不要用日期  ");
+}
+#[test]
+fn feedback_captures_displayed_version_and_alias_before_new_snapshot() {
+    let mut snapshot = Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    };
+    let displayed = displayed_feedback(&snapshot);
+    let old_alias = snapshot.proposals[0].alias.clone();
+    let old_version = snapshot.proposals[0].candidate.expected_version.clone();
+    snapshot.proposals[0].alias = Some("新建议".into());
+    snapshot.proposals[0].candidate.expected_version = "new-version".into();
+    assert_eq!(displayed[0].1.rejected_alias, old_alias);
+    assert_eq!(displayed[0].1.expected_version, old_version);
+    assert_ne!(displayed, displayed_feedback(&snapshot));
+}
+#[test]
+fn attention_rows_remain_non_applicable_and_status_explains_local_recovery() {
+    let mut state = ReviewState::default();
+    state
+        .snapshot
+        .attention
+        .push(quick_panel::harness_tools::Attention {
+            title: "合成来源".into(),
+            source: Source::SavedItem {
+                id: "synthetic".into(),
+            },
+            expected_version: "seen".into(),
+            code: "round_limit".into(),
+            message: "已达到模型轮次上限".into(),
+        });
+    state.select(Some(0));
+    state.check(0, true);
+    assert!(state.selected().is_none());
+    assert!(state.begin_decision(false).is_err());
+    assert_eq!(state.feedback_target().unwrap().1.rejected_alias, None);
+    assert!(state.status(true).contains("需处理"));
 }

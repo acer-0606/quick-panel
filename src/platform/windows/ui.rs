@@ -280,6 +280,12 @@ enum UiEffect {
         owner: HWND,
         settings: crate::organizer::OrganizerSettings,
     },
+    HarnessMemory {
+        owner: HWND,
+        state: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
+        outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
+        appearance: Theme,
+    },
     OrganizerReview {
         owner: HWND,
         state: Rc<RefCell<crate::organizer_ui::ReviewState>>,
@@ -439,10 +445,8 @@ impl Drop for WindowGuard {
         }
     }
 }
-type OrganizerWorker = crate::connection_test::ConnectionTestWorker<
-    crate::organizer::Work,
-    (u64, Result<Vec<crate::organizer::Proposal>, String>),
->;
+type OrganizerWorker = crate::harness_worker::HarnessWorker;
+pub(super) const PI_HEALTH_WAKE: u32 = WM_APP + 81;
 struct App {
     organizer_progress: crate::organizer_display::ProgressCache,
     organizer_label: HWND,
@@ -453,6 +457,8 @@ struct App {
     organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
     organizer_page_open: bool,
+    harness_memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
+    runtime_health: Arc<std::sync::Mutex<String>>,
     host: *const Host,
     effects: VecDeque<UiEffect>,
     hotkey_bindings: HotkeyBindings,
@@ -579,6 +585,8 @@ pub fn run() -> Result<(), String> {
             organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
             organizer_outbox: Rc::new(RefCell::new((None, None))),
             organizer_page_open: false,
+            harness_memory: Rc::new(RefCell::new(Default::default())),
+            runtime_health: Arc::new(std::sync::Mutex::new("启动测试不调用模型".into())),
             host: std::ptr::null(),
             effects: VecDeque::new(),
             hotkey_bindings: HotkeyBindings::default(),
@@ -904,12 +912,12 @@ impl App {
         }
     }
     fn cancel_organizer_for_settings(&mut self, next: &Settings) {
-        if let Some(id) = self
+        if let Some(_id) = self
             .organizer_session
             .settings_changed(&self.settings, next)
             && let Some(worker) = &self.organizer_worker
         {
-            worker.cancel(id);
+            worker.cancel();
         }
     }
     fn organizer_snapshot(&self) {
@@ -940,22 +948,37 @@ impl App {
         {
             return;
         }
+        self.ensure_harness_worker();
+        let token = work.token;
+        match self.organizer_worker.as_ref().unwrap().start(work) {
+            Ok(()) => self.organizer_session.begin(token, token),
+            Err(message) => self.send(Command::HarnessFailed {
+                token,
+                code: "RUNTIME_UNAVAILABLE".into(),
+                message,
+                retryable: false,
+            }),
+        }
+    }
+    fn ensure_harness_worker(&mut self) {
+        if self
+            .organizer_worker
+            .as_ref()
+            .is_some_and(|worker| worker.retired_and_idle())
+        {
+            self.organizer_worker = None;
+        }
         if self.organizer_worker.is_none() {
             let address = self.hwnd.0 as usize;
-            self.organizer_worker = Some(crate::organizer_ui::request_worker(
-                |work: crate::organizer::Work| {
-                    let settings = Settings {
-                        ai: work.ai_settings.clone(),
-                        organizer: work.organizer_settings.clone(),
-                        ..Settings::default()
-                    };
-                    let token = work.token;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        ai_client::organize(&settings, &work)
-                    }))
-                    .unwrap_or_else(|_| Err("后台整理请求失败，可稍后重试".into()));
-                    Ok((token, result))
-                },
+            let paths = crate::harness_worker::RuntimePaths::bundled().unwrap_or_else(|_| {
+                crate::harness_worker::RuntimePaths {
+                    node: Default::default(),
+                    module: Default::default(),
+                }
+            });
+            self.organizer_worker = Some(OrganizerWorker::new(
+                paths,
+                ai_client::harness_model,
                 Arc::new(move || unsafe {
                     let _ = PostMessageW(
                         Some(HWND(address as *mut _)),
@@ -966,14 +989,21 @@ impl App {
                 }),
             ));
         }
-        let token = work.token;
-        match self.organizer_worker.as_ref().unwrap().submit(work) {
-            Ok(id) => self.organizer_session.begin(id, token),
-            Err(_) => self.send(Command::OrganizerComplete {
-                token,
-                result: Err("上一次后台请求仍未结束".into()),
-            }),
+    }
+    fn memory_snapshot(&self) {
+        let command = self.harness_memory.borrow_mut().request_snapshot();
+        if let Some(command) = command {
+            self.send(command);
         }
+    }
+    unsafe fn show_harness_memory(&mut self) {
+        self.memory_snapshot();
+        self.effects.push_back(UiEffect::HarnessMemory {
+            owner: self.hwnd,
+            state: self.harness_memory.clone(),
+            outbox: self.organizer_outbox.clone(),
+            appearance: self.settings.theme,
+        });
     }
     unsafe fn organizer_settings(&mut self) {
         self.effects.push_back(UiEffect::OrganizerSettings {
@@ -2250,22 +2280,26 @@ impl App {
         }
     }
     unsafe fn work_done(&mut self) {
-        if let Some(completion) = self
-            .organizer_worker
-            .as_ref()
-            .and_then(|worker| worker.try_result())
-            && self.state.lifecycle == Lifecycle::Running
-            && let Some(token) = self.organizer_session.finish(completion.id)
-        {
-            match completion.result {
-                Ok((token, result)) => self.send(Command::OrganizerComplete { token, result }),
-                Err(message) => {
-                    self.organizer_review.borrow_mut().message = message;
-                    self.organizer_review.borrow_mut().revision += 1;
-                    self.send(Command::OrganizerComplete {
-                        token,
-                        result: Err("后台请求失败，可稍后重试".into()),
-                    });
+        while let Some(output) = self.organizer_worker.as_ref().and_then(|w| w.take()) {
+            if self.state.lifecycle != Lifecycle::Running {
+                continue;
+            }
+            match output {
+                crate::harness_worker::Output::Actor(command) => {
+                    let terminal = match &command {
+                        Command::OrganizerComplete { token, .. }
+                        | Command::HarnessFailed { token, .. } => Some(*token),
+                        _ => None,
+                    };
+                    if terminal.is_none_or(|token| self.organizer_session.finish(token).is_some()) {
+                        self.send(command);
+                    }
+                }
+                crate::harness_worker::Output::Health(result) => {
+                    *self.runtime_health.lock().unwrap() = match result {
+                        Ok(()) => "Pi 运行时可用（未调用模型）".into(),
+                        Err(message) => message,
+                    };
                 }
             }
         }
@@ -2422,12 +2456,40 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
-                // Task2 compile compatibility; Task3 must route these correlated replies.
-                Event::HarnessContext { .. }
+                event @ (Event::HarnessContext { .. }
                 | Event::HarnessToolResult { .. }
-                | Event::HarnessFinished { .. }
-                | Event::HarnessMemoryState { .. }
-                | Event::HarnessMemoryReceipt { .. } => {}
+                | Event::HarnessFinished { .. }) => {
+                    if let Some(worker) = &self.organizer_worker {
+                        worker.reply(event);
+                    }
+                }
+                Event::HarnessMemoryState {
+                    request_id,
+                    snapshot,
+                } => {
+                    self.harness_memory.borrow_mut().adopt(request_id, snapshot);
+                }
+                Event::HarnessMemoryReceipt {
+                    request_id,
+                    result,
+                    pending_save,
+                } => {
+                    let admitted = result.is_ok() || pending_save;
+                    if self
+                        .harness_memory
+                        .borrow_mut()
+                        .receipt(request_id, result, pending_save)
+                    {
+                        if admitted {
+                            self.organizer_session.cancel();
+                            if let Some(worker) = &self.organizer_worker {
+                                worker.cancel();
+                            }
+                        }
+                        self.memory_snapshot();
+                        self.organizer_snapshot();
+                    }
+                }
                 Event::OrganizerProgress {
                     request_id,
                     progress,
@@ -3456,6 +3518,7 @@ impl App {
             Function::AiSettings => self.ai_settings(),
             Function::OrganizerSettings => self.organizer_settings(),
             Function::OrganizerReview => self.review_organizer(),
+            Function::HarnessMemory => self.show_harness_memory(),
             Function::AiSearch => self.begin_smart(Some(SmartSearchMode::Claude)),
             Function::EmbeddingSettings => self.embedding_settings(),
             Function::SemanticSearch => self.begin_smart(Some(SmartSearchMode::Semantic)),
@@ -3554,10 +3617,11 @@ impl App {
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
                 let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
-                if let Some(id) = self.organizer_session.cancel()
-                    && let Some(worker) = &self.organizer_worker
+                self.organizer_session.cancel();
+                if let Some(worker) = &self.organizer_worker
+                    && let Some(checkpoint) = worker.shutdown()
                 {
-                    worker.cancel(id);
+                    self.send(checkpoint);
                 }
                 self.screenshot_gate.close();
                 self.cancel_preflight();
@@ -3676,6 +3740,18 @@ unsafe fn app_message(
                     SendMessageW(app.edit, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
                 }
             }
+            return Some(LRESULT(0));
+        }
+        PI_HEALTH_WAKE => {
+            if app.state.lifecycle != Lifecycle::Running || app.organizer_tick_pending {
+                *app.runtime_health.lock().unwrap() = "正在调度或退出，请稍后测试".into();
+                return Some(LRESULT(0));
+            }
+            app.ensure_harness_worker();
+            let result = app.organizer_worker.as_ref().unwrap().health();
+            *app.runtime_health.lock().unwrap() = result
+                .err()
+                .unwrap_or_else(|| "正在启动 Pi（不调用模型）…".into());
             return Some(LRESULT(0));
         }
         ENGINE_WAKE => {
@@ -4356,12 +4432,14 @@ impl Host {
                             app.settings.path_activity.enabled,
                         )
                     };
+                    let runtime_health = self.app.borrow().runtime_health.clone();
                     let values = dialogs::organizer_settings_form(
                         owner,
                         &settings,
                         &ai,
                         path_enabled,
                         appearance,
+                        runtime_health,
                     );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
@@ -4385,6 +4463,29 @@ impl Host {
                         }
                     }
                 }
+                UiEffect::HarnessMemory {
+                    owner,
+                    state,
+                    outbox,
+                    appearance,
+                } => {
+                    let address = owner.0 as usize;
+                    super::harness_memory_ui::show(
+                        owner,
+                        state,
+                        Rc::new(move |command| {
+                            outbox.borrow_mut().0 = Some(command);
+                            let _ = PostMessageW(
+                                Some(HWND(address as *mut _)),
+                                ORGANIZER_UI_WAKE,
+                                WPARAM(0),
+                                LPARAM(0),
+                            );
+                        }),
+                        appearance,
+                    );
+                    self.app.borrow_mut().state.modal_open = false;
+                }
                 UiEffect::OrganizerReview {
                     owner,
                     state,
@@ -4393,9 +4494,11 @@ impl Host {
                     enabled,
                 } => {
                     let address = owner.0 as usize;
+                    let memory = self.app.borrow().harness_memory.clone();
                     organizer_ui::show(
                         owner,
                         state,
+                        memory,
                         Rc::new(move |command| {
                             let detail = matches!(command, Command::OrganizerDetail { .. });
                             let mut slot = outbox.borrow_mut();

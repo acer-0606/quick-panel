@@ -11,6 +11,7 @@ pub mod embedding_jobs;
 pub mod engine;
 mod harness_store;
 pub mod harness_tools;
+pub mod harness_worker;
 pub mod hotkeys;
 pub mod model;
 pub mod organizer;

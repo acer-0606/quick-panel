@@ -3,6 +3,7 @@ pub mod ai_client;
 mod ai_time;
 pub mod clipboard;
 mod dialogs;
+mod harness_memory_ui;
 pub mod images;
 mod organizer_ui;
 mod path_monitor;

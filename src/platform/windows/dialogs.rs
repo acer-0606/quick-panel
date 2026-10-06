@@ -149,6 +149,8 @@ enum TestForm {
     Organizer {
         ai: crate::ai::AiSettings,
         path_enabled: bool,
+        owner: usize,
+        health: Arc<std::sync::Mutex<String>>,
     },
 }
 struct TestRequest {
@@ -361,7 +363,20 @@ unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
     let (password_index, clear_index) = match config {
         TestForm::Ai(_) => (4, 5),
         TestForm::Embedding(_) => (3, 4),
-        TestForm::Organizer { .. } => return,
+        TestForm::Organizer {
+            owner, ref health, ..
+        } => {
+            *health.lock().unwrap() = "正在启动 Pi（不调用模型）…".into();
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(owner as *mut _)),
+                    super::ui::PI_HEALTH_WAKE,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            return;
+        }
     };
     // Password text enters an erasing owner immediately; no plain-text result vector is made.
     let key = ai_client::SecretString(unsafe { text(edits[password_index]) });
@@ -422,6 +437,19 @@ unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
 }
 
 unsafe fn poll_test(ptr: *const RefCell<Form>) {
+    let health = unsafe {
+        match &(*ptr).borrow().test {
+            Some(TestForm::Organizer { health, .. }) => Some(health.clone()),
+            _ => None,
+        }
+    };
+    if let Some(health) = health {
+        unsafe {
+            test_status(ptr, &health.lock().unwrap());
+        }
+        return;
+    }
+
     let done = unsafe { (*ptr).borrow().done };
     if done {
         return;
@@ -912,6 +940,7 @@ pub unsafe fn organizer_settings_form(
     ai: &crate::ai::AiSettings,
     path_enabled: bool,
     appearance: Theme,
+    health: Arc<std::sync::Mutex<String>>,
 ) -> Option<Vec<String>> {
     use crate::organizer::{OrganizerMode, OrganizerScope};
     unsafe {
@@ -950,10 +979,20 @@ pub unsafe fn organizer_settings_form(
                     "整理说明（最多 512 字符）",
                     Field::Multiline(settings.instructions.clone()),
                 ),
+                (
+                    "整理记忆",
+                    Field::Switch(settings.memory_enabled, "记住整理反馈"),
+                ),
+                (
+                    "Pi 最大模型轮次（2–8）",
+                    Field::Text(settings.max_rounds.to_string()),
+                ),
             ],
             Some(TestForm::Organizer {
                 ai: ai.clone(),
                 path_enabled,
+                owner: owner.0 as usize,
+                health,
             }),
             appearance,
         )
@@ -1020,7 +1059,7 @@ unsafe fn form_fields_with_test_theme(
             ..Default::default()
         };
         RegisterClassW(&wc);
-        let testing = matches!(test, Some(TestForm::Ai(_) | TestForm::Embedding(_)));
+        let testing = test.is_some();
         let validating = test.is_some();
         let model_listing = matches!(test, Some(TestForm::Ai(_)));
         let state = Box::new(RefCell::new(Form {
@@ -1349,6 +1388,10 @@ unsafe fn form_fields_with_test_theme(
                 None,
             )
             .ok()?;
+            if matches!(state.borrow().test, Some(TestForm::Organizer { .. })) {
+                let label = wide("测试 Pi 运行时");
+                let _ = SetWindowTextW(button, PCWSTR(label.as_ptr()));
+            }
             if !testing {
                 let _ = ShowWindow(button, SW_HIDE);
             }
@@ -1402,7 +1445,9 @@ unsafe fn form_fields_with_test_theme(
             let note = {
                 let form = state.borrow();
                 match &form.test {
-                    Some(TestForm::Organizer { ai, path_enabled }) => Some(format!(
+                    Some(TestForm::Organizer {
+                        ai, path_enabled, ..
+                    }) => Some(format!(
                         "{}{}",
                         crate::organizer_ui::organizer_config_warning(ai)
                             .unwrap_or_else(|| "复用 AI 设置；检索开关可保持关闭".into()),
@@ -1418,7 +1463,8 @@ unsafe fn form_fields_with_test_theme(
             if let Some(note) = note {
                 test_status(&*state, &note);
             }
-            let available = !TEST_WORKER.with(|worker| worker.busy());
+            let available = matches!(state.borrow().test, Some(TestForm::Organizer { .. }))
+                || !TEST_WORKER.with(|worker| worker.busy());
             let _ = EnableWindow(button, available);
             if testing && SetTimer(Some(hwnd), TEST_TIMER, 100, None) == 0 {
                 let _ = EnableWindow(button, false);

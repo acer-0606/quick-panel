@@ -664,3 +664,35 @@ fn organizer_disabled_changed_or_invalid_credentials_fail_before_post() {
     assert!(organize(&current, &work).is_err());
     assert!(matches!(listener.accept(),Err(error) if error.kind()==ErrorKind::WouldBlock));
 }
+
+#[test]
+fn pi_http_bridge_uses_exact_work_and_normalizes_signed_content() {
+    use quick_panel::{pi_harness::ModelRequest, platform::windows::ai_client::harness_model};
+    let raw = serde_json::json!({"id":"message-provider-id","usage":{"input_tokens":1},"content":[{"type":"thinking","thinking":"fixture","signature":"signed-fixture"},{"type":"redacted_thinking","data":"redacted-fixture"},{"type":"tool_use","id":"fixture-call","name":"items_get_context","input":{"index":0}}],"stop_reason":"tool_use"});
+    let (endpoint, server) = serve(response("200 OK", "", &serde_json::to_vec(&raw).unwrap()));
+    let mut config = settings(endpoint, AuthMethod::Bearer);
+    config.effort = Effort::High;
+    let work = Work {
+        token: 100,
+        ai_settings: config,
+        organizer_settings: OrganizerSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        candidates: vec![],
+    };
+    let request=ModelRequest{system:"fixture system".into(),messages:vec![serde_json::json!({"role":"user","content":[{"type":"text","text":"fixture"}]})],tools:["items_get_context","items_search","memory_recall","usage_get_summary","organizer_submit","memory_propose_rule"].into_iter().map(|name|serde_json::json!({"name":name,"description":"fixture","input_schema":{"type":"object"}})).collect(),max_tokens:4096};
+    let result = harness_model(&work, request.clone()).unwrap();
+    assert_eq!(result.content, raw["content"].as_array().unwrap().clone());
+    assert_eq!(result.stop_reason, "tool_use");
+    let posted = server.join().unwrap();
+    assert_eq!(
+        posted.headers["authorization"],
+        format!("Bearer {DUMMY_KEY}")
+    );
+    let body: Value = serde_json::from_slice(&posted.body).unwrap();
+    assert_eq!(body["model"], work.ai_settings.model);
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["tools"], serde_json::to_value(request.tools).unwrap());
+    assert_eq!(body["stream"], false);
+}

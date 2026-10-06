@@ -166,6 +166,7 @@ impl OrganizerStore {
                 .iter()
                 .filter_map(|r| match &r.status {
                     Status::Attention { code, message } => Some(crate::harness_tools::Attention {
+                        title: r.candidate.title.clone(),
                         source: r.candidate.source.clone(),
                         expected_version: r.candidate.expected_version.clone(),
                         code: code.clone(),

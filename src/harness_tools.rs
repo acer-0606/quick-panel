@@ -76,12 +76,14 @@ pub struct MemoryEdit {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemorySnapshot {
+    pub source_labels: Vec<(Source, String)>,
     pub version: u64,
     pub records: Vec<MemoryRecord>,
     pub storage_error: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attention {
+    pub title: String,
     pub source: Source,
     pub expected_version: String,
     pub code: String,

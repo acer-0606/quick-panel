@@ -72,7 +72,8 @@ fn preserve_form(s: &Settings, ai: bool) -> Settings {
         .unwrap();
     } else {
         saved.organizer =
-            parse_organizer_fields(&["1", "0", "3", "60", "4", ""].map(str::to_owned)).unwrap();
+            parse_organizer_fields(&["1", "0", "3", "60", "4", "", "1", "4"].map(str::to_owned))
+                .unwrap();
     }
     saved
 }
