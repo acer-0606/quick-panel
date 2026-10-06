@@ -3,9 +3,11 @@
 //! Call `interpret` from the bounded AI worker, never from the UI or SQLite actor.
 use crate::{
     ai::{AiPlan, AiSettings, FunctionDescriptor},
+    ai_models::{self, ModelInfo, ModelListing},
     claude::{HttpRequest, parse_response, prepare},
     connection_test::{CredentialSource, credential_source},
-    model::Scope,
+    model::{Scope, Settings},
+    organizer::{self, Proposal, Work},
 };
 use std::{
     ffi::c_void,
@@ -246,7 +248,27 @@ fn exchange(
     response_limit: usize,
     oversize: &str,
 ) -> Result<(u16, Vec<u8>), String> {
-    let deadline = Instant::now() + REQUEST_BUDGET;
+    exchange_at(
+        request,
+        response_limit,
+        oversize,
+        HttpMethod::Post,
+        Instant::now() + REQUEST_BUDGET,
+    )
+}
+
+enum HttpMethod {
+    Get,
+    Post,
+}
+
+fn exchange_at(
+    request: &HttpRequest,
+    response_limit: usize,
+    oversize: &str,
+    method: HttpMethod,
+    deadline: Instant,
+) -> Result<(u16, Vec<u8>), String> {
     let endpoint = &request.endpoint;
     // A loopback endpoint must stay local, even if the current user configured a proxy.
     let access = if endpoint.host.eq_ignore_ascii_case("localhost")
@@ -284,7 +306,10 @@ fn exchange(
     let handle = InternetHandle::new(unsafe {
         WinHttpOpenRequest(
             connection.0,
-            w!("POST"),
+            match method {
+                HttpMethod::Get => w!("GET"),
+                HttpMethod::Post => w!("POST"),
+            },
             PCWSTR(path.as_ptr()),
             w!("HTTP/1.1"),
             PCWSTR::null(),
@@ -314,12 +339,16 @@ fn exchange(
     }
     let length = u32::try_from(request.body.len()).map_err(|_| "AI 请求内容过大".to_owned())?;
     handle.timeouts(deadline)?;
-    // Exactly one POST attempt. In particular, no RESEND_REQUEST/429/503 retry loop.
+    // Exactly one attempt per explicit request/page, without resend/status retries.
     unsafe {
         WinHttpSendRequest(
             handle.0,
             None,
-            Some(request.body.as_ptr().cast()),
+            if request.body.is_empty() {
+                None
+            } else {
+                Some(request.body.as_ptr().cast())
+            },
             length,
             length,
             0,
@@ -388,6 +417,66 @@ pub fn interpret(
     }
     let key = SecretString(unprotect_key(&settings.encrypted_key)?);
     interpret_with_key(settings, key, query, scope, functions)
+}
+
+/// One bounded metadata-only POST using the actor's exact revocable snapshot.
+/// Search enablement is independent; the organizer switch is required.
+pub fn organize(settings: &Settings, work: &Work) -> Result<Vec<Proposal>, String> {
+    if !settings.organizer.enabled || !work.organizer_settings.enabled {
+        return Err("AI 管家尚未启用".into());
+    }
+    if settings.ai != work.ai_settings || settings.organizer != work.organizer_settings {
+        return Err("管家配置已变化，请使用新的整理任务".into());
+    }
+    let key = SecretString(unprotect_key(&work.ai_settings.encrypted_key)?);
+    let request = SensitiveRequest(organizer::prepare(
+        &work.ai_settings,
+        &key.0,
+        &work.organizer_settings,
+        &work.candidates,
+    )?);
+    drop(key);
+    let (status, body) = exchange(
+        &request.0,
+        organizer::MAX_RESPONSE_BYTES,
+        "整理响应超过 64 KiB，已停止读取",
+    )?;
+    organizer::parse_response(status, &body, &work.candidates)
+}
+
+/// Explicit model discovery using entered or saved credentials, without saving
+/// configuration, requiring a model ID, or sending a Messages inference request.
+pub fn list_models(
+    settings: &AiSettings,
+    entered_key: String,
+    clear_key: bool,
+) -> Result<Vec<ModelInfo>, String> {
+    list_models_with_key(settings, SecretString(entered_key), clear_key)
+}
+
+pub(crate) fn list_models_with_key(
+    settings: &AiSettings,
+    entered_key: SecretString,
+    clear_key: bool,
+) -> Result<Vec<ModelInfo>, String> {
+    let key = connection_test_key(entered_key, clear_key, &settings.encrypted_key)?;
+    let deadline = Instant::now() + REQUEST_BUDGET;
+    let mut listing = ModelListing::default();
+    let mut cursor: Option<String> = None;
+    loop {
+        let request = SensitiveRequest(ai_models::prepare(settings, &key.0, cursor.as_deref())?);
+        let (status, body) = exchange_at(
+            &request.0,
+            ai_models::MAX_RESPONSE_BYTES,
+            "模型列表响应超过 256 KiB，已停止读取",
+            HttpMethod::Get,
+            deadline,
+        )?;
+        cursor = listing.push_page(ai_models::parse_page(status, &body)?)?;
+        if cursor.is_none() {
+            return Ok(listing.into_models());
+        }
+    }
 }
 
 fn interpret_with_key(

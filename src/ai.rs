@@ -11,6 +11,31 @@ pub enum AuthMethod {
     Bearer,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effort {
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh", alias = "x_high")]
+    XHigh,
+    Max,
+}
+impl Effort {
+    pub fn wire_name(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::XHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AiSettings {
@@ -18,6 +43,7 @@ pub struct AiSettings {
     pub endpoint: String,
     pub model: String,
     pub auth: AuthMethod,
+    pub effort: Effort,
     pub encrypted_key: Vec<u8>,
 }
 impl Default for AiSettings {
@@ -27,6 +53,7 @@ impl Default for AiSettings {
             endpoint: "https://api.anthropic.com".into(),
             model: String::new(),
             auth: AuthMethod::ApiKey,
+            effort: Effort::Default,
             encrypted_key: Vec::new(),
         }
     }
@@ -38,6 +65,7 @@ impl fmt::Debug for AiSettings {
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("auth", &self.auth)
+            .field("effort", &self.effort)
             .field("encrypted_key", &"<protected>")
             .finish()
     }

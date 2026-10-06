@@ -90,6 +90,8 @@ pub(crate) fn parse_endpoint_for(address: &str, resource: &str) -> Result<Endpoi
     let suffix = format!("/v1/{resource}");
     let path = if path.ends_with(&suffix) {
         path
+    } else if let Some(prefix) = path.strip_suffix("/v1/messages") {
+        format!("{prefix}{suffix}")
     } else if path.ends_with("/v1") {
         format!("{path}/{resource}")
     } else {
@@ -179,16 +181,6 @@ pub fn prepare(
     if !settings.enabled {
         return Err("请先启用 AI 检索".into());
     }
-    if key.is_empty() || key.len() > 4096 || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
-    {
-        return Err("API 密钥无效".into());
-    }
-    if settings.model.trim().is_empty()
-        || settings.model.chars().count() > 256
-        || settings.model.chars().any(char::is_control)
-    {
-        return Err("AI 模型 ID 无效".into());
-    }
     if query.trim().is_empty()
         || query.chars().count() > 2048
         || query
@@ -198,18 +190,57 @@ pub fn prepare(
         return Err("检索描述为空、过长或含无效字符".into());
     }
     validate_catalogue(functions)?;
-    let endpoint = parse_endpoint(&settings.endpoint)?;
     let payload = json!({"query":query,"scope":scope_name(scope),"functions":functions});
-    let body = serde_json::to_vec(&json!({
+    prepare_messages(settings, key, SYSTEM, payload, 768)
+}
+
+/// Shared Messages builder. Feature-specific enablement and input validation are
+/// performed by the caller; credentials, endpoint and effort share one contract.
+pub(crate) fn prepare_messages(
+    settings: &AiSettings,
+    key: &str,
+    system: &str,
+    payload: serde_json::Value,
+    max_tokens: u32,
+) -> Result<HttpRequest, String> {
+    if settings.model.trim().is_empty()
+        || settings.model.chars().count() > 256
+        || settings
+            .model
+            .chars()
+            .any(|character| character.is_control() || is_bidi(character))
+    {
+        return Err("AI 模型 ID 无效".into());
+    }
+    let endpoint = parse_endpoint(&settings.endpoint)?;
+    let mut envelope = json!({
         "model":settings.model,
-        "max_tokens":768,
+        "max_tokens":max_tokens,
         "stream":false,
-        "system":SYSTEM,
+        "system":system,
         "messages":[{"role":"user","content":payload.to_string()}]
-    }))
-    .map_err(|_| "无法准备 AI 检索请求")?;
+    });
+    if let Some(effort) = settings.effort.wire_name() {
+        envelope["output_config"] = json!({"effort":effort});
+    }
+    let body = serde_json::to_vec(&envelope).map_err(|_| "无法准备 AI 请求")?;
     if body.len() > MAX_REQUEST_BYTES {
-        return Err("AI 检索请求过大".into());
+        return Err("AI 请求过大".into());
+    }
+    Ok(HttpRequest {
+        endpoint,
+        headers: request_headers(settings, key)?,
+        body,
+    })
+}
+
+pub(crate) fn request_headers(
+    settings: &AiSettings,
+    key: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if key.is_empty() || key.len() > 4096 || !key.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err("API 密钥无效".into());
     }
     let mut headers = vec![
         ("Content-Type".into(), "application/json".into()),
@@ -219,11 +250,7 @@ pub fn prepare(
         AuthMethod::ApiKey => ("x-api-key".into(), key.to_owned()),
         AuthMethod::Bearer => ("Authorization".into(), format!("Bearer {key}")),
     });
-    Ok(HttpRequest {
-        endpoint,
-        headers,
-        body,
-    })
+    Ok(headers)
 }
 
 fn validate_catalogue(functions: &[FunctionDescriptor]) -> Result<(), String> {
@@ -260,41 +287,8 @@ pub fn parse_response(
     response: &[u8],
     functions: &[FunctionDescriptor],
 ) -> Result<AiPlan, String> {
-    if status != 200 {
-        return Err(match status {
-            401 | 403 => "AI API 认证失败，请检查密钥和权限",
-            404 => "AI API 地址或模型不存在，请检查配置",
-            429 => "AI API 请求过于频繁，请稍后再试",
-            500..=599 => "AI API 服务暂时不可用，请稍后再试",
-            _ => "AI API 请求失败，请检查配置",
-        }
-        .into());
-    }
-    if response.len() > MAX_RESPONSE_BYTES {
-        return Err("AI API 响应过大，请调整描述后重试".into());
-    }
     validate_catalogue(functions)?;
-    let envelope: serde_json::Value = serde_json::from_slice(response).map_err(|_| INVALID_PLAN)?;
-    if envelope["stop_reason"].as_str() != Some("end_turn")
-        || envelope["stop_details"]["type"].as_str() == Some("refusal")
-    {
-        return Err("AI 未返回完整检索计划，请调整描述后重试".into());
-    }
-    let content = envelope["content"].as_array().ok_or(INVALID_PLAN)?;
-    if content.is_empty() || content.len() > 8 {
-        return Err(INVALID_PLAN.into());
-    }
-    let mut text = String::new();
-    for block in content {
-        if block["type"].as_str() != Some("text") {
-            return Err(INVALID_PLAN.into());
-        }
-        let part = block["text"].as_str().ok_or(INVALID_PLAN)?;
-        if text.len().saturating_add(part.len()) > MAX_PLAN_BYTES {
-            return Err(INVALID_PLAN.into());
-        }
-        text.push_str(part);
-    }
+    let text = messages_text(status, response, MAX_RESPONSE_BYTES, MAX_PLAN_BYTES)?;
     let raw: RawPlan = serde_json::from_str(&text).map_err(|_| INVALID_PLAN)?;
     if raw.queries.len() > 6 || raw.functions.len() > 3 {
         return Err(INVALID_PLAN.into());
@@ -335,6 +329,73 @@ pub fn parse_response(
         period: raw.period,
         functions: known_functions,
     })
+}
+
+pub(crate) fn check_status(status: u16) -> Result<(), String> {
+    if status == 200 {
+        return Ok(());
+    }
+    Err(match status {
+        401 | 403 => "AI API 认证失败，请检查密钥和权限",
+        404 => "AI API 地址或模型不存在，请检查配置",
+        429 => "AI API 请求过于频繁，请稍后再试",
+        500..=599 => "AI API 服务暂时不可用，请稍后再试",
+        _ => "AI API 请求失败，请检查配置",
+    }
+    .into())
+}
+
+pub(crate) fn is_bidi(character: char) -> bool {
+    matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+pub(crate) fn messages_text(
+    status: u16,
+    response: &[u8],
+    response_limit: usize,
+    text_limit: usize,
+) -> Result<String, String> {
+    check_status(status)?;
+    if response.len() > response_limit {
+        return Err("AI API 响应过大".into());
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(response).map_err(|_| INVALID_PLAN)?;
+    if envelope["stop_reason"].as_str() != Some("end_turn")
+        || envelope["stop_details"]["type"].as_str() == Some("refusal")
+    {
+        return Err("AI 未返回完整结果，请调整输入后重试".into());
+    }
+    let content = envelope["content"].as_array().ok_or(INVALID_PLAN)?;
+    if content.is_empty() || content.len() > 8 {
+        return Err(INVALID_PLAN.into());
+    }
+    let mut text = String::new();
+    for block in content {
+        match block["type"].as_str() {
+            Some("thinking") => {
+                let thinking = block["thinking"].as_str().ok_or(INVALID_PLAN)?;
+                let signature = block["signature"].as_str().ok_or(INVALID_PLAN)?;
+                if thinking.len() > MAX_PLAN_BYTES || signature.len() > MAX_PLAN_BYTES {
+                    return Err(INVALID_PLAN.into());
+                }
+                continue;
+            }
+            Some("redacted_thinking") => {
+                if block["data"].as_str().ok_or(INVALID_PLAN)?.len() > MAX_PLAN_BYTES {
+                    return Err(INVALID_PLAN.into());
+                }
+                continue;
+            }
+            Some("text") => {}
+            _ => return Err(INVALID_PLAN.into()),
+        }
+        let part = block["text"].as_str().ok_or(INVALID_PLAN)?;
+        if text.len().saturating_add(part.len()) > text_limit {
+            return Err(INVALID_PLAN.into());
+        }
+        text.push_str(part);
+    }
+    Ok(text)
 }
 
 const INVALID_PLAN: &str = "AI 返回的检索计划无效，请调整描述后重试";

@@ -1,4 +1,4 @@
-use quick_panel::ai::{AiSettings, AuthMethod, FunctionDescriptor, Period};
+use quick_panel::ai::{AiSettings, AuthMethod, Effort, FunctionDescriptor, Period};
 use quick_panel::claude::{parse_endpoint, parse_response, prepare};
 use quick_panel::model::Scope;
 use serde_json::{Value, json};
@@ -9,6 +9,7 @@ fn settings() -> AiSettings {
         endpoint: "https://api.anthropic.com".into(),
         model: "claude-sonnet-test".into(),
         auth: AuthMethod::ApiKey,
+        effort: Effort::Default,
         encrypted_key: b"not-a-plaintext-key".to_vec(),
     }
 }
@@ -452,4 +453,44 @@ fn status_errors_are_useful_without_echoing_untrusted_server_body() {
     assert!(parse_response(302, b"secret redirect", &[]).is_err());
     let error = parse_response(200, b"raw-sensitive-response", &[]).unwrap_err();
     assert!(!error.contains("raw-sensitive-response"));
+}
+
+#[test]
+fn explicit_effort_uses_output_config_and_default_is_omitted() {
+    for (effort, expected) in [
+        (Effort::Default, None),
+        (Effort::Low, Some("low")),
+        (Effort::Medium, Some("medium")),
+        (Effort::High, Some("high")),
+        (Effort::XHigh, Some("xhigh")),
+        (Effort::Max, Some("max")),
+    ] {
+        let config = AiSettings {
+            effort,
+            ..settings()
+        };
+        let request = prepare(&config, "fixture-key", "查找", Scope::All, &[]).unwrap();
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["output_config"]["effort"].as_str(), expected);
+        if expected.is_none() {
+            assert!(body.get("output_config").is_none());
+        }
+    }
+}
+
+#[test]
+fn search_accepts_bounded_thinking_but_keeps_tool_and_size_rejection() {
+    let mut response: Value = serde_json::from_slice(&plan_response(basic_plan())).unwrap();
+    response["content"].as_array_mut().unwrap().insert(
+        0,
+        json!({"type":"thinking","thinking":"private reasoning","signature":"signature"}),
+    );
+    assert_eq!(
+        parse_response(200, &serde_json::to_vec(&response).unwrap(), &[])
+            .unwrap()
+            .queries,
+        ["连接超时", "connection timeout"]
+    );
+    response["content"][0]["thinking"] = json!("a".repeat(16385));
+    assert!(parse_response(200, &serde_json::to_vec(&response).unwrap(), &[]).is_err());
 }

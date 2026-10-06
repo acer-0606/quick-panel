@@ -100,6 +100,7 @@ pub struct SemanticIndexStatus {
 pub struct Settings {
     pub path_activity: crate::path_activity::PathActivitySettings,
     pub ai: crate::ai::AiSettings,
+    pub organizer: crate::organizer::OrganizerSettings,
     pub embedding: crate::semantic::EmbeddingSettings,
     pub theme: Theme,
     pub smart_search: SmartSearchMode,
@@ -120,6 +121,7 @@ impl Default for Settings {
         Self {
             path_activity: crate::path_activity::PathActivitySettings::default(),
             ai: crate::ai::AiSettings::default(),
+            organizer: crate::organizer::OrganizerSettings::default(),
             embedding: crate::semantic::EmbeddingSettings::default(),
             theme: Theme::System,
             smart_search: SmartSearchMode::Auto,

@@ -2,10 +2,12 @@
 #![cfg(windows)]
 
 use quick_panel::{
-    ai::{AiSettings, AuthMethod, FunctionDescriptor, Period},
-    model::Scope,
+    ai::{AiSettings, AuthMethod, Effort, FunctionDescriptor, Period},
+    model::{ItemKind, Scope, Settings},
+    organizer::{Candidate, OrganizerSettings, Source, Work},
     platform::windows::ai_client::{
-        interpret, protect_key, test_ai_connection, unprotect_key, validate_settings,
+        interpret, list_models, organize, protect_key, test_ai_connection, unprotect_key,
+        validate_settings,
     },
 };
 use serde_json::Value;
@@ -28,6 +30,7 @@ fn connection_test_uses_edited_disabled_config_and_validates_a_real_search_plan(
     let mut config = settings(endpoint, AuthMethod::Bearer);
     config.enabled = false;
     config.model = "unsaved-edited-model".into();
+    config.effort = Effort::XHigh;
     let original = config.clone();
     test_ai_connection(&config, "unsaved-key".into(), false).unwrap();
     assert_eq!(config, original);
@@ -37,6 +40,7 @@ fn connection_test_uses_edited_disabled_config_and_validates_a_real_search_plan(
     assert!(!request.headers.contains_key("x-api-key"));
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["model"], "unsaved-edited-model");
+    assert_eq!(body["output_config"]["effort"], "xhigh");
     let payload: Value =
         serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
     assert_eq!(payload["query"], "Quick Panel connection test");
@@ -162,7 +166,10 @@ fn read_request(stream: &mut TcpStream) -> ObservedRequest {
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
         .collect();
-    let length: usize = headers.get("content-length").unwrap().parse().unwrap();
+    let length: usize = headers
+        .get("content-length")
+        .map(|value| value.parse().unwrap())
+        .unwrap_or(0);
     assert!(length <= 128 * 1024);
     while bytes.len() - header_end < length {
         let count = stream.read(&mut chunk).unwrap();
@@ -188,6 +195,7 @@ fn settings(endpoint: String, auth: AuthMethod) -> AiSettings {
         endpoint,
         model: "fixture-model".into(),
         auth,
+        effort: Effort::Default,
         encrypted_key: protect_key(DUMMY_KEY).unwrap(),
     }
 }
@@ -425,4 +433,234 @@ fn disabled_configuration_does_not_send_a_request() {
     settings.enabled = false;
     assert!(interpret(&settings, "query", Scope::All, &functions()).is_err());
     assert!(matches!(listener.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock));
+}
+
+#[test]
+fn model_listing_get_uses_unsaved_key_and_ignores_disabled_blank_model() {
+    let (endpoint, server) = serve(response(
+        "200 OK",
+        "",
+        br#"{"data":[{"id":"gateway-fixture"}]}"#,
+    ));
+    let mut config = settings(endpoint, AuthMethod::Bearer);
+    config.enabled = false;
+    config.model.clear();
+    let original = config.clone();
+    let models = list_models(&config, "unsaved-model-key".into(), false).unwrap();
+    let request = server.join().unwrap();
+    assert_eq!(models[0].id, "gateway-fixture");
+    assert_eq!(models[0].supports_effort(Effort::High), None);
+    assert_eq!(config, original);
+    assert_eq!(request.line, "GET /v1/models?limit=100 HTTP/1.1");
+    assert_eq!(request.headers["authorization"], "Bearer unsaved-model-key");
+    assert!(request.body.is_empty());
+}
+
+#[test]
+fn model_listing_saved_key_and_clear_key_do_not_fallback_or_follow_redirect() {
+    let (endpoint, server) = serve(response("200 OK", "", br#"{"data":[]}"#));
+    assert!(
+        list_models(
+            &settings(endpoint, AuthMethod::ApiKey),
+            String::new(),
+            false
+        )
+        .unwrap()
+        .is_empty()
+    );
+    assert_eq!(server.join().unwrap().headers["x-api-key"], DUMMY_KEY);
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let config = settings(
+        format!("http://{}/v1/messages", listener.local_addr().unwrap()),
+        AuthMethod::ApiKey,
+    );
+    for (key, clear) in [("", true), ("unsaved-key", true), ("invalid key", false)] {
+        assert!(list_models(&config, key.into(), clear).is_err());
+    }
+    assert!(matches!(listener.accept(),Err(error) if error.kind()==ErrorKind::WouldBlock));
+    let (endpoint, server) = serve(response(
+        "302 Found",
+        &format!(
+            "Location: http://{}/collect\r\n",
+            listener.local_addr().unwrap()
+        ),
+        b"",
+    ));
+    assert!(
+        list_models(
+            &settings(endpoint, AuthMethod::ApiKey),
+            String::new(),
+            false
+        )
+        .is_err()
+    );
+    server.join().unwrap();
+    assert!(matches!(listener.accept(),Err(error) if error.kind()==ErrorKind::WouldBlock));
+}
+
+#[test]
+fn organizer_post_returns_source_bound_metadata_and_effort_when_search_is_disabled() {
+    let reply = serde_json::json!({"stop_reason":"end_turn","content":[{"type":"text","text":
+        r#"{"items":[{"index":0,"alias":"项目日志","tags":["日志"],"reason":"用户备注标明日志"}]}"#}]});
+    let (endpoint, server) = serve(response("200 OK", "", &serde_json::to_vec(&reply).unwrap()));
+    let mut ai = settings(endpoint, AuthMethod::ApiKey);
+    ai.enabled = false;
+    ai.effort = Effort::High;
+    let candidate = Candidate {
+        source: Source::SavedItem {
+            id: "private-source".into(),
+        },
+        fingerprint: "content-version".into(),
+        expected_version: "metadata-version".into(),
+        kind: ItemKind::Document,
+        title: "项目日志".into(),
+        alias: String::new(),
+        tags: vec![],
+        context: "C:\\项目\\日志.txt".into(),
+    };
+    let work = Work {
+        token: 7,
+        ai_settings: ai.clone(),
+        organizer_settings: OrganizerSettings {
+            enabled: true,
+            ..OrganizerSettings::default()
+        },
+        candidates: vec![candidate.clone()],
+    };
+    let settings = Settings {
+        ai,
+        organizer: work.organizer_settings.clone(),
+        ..Settings::default()
+    };
+    let proposals = organize(&settings, &work).unwrap();
+    assert_eq!(proposals[0].candidate, candidate);
+    assert_eq!(proposals[0].alias.as_deref(), Some("项目日志"));
+    let request = server.join().unwrap();
+    assert_eq!(request.line, "POST /v1/messages HTTP/1.1");
+    let body: Value = serde_json::from_slice(&request.body).unwrap();
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert!(
+        !String::from_utf8(request.body)
+            .unwrap()
+            .contains("private-source")
+    );
+}
+
+#[test]
+fn model_listing_paginates_only_same_endpoint_with_encoded_cursor() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let endpoint = format!(
+        "http://{}/proxy/v1/messages",
+        listener.local_addr().unwrap()
+    );
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for body in [
+            r#"{"data":[{"id":"model+a/b"}],"has_more":true,"last_id":"model+a/b"}"#,
+            r#"{"data":[{"id":"final-model"}],"has_more":false}"#,
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "pagination request timeout");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("pagination accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            requests.push(read_request(&mut stream));
+            stream
+                .write_all(&response("200 OK", "", body.as_bytes()))
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(150));
+        assert!(matches!(listener.accept(),Err(error) if error.kind()==ErrorKind::WouldBlock));
+        requests
+    });
+    let models = list_models(
+        &settings(endpoint, AuthMethod::ApiKey),
+        String::new(),
+        false,
+    )
+    .unwrap();
+    let requests = server.join().unwrap();
+    assert_eq!(
+        models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>(),
+        ["model+a/b", "final-model"]
+    );
+    assert_eq!(requests[0].line, "GET /proxy/v1/models?limit=100 HTTP/1.1");
+    assert_eq!(
+        requests[1].line,
+        "GET /proxy/v1/models?limit=100&after_id=model%2Ba%2Fb HTTP/1.1"
+    );
+    for request in requests {
+        assert_eq!(request.headers["x-api-key"], DUMMY_KEY);
+        assert!(request.body.is_empty());
+    }
+}
+
+#[test]
+fn model_listing_body_limits_and_service_errors_are_sanitized() {
+    for (status, body) in [
+        ("200 OK", vec![b'x'; 256 * 1024 + 1]),
+        (
+            "429 Too Many Requests",
+            b"private-provider-response unsaved-key".to_vec(),
+        ),
+    ] {
+        let (endpoint, server) = serve(response(status, "", &body));
+        let error = list_models(
+            &settings(endpoint, AuthMethod::ApiKey),
+            "unsaved-key".into(),
+            false,
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(!error.contains("private-provider-response"));
+        assert!(!error.contains("unsaved-key"));
+    }
+}
+
+#[test]
+fn organizer_disabled_changed_or_invalid_credentials_fail_before_post() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let ai = settings(
+        format!("http://{}", listener.local_addr().unwrap()),
+        AuthMethod::ApiKey,
+    );
+    let work = Work {
+        token: 1,
+        ai_settings: ai.clone(),
+        organizer_settings: OrganizerSettings {
+            enabled: true,
+            ..OrganizerSettings::default()
+        },
+        candidates: vec![],
+    };
+    let mut current = Settings {
+        ai,
+        organizer: work.organizer_settings.clone(),
+        ..Settings::default()
+    };
+    current.organizer.enabled = false;
+    assert!(organize(&current, &work).is_err());
+    current.organizer.enabled = true;
+    current.ai.model = "changed-model".into();
+    assert!(organize(&current, &work).is_err());
+    let mut work = work;
+    work.ai_settings.encrypted_key.clear();
+    current.ai = work.ai_settings.clone();
+    assert!(organize(&current, &work).is_err());
+    assert!(matches!(listener.accept(),Err(error) if error.kind()==ErrorKind::WouldBlock));
 }
