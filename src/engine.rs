@@ -205,6 +205,45 @@ impl Engine {
         } else {
             0
         };
+        let bridge_bytes = match &command {
+            Command::HarnessTool {
+                call_id, arguments, ..
+            } => serde_json::to_vec(arguments)
+                .map_err(|e| e.to_string())?
+                .len()
+                .saturating_add(call_id.len())
+                .saturating_add(64),
+            Command::HarnessCheckpoint { checkpoint, .. } => {
+                let bytes = serde_json::to_vec(checkpoint)
+                    .map_err(|e| e.to_string())?
+                    .len();
+                if bytes > crate::pi_harness::MAX_CHECKPOINT_BYTES {
+                    return Err("Pi 检查点超过桥接容量".into());
+                }
+                bytes.saturating_add(32)
+            }
+            Command::HarnessFeedback {
+                sources, reason, ..
+            } => serde_json::to_vec(sources)
+                .map_err(|e| e.to_string())?
+                .len()
+                .saturating_add(reason.len())
+                .saturating_add(64),
+            Command::HarnessMemoryEdit { input, .. } => serde_json::to_vec(input)
+                .map_err(|e| e.to_string())?
+                .len()
+                .saturating_add(32),
+            Command::HarnessMemoryDelete { ids, .. } => {
+                ids.len().saturating_mul(8).saturating_add(32)
+            }
+            Command::HarnessFailed { code, message, .. } => {
+                code.len().saturating_add(message.len()).saturating_add(64)
+            }
+            _ => 0,
+        };
+        if bridge_bytes > crate::pi_harness::MAX_FRAME_BYTES {
+            return Err("Pi 命令超过桥接容量".into());
+        }
         state.queries.note_reliable(&command);
         if matches!(command, Command::Shutdown) {
             state.queries.generation.fetch_add(1, Ordering::AcqRel);
@@ -231,7 +270,7 @@ impl Engine {
                 .iter()
                 .map(crate::semantic_store::embedding_bytes)
                 .sum(),
-            _ => 0,
+            _ => bridge_bytes,
         };
         let (command, bytes) = if bytes > state.max_item_bytes {
             (
@@ -431,6 +470,717 @@ fn scope_matches(kind: ItemKind, scope: Scope) -> bool {
     )
 }
 impl Actor {
+    fn harness_directory(&self, c: &crate::organizer::Candidate) -> Option<String> {
+        use crate::organizer::Source;
+        if c.kind == ItemKind::Clipboard {
+            return None;
+        }
+        let target = match &c.source {
+            Source::ObservedPath { normalized_path } => normalized_path.clone(),
+            Source::SavedItem { id } => {
+                if let Some(p) = self.pending.get(id) {
+                    p.item.target.clone()?
+                } else {
+                    self.repo.metadata(id).ok()??.target?
+                }
+            }
+        };
+        let normalized = crate::path_activity::normalize_path(&target).ok()?;
+        normalized.rsplit_once('\\').and_then(|(parent, _)| {
+            crate::path_activity::normalize_path(&format!("{parent}\\")).ok()
+        })
+    }
+    fn harness_scope_matches(
+        &self,
+        scope: &crate::harness_tools::MemoryScope,
+        c: &crate::organizer::Candidate,
+    ) -> bool {
+        match scope {
+            crate::harness_tools::MemoryScope::Global => true,
+            crate::harness_tools::MemoryScope::Item { source } => source == &c.source,
+            crate::harness_tools::MemoryScope::Directory { path } => {
+                self.harness_directory(c).as_ref() == Some(path)
+            }
+        }
+    }
+    fn harness_recall(&self, c: &crate::organizer::Candidate, query: &str) -> serde_json::Value {
+        use crate::harness_tools::*;
+        if !self.settings.organizer.memory_enabled {
+            return serde_json::json!({"records":[]});
+        }
+        let query = crate::search::normalize(query);
+        let mut ranked: Vec<_> = self
+            .repo
+            .harness
+            .memories
+            .iter()
+            .filter(|m| m.enabled && m.confirmed && m.origin == MemoryOrigin::Human)
+            .filter_map(|m| {
+                let rank = if self.harness_scope_matches(&m.scope, c) {
+                    match m.scope {
+                        MemoryScope::Item { .. } => 0,
+                        MemoryScope::Directory { .. } => 1,
+                        MemoryScope::Global => 2,
+                    }
+                } else if m.kind != MemoryKind::Rule
+                    && !query.is_empty()
+                    && crate::search::normalize(&format!(
+                        "{} {} {}",
+                        m.text,
+                        m.alias.as_deref().unwrap_or_default(),
+                        m.tags.join(" ")
+                    ))
+                    .contains(&query)
+                {
+                    3
+                } else {
+                    return None;
+                };
+                Some((rank, m))
+            })
+            .collect();
+        ranked.sort_by(|(ar, a), (br, b)| ar.cmp(br).then(b.id.cmp(&a.id)));
+        let mut result = Vec::new();
+        let mut chars = 0;
+        let mut bytes = 32;
+        for (_, m) in ranked.into_iter().take(8) {
+            let value = serde_json::json!({"id":format!("memory:{}",m.id),"scope":match m.scope{MemoryScope::Item{..}=>"item",MemoryScope::Directory{..}=>"directory",MemoryScope::Global=>"global"},"kind":m.kind,"text":m.text,"alias":m.alias,"tags":m.tags,"evidence_ids":m.evidence_ids});
+            let cost = serde_json::to_string(&value)
+                .unwrap_or_default()
+                .chars()
+                .count();
+            let value_bytes = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+            if chars + cost > 8192
+                || bytes + value_bytes + 1 > crate::pi_harness::MAX_TOOL_RESULT_BYTES - 128
+            {
+                break;
+            }
+            chars += cost;
+            bytes += value_bytes + 1;
+            result.push(value);
+        }
+        serde_json::json!({"records":result})
+    }
+    fn harness_memory_receipt(&mut self, request_id: u64, staged: Result<(), String>) {
+        if staged.is_ok() {
+            self.mark_dirty();
+            self.flush();
+        }
+        let pending_save = staged.is_ok() && self.dirty();
+        let result = staged.and_then(|()| {
+            if pending_save {
+                Err("本地写入未完成，编辑内容已保留，请重试保存".into())
+            } else {
+                Ok(())
+            }
+        });
+        self.emit(Event::HarnessMemoryReceipt {
+            request_id,
+            result,
+            pending_save,
+        });
+    }
+    fn harness_memory_edit(
+        &mut self,
+        request_id: u64,
+        input: crate::harness_tools::MemoryEdit,
+    ) -> Result<(), String> {
+        let signature = organizer_hash(&("edit", &input));
+        if self.repo.harness.human_seen(request_id, &signature)? {
+            return Ok(());
+        }
+        let mut next = self.repo.harness.clone();
+        next.edit(input, now_ms())?;
+        next.human_request(request_id, signature);
+        if !next.fits() {
+            return Err("记忆容量已满，编辑内容尚未保存".into());
+        }
+        self.organizer_cancel();
+        self.repo.harness = next;
+        self.repo.organizer.next_at_ms = 0;
+        self.repo.organizer.dirty = true;
+        self.organizer_changed();
+        Ok(())
+    }
+    fn harness_memory_delete(&mut self, request_id: u64, ids: Vec<u64>) -> Result<(), String> {
+        let signature = organizer_hash(&("delete", &ids));
+        if self.repo.harness.human_seen(request_id, &signature)? {
+            return Ok(());
+        }
+        let mut next = self.repo.harness.clone();
+        next.delete(&ids)?;
+        next.human_request(request_id, signature);
+        if !next.fits() {
+            return Err("记忆收据容量已满".into());
+        }
+        self.organizer_cancel();
+        self.repo.harness = next;
+        self.repo.organizer.next_at_ms = 0;
+        self.repo.organizer.dirty = true;
+        self.organizer_changed();
+        Ok(())
+    }
+    fn harness_feedback(
+        &mut self,
+        request_id: u64,
+        sources: Vec<crate::organizer::Source>,
+        reason: String,
+        scope: crate::harness_tools::FeedbackScope,
+    ) -> Result<(), String> {
+        use crate::{harness_tools::*, organizer_store::Status};
+        let signature = organizer_hash(&("feedback", &sources, &reason, scope));
+        if self.repo.harness.human_seen(request_id, &signature)? {
+            return Ok(());
+        }
+        if !text_valid(&reason, 256, false)
+            || sources.is_empty()
+            || sources.len() > 8
+            || sources.iter().collect::<HashSet<_>>().len() != sources.len()
+        {
+            return Err("反馈原因或选择无效，请保留编辑后修正".into());
+        }
+        let mut next = self.repo.harness.clone();
+        let mut candidates = Vec::new();
+        for source in &sources {
+            let record = self
+                .repo
+                .organizer
+                .records
+                .iter()
+                .find(|r| &r.candidate.source == source)
+                .ok_or("来源已变化，反馈尚未保存")?;
+            let current = self
+                .organizer_candidate(source)?
+                .ok_or("来源不再符合整理范围，反馈尚未保存")?;
+            if current != record.candidate {
+                return Err("来源已变化，请核对后保存反馈".into());
+            }
+            let memory_scope = match scope {
+                FeedbackScope::Item => MemoryScope::Item {
+                    source: source.clone(),
+                },
+                FeedbackScope::Directory => MemoryScope::Directory {
+                    path: self
+                        .harness_directory(&current)
+                        .ok_or("此来源没有可用的目录范围")?,
+                },
+                FeedbackScope::Global => MemoryScope::Global,
+            };
+            let alias = match &record.status {
+                Status::Ready(p) => p.alias.clone(),
+                _ => next
+                    .run
+                    .as_ref()
+                    .and_then(|r| {
+                        r.staged
+                            .iter()
+                            .flatten()
+                            .find(|p| &p.candidate.source == source)
+                    })
+                    .and_then(|p| p.alias.clone()),
+            };
+            next.insert(MemoryRecord {
+                id: 0,
+                scope: memory_scope,
+                kind: MemoryKind::Rejected,
+                origin: MemoryOrigin::Human,
+                proposed_by_ai: false,
+                text: reason.clone(),
+                alias,
+                tags: vec![],
+                evidence_ids: vec![],
+                confirmed: true,
+                enabled: true,
+                created_at_ms: now_ms(),
+            })
+            .map_err(|e| e.message)?;
+            candidates.push(current);
+        }
+        next.version = next.version.checked_add(1).ok_or("记忆版本耗尽")?;
+        next.clear_run();
+        next.human_request(request_id, signature);
+        if !next.fits() {
+            return Err("反馈容量已满，请编辑或删除记忆".into());
+        }
+        self.organizer_cancel();
+        self.repo.harness = next;
+        for c in candidates {
+            if let Some(r) = self
+                .repo
+                .organizer
+                .records
+                .iter_mut()
+                .find(|r| r.candidate.source == c.source)
+            {
+                r.candidate = c;
+                r.status = Status::Queued;
+            }
+        }
+        self.repo.organizer.next_at_ms = 0;
+        self.repo.organizer.retry_at_ms = None;
+        self.repo.organizer.paused = false;
+        self.repo.organizer.failures = 0;
+        self.repo.organizer.dirty = true;
+        self.organizer_changed();
+        Ok(())
+    }
+    fn harness_examples(
+        &self,
+        proposals: &[crate::organizer::Proposal],
+        automatic: bool,
+    ) -> Result<crate::harness_store::HarnessStore, String> {
+        use crate::harness_tools::*;
+        let mut next = self.repo.harness.clone();
+        if !self.settings.organizer.memory_enabled || next.blocked {
+            return Ok(next);
+        }
+        for p in proposals {
+            let edited=!automatic&&self.repo.organizer.records.iter().any(|r|matches!(&r.status,crate::organizer_store::Status::Ready(old) if old.candidate==p.candidate&&(old.alias!=p.alias||old.tags!=p.tags)));
+            let alias = if automatic && !p.candidate.alias.is_empty() {
+                Some(p.candidate.alias.clone())
+            } else {
+                p.alias
+                    .clone()
+                    .or_else(|| (!p.candidate.alias.is_empty()).then(|| p.candidate.alias.clone()))
+            };
+            let mut tags = p.candidate.tags.clone();
+            for tag in &p.tags {
+                if !tags.contains(tag) && tags.len() < 32 {
+                    tags.push(tag.clone());
+                }
+            }
+            next.insert(MemoryRecord {
+                id: 0,
+                scope: MemoryScope::Item {
+                    source: p.candidate.source.clone(),
+                },
+                kind: if automatic {
+                    MemoryKind::AiApplied
+                } else if edited {
+                    MemoryKind::Edited
+                } else {
+                    MemoryKind::Accepted
+                },
+                origin: if automatic {
+                    MemoryOrigin::Ai
+                } else {
+                    MemoryOrigin::Human
+                },
+                proposed_by_ai: automatic,
+                text: p.reason.clone(),
+                alias,
+                tags,
+                evidence_ids: vec![],
+                confirmed: !automatic,
+                enabled: true,
+                created_at_ms: now_ms(),
+            })
+            .map_err(|e| e.message)?;
+        }
+        if !automatic {
+            next.version = next.version.checked_add(1).ok_or("记忆版本耗尽")?;
+            next.clear_run();
+        }
+        Ok(next)
+    }
+    fn harness_item(c: &crate::organizer::Candidate, index: Option<usize>) -> serde_json::Value {
+        serde_json::json!({"index":index,"kind":match c.kind{ItemKind::Clipboard=>"clipboard",ItemKind::Folder=>"folder",ItemKind::Document=>"document"},"title":c.title,"alias":c.alias,"tags":c.tags,"context":c.context,"version":c.expected_version})
+    }
+    fn harness_failed(&mut self, token: u64, code: String, message: String, retryable: bool) {
+        let Some(w) = self
+            .organizer_work
+            .as_ref()
+            .filter(|w| w.token == token)
+            .cloned()
+        else {
+            return;
+        };
+        self.organizer_work = None;
+        self.repo.organizer.release_reservation();
+        if code == "TRANSIENT_NETWORK" && retryable {
+            self.organizer_failed();
+            return;
+        }
+        let code = if crate::harness_tools::text_valid(&code, 128, false) {
+            code
+        } else {
+            "runtime".into()
+        };
+        let message: String = message
+            .chars()
+            .filter(|c| !c.is_control() && !crate::claude::is_bidi(*c))
+            .take(1024)
+            .collect();
+        for r in &mut self.repo.organizer.records {
+            if w.candidates.contains(&r.candidate) {
+                r.status = crate::organizer_store::Status::Attention {
+                    code: code.clone(),
+                    message: message.clone(),
+                };
+            }
+        }
+        if matches!(code.as_str(), "AUTH" | "RUNTIME_UNAVAILABLE") {
+            self.repo.organizer.paused = true;
+            self.repo.organizer.retry_at_ms = None;
+        }
+        self.repo.organizer.next_at_ms = 0;
+        self.repo.organizer.dirty = true;
+        self.organizer_changed();
+    }
+    fn harness_profile(&self) -> String {
+        organizer_hash(&(
+            &self.settings.ai,
+            &self.settings.organizer,
+            &self.settings.excluded_apps,
+            &self.settings.path_activity,
+        ))
+    }
+    fn harness_guard(
+        &self,
+        token: u64,
+    ) -> Result<crate::organizer::Work, crate::pi_harness::ToolError> {
+        use crate::harness_tools::error;
+        let work = self
+            .organizer_work
+            .as_ref()
+            .filter(|w| w.token == token)
+            .ok_or_else(|| error("STALE_RUN", "整理任务已撤销", false))?;
+        if self.exiting
+            || !self.settings.organizer.enabled
+            || self.settings.ai != work.ai_settings
+            || self.settings.organizer != work.organizer_settings
+            || self.repo.harness.blocked
+        {
+            return Err(error("STALE_RUN", "整理任务已撤销或配置已变化", false));
+        }
+        let run = self
+            .repo
+            .harness
+            .run
+            .as_ref()
+            .ok_or_else(|| error("STALE_RUN", "Pi 任务已撤销", false))?;
+        if run.profile != self.harness_profile()
+            || run.memory_version != self.repo.harness.version
+            || run.candidates != work.candidates
+        {
+            return Err(error("STALE_RUN", "Pi 任务版本已变化", false));
+        }
+        for c in &work.candidates {
+            if self
+                .organizer_candidate(&c.source)
+                .map_err(|e| error("STORAGE", e, false))?
+                .as_ref()
+                != Some(c)
+            {
+                return Err(error("STALE_SOURCE", "来源已变化，请重试", false));
+            }
+        }
+        Ok(work.clone())
+    }
+    fn harness_context(
+        &self,
+        token: u64,
+    ) -> Result<crate::harness_tools::PiContext, crate::pi_harness::ToolError> {
+        use crate::pi_harness::{ItemRef, PublicEffort};
+        let w = self.harness_guard(token)?;
+        let effort = match w.ai_settings.effort {
+            crate::ai::Effort::Default => PublicEffort::Default,
+            crate::ai::Effort::Low => PublicEffort::Low,
+            crate::ai::Effort::Medium => PublicEffort::Medium,
+            crate::ai::Effort::High => PublicEffort::High,
+            crate::ai::Effort::XHigh => PublicEffort::XHigh,
+            crate::ai::Effort::Max => PublicEffort::Max,
+        };
+        Ok(crate::harness_tools::PiContext {
+            model: w.ai_settings.model,
+            effort,
+            instructions: w.organizer_settings.instructions,
+            max_rounds: w.organizer_settings.max_rounds,
+            item_refs: w
+                .candidates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| ItemRef {
+                    index: i as u32,
+                    kind: match c.kind {
+                        ItemKind::Clipboard => "clipboard",
+                        ItemKind::Folder => "folder",
+                        ItemKind::Document => "document",
+                    }
+                    .into(),
+                    title: c.title.clone(),
+                    version: c.expected_version.clone(),
+                })
+                .collect(),
+            checkpoint: self
+                .repo
+                .harness
+                .run
+                .as_ref()
+                .and_then(|r| r.checkpoint.clone()),
+        })
+    }
+    fn harness_tool(
+        &mut self,
+        token: u64,
+        call: &str,
+        name: crate::pi_harness::ToolName,
+        args: serde_json::Value,
+    ) -> crate::pi_harness::HostResult<serde_json::Value> {
+        use crate::{
+            harness_tools::*,
+            pi_harness::{HostResult, ToolName},
+        };
+        let w = match self.harness_guard(token) {
+            Ok(w) => w,
+            Err(e) => return HostResult::failure(e),
+        };
+        if !text_valid(call, 160, false) {
+            return HostResult::failure(error("protocol", "调用 ID 无效", false));
+        }
+        let signature = organizer_hash(&(name, &args));
+        match self.repo.harness.receipt(call, &signature) {
+            Ok(Some(prior)) => return prior,
+            Ok(None) => {}
+            Err(e) => return HostResult::failure(e),
+        }
+        let mutating = matches!(
+            name,
+            ToolName::OrganizerSubmit | ToolName::MemoryProposeRule
+        );
+        let before = mutating.then(|| self.repo.harness.clone());
+        let result = (|| match name {
+            ToolName::OrganizerSubmit => {
+                if args.get("alias").is_none() {
+                    return Err(error("INVALID_ARGUMENTS", "缺少 alias 字段", true));
+                }
+                let a: SubmitArgs = parse(args)?;
+                let c = w
+                    .candidates
+                    .get(a.index)
+                    .ok_or_else(|| error("INVALID_ARGUMENTS", "索引不属于当前批次", true))?;
+                if c.expected_version != a.expected_version {
+                    return Err(error("STALE_SOURCE", "来源版本已变化", false));
+                }
+                if a.alias.as_ref().is_some_and(|v| !text_valid(v, 48, false)) {
+                    return Err(error(
+                        "INVALID_ALIAS",
+                        "别名须为 1–48 字符且不含控制字符",
+                        true,
+                    ));
+                }
+                let p = crate::organizer::Proposal {
+                    candidate: c.clone(),
+                    alias: a.alias,
+                    tags: a.tags,
+                    reason: a.reason,
+                };
+                p.validate()
+                    .map_err(|e| error("INVALID_ARGUMENTS", e, true))?;
+                if self.settings.organizer.memory_enabled
+                    && p.alias.as_ref().is_some_and(|a| {
+                        self.repo.harness.memories.iter().any(|m| {
+                            m.enabled
+                                && m.confirmed
+                                && m.origin == MemoryOrigin::Human
+                                && m.kind == MemoryKind::Rejected
+                                && m.alias.as_ref().is_some_and(|old| {
+                                    crate::search::normalize(old) == crate::search::normalize(a)
+                                })
+                                && self.harness_scope_matches(&m.scope, c)
+                        })
+                    })
+                {
+                    return Err(error(
+                        "REJECTED_ALIAS",
+                        "该范围内已拒绝此别名，请换一个名称",
+                        true,
+                    ));
+                }
+                self.repo.harness.stage(a.index, p)?;
+                Ok(serde_json::json!({"accepted":true,"index":a.index}))
+            }
+            ToolName::ItemsGetContext => {
+                let a: IndexArgs = parse(args)?;
+                let c = w
+                    .candidates
+                    .get(a.index)
+                    .ok_or_else(|| error("INVALID_ARGUMENTS", "索引不属于当前批次", true))?;
+                Ok(Self::harness_item(c, Some(a.index)))
+            }
+            ToolName::ItemsSearch => {
+                let a: SearchArgs = parse(args)?;
+                if !(1..=8).contains(&a.limit) || !text_valid(&a.query, 512, true) {
+                    return Err(error("INVALID_ARGUMENTS", "检索参数超过限制", true));
+                }
+                let query = crate::search::normalize(&a.query);
+                let mut found = Vec::new();
+                let mut result_bytes = 32;
+                let mut seen = HashSet::new();
+                for c in w
+                    .candidates
+                    .iter()
+                    .chain(self.repo.organizer.records.iter().map(|r| &r.candidate))
+                {
+                    if found.len() == a.limit {
+                        break;
+                    }
+                    if !seen.insert(&c.source)
+                        || self
+                            .organizer_candidate(&c.source)
+                            .map_err(|e| error("STORAGE", e, false))?
+                            .as_ref()
+                            != Some(c)
+                    {
+                        continue;
+                    }
+                    let text = crate::search::normalize(&format!(
+                        "{} {} {} {}",
+                        c.title,
+                        c.alias,
+                        c.tags.join(" "),
+                        c.context
+                    ));
+                    if text.contains(&query) {
+                        let value = Self::harness_item(
+                            c,
+                            w.candidates.iter().position(|v| v.source == c.source),
+                        );
+                        let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |v| v.len());
+                        if result_bytes + bytes + 1 > crate::pi_harness::MAX_TOOL_RESULT_BYTES - 128
+                        {
+                            break;
+                        }
+                        result_bytes += bytes + 1;
+                        found.push(value);
+                    }
+                }
+                Ok(serde_json::json!({"items":found}))
+            }
+            ToolName::UsageGetSummary => {
+                let a: IndexArgs = parse(args)?;
+                let c = w
+                    .candidates
+                    .get(a.index)
+                    .ok_or_else(|| error("INVALID_ARGUMENTS", "索引不属于当前批次", true))?;
+                let (count, last) = match &c.source {
+                    crate::organizer::Source::SavedItem { id } => {
+                        if let Some(p) = self.pending.get(id) {
+                            (p.item.summary.use_count, p.item.summary.last_used_ms)
+                        } else {
+                            let m = self
+                                .repo
+                                .metadata(id)
+                                .map_err(|e| error("STORAGE", e, false))?
+                                .ok_or_else(|| error("STALE_SOURCE", "来源不存在", false))?;
+                            (m.summary.use_count, m.summary.last_used_ms)
+                        }
+                    }
+                    crate::organizer::Source::ObservedPath { normalized_path } => self
+                        .repo
+                        .paths
+                        .observation_revision(normalized_path)
+                        .ok_or_else(|| error("STALE_SOURCE", "来源不存在", false))?,
+                };
+                Ok(
+                    serde_json::json!({"use_count":count,"last_used_ms":last,"feedback_count":self.repo.harness.memories.iter().filter(|m|m.origin==MemoryOrigin::Human&&self.harness_scope_matches(&m.scope,c)).count()}),
+                )
+            }
+            ToolName::MemoryRecall => {
+                let a: RecallArgs = parse(args)?;
+                let c = w
+                    .candidates
+                    .get(a.index)
+                    .ok_or_else(|| error("INVALID_ARGUMENTS", "索引不属于当前批次", true))?;
+                if a.query.as_ref().is_some_and(|v| !text_valid(v, 512, true)) {
+                    return Err(error("INVALID_ARGUMENTS", "回忆关键词超过限制", true));
+                }
+                Ok(self.harness_recall(c, a.query.as_deref().unwrap_or_default()))
+            }
+            ToolName::MemoryProposeRule => {
+                let a: RuleArgs = parse(args)?;
+                let c = w
+                    .candidates
+                    .get(a.index)
+                    .ok_or_else(|| error("INVALID_ARGUMENTS", "索引不属于当前批次", true))?;
+                if !text_valid(&a.text, 512, false)
+                    || a.evidence_ids.len() > 8
+                    || a.evidence_ids.iter().any(|id| {
+                        !text_valid(id, 128, false)
+                            || !self
+                                .repo
+                                .harness
+                                .memories
+                                .iter()
+                                .any(|m| id == &format!("memory:{}", m.id))
+                    })
+                {
+                    return Err(error("INVALID_ARGUMENTS", "规则或依据编号无效", true));
+                }
+                if !self.settings.organizer.memory_enabled {
+                    return Ok(serde_json::json!({"proposed":false,"memory_enabled":false}));
+                }
+                if let Some(m) = self.repo.harness.memories.iter().find(|m| {
+                    m.kind == MemoryKind::Rule
+                        && !m.confirmed
+                        && m.origin == MemoryOrigin::Ai
+                        && m.text == a.text
+                        && m.scope
+                            == MemoryScope::Item {
+                                source: c.source.clone(),
+                            }
+                }) {
+                    return Ok(
+                        serde_json::json!({"proposed":true,"id":format!("memory:{}",m.id),"confirmed":false}),
+                    );
+                }
+                let id = self.repo.harness.insert(MemoryRecord {
+                    id: 0,
+                    scope: MemoryScope::Item {
+                        source: c.source.clone(),
+                    },
+                    kind: MemoryKind::Rule,
+                    origin: MemoryOrigin::Ai,
+                    proposed_by_ai: true,
+                    text: a.text,
+                    alias: None,
+                    tags: vec![],
+                    evidence_ids: a.evidence_ids,
+                    confirmed: false,
+                    enabled: true,
+                    created_at_ms: now_ms(),
+                })?;
+                Ok(
+                    serde_json::json!({"proposed":true,"id":format!("memory:{id}"),"confirmed":false}),
+                )
+            }
+        })();
+        let receipt = match result {
+            Ok(v) => HostResult::success(v),
+            Err(e) => HostResult::failure(e),
+        };
+        if serde_json::to_vec(&receipt)
+            .map_or(true, |v| v.len() > crate::pi_harness::MAX_TOOL_RESULT_BYTES)
+        {
+            if let Some(before) = before {
+                self.repo.harness = before;
+            }
+            return HostResult::failure(error("tool_result_limit", "工具结果超过容量", false));
+        }
+        if !mutating {
+            return receipt;
+        }
+        if let Err(e) = self
+            .repo
+            .harness
+            .record_receipt(call.into(), signature, receipt.clone())
+        {
+            self.repo.harness = before.expect("mutation snapshot");
+            return HostResult::failure(e);
+        }
+        self.mark_dirty();
+        receipt
+    }
     // All organizer reads are bounded metadata/text-slice reads; representations never enter work.
     fn organizer_candidate(
         &self,
@@ -621,6 +1371,9 @@ impl Actor {
         Ok(())
     }
     fn organizer_cancel(&mut self) {
+        if !self.exiting {
+            self.repo.harness.clear_run();
+        }
         self.organizer_work = None;
         self.repo.organizer.release_reservation();
         self.repo.organizer.recover();
@@ -673,6 +1426,7 @@ impl Actor {
             || self.settings.ai.encrypted_key.is_empty()
             || self.organizer_work.is_some()
             || self.repo.organizer.paused
+            || self.repo.harness.blocked
             || self.repo.organizer.retry_at_ms.is_some_and(|t| t > now)
             || self.repo.organizer.next_at_ms > now
         {
@@ -683,7 +1437,27 @@ impl Actor {
         } else {
             self.settings.organizer.batch_size
         };
-        let count = self.settings.organizer.batch_size.min(room);
+        let resume = self
+            .repo
+            .harness
+            .run
+            .as_ref()
+            .filter(|r| {
+                r.profile == self.harness_profile()
+                    && r.memory_version == self.repo.harness.version
+                    && r.candidates.iter().all(|c| {
+                        self.repo.organizer.records.iter().any(|record| {
+                            record.candidate == *c && matches!(record.status, Status::Queued)
+                        })
+                    })
+            })
+            .map(|r| r.candidates.clone());
+        let count = resume
+            .as_ref()
+            .map_or(self.settings.organizer.batch_size.min(room), Vec::len);
+        if count > room {
+            return Ok(());
+        }
         if count == 0 {
             return Ok(());
         }
@@ -695,13 +1469,12 @@ impl Actor {
             candidates: Vec::new(),
         };
         let mut store_blocked = false;
-        for record in self
-            .repo
-            .organizer
-            .records
-            .iter()
-            .filter(|r| matches!(r.status, Status::Queued))
-        {
+        for record in self.repo.organizer.records.iter().filter(|r| {
+            matches!(r.status, Status::Queued)
+                && resume
+                    .as_ref()
+                    .is_none_or(|original| original.contains(&r.candidate))
+        }) {
             if work.candidates.len() == count {
                 break;
             }
@@ -748,6 +1521,13 @@ impl Actor {
                 self.organizer_changed();
             }
             return Ok(());
+        }
+        if let Err(e) = self
+            .repo
+            .harness
+            .begin(self.harness_profile(), work.candidates.clone())
+        {
+            return Err(e.message);
         }
         self.organizer_token = work.token;
         self.repo.organizer = reserved;
@@ -797,7 +1577,29 @@ impl Actor {
             self.organizer_changed();
             return Ok(());
         }
+        if let Some(run) = &self.repo.harness.run
+            && (run.checkpoint.is_some() || run.staged.iter().any(Option::is_some) || run.finished)
+            && !result.as_ref().is_ok_and(|proposals| {
+                run.finished
+                    && run
+                        .staged
+                        .iter()
+                        .cloned()
+                        .collect::<Option<Vec<_>>>()
+                        .as_ref()
+                        == Some(proposals)
+            })
+        {
+            self.harness_failed(
+                token,
+                "incomplete".into(),
+                "完成结果与 Pi 暂存收据不符".into(),
+                false,
+            );
+            return Ok(());
+        }
         self.organizer_work = None;
+        self.repo.harness.clear_run();
         self.repo.organizer.release_reservation();
         let proposals = match result {
             Ok(p)
@@ -834,6 +1636,11 @@ impl Actor {
             self.organizer_changed();
             return Ok(());
         }
+        let memory = if work.organizer_settings.mode == OrganizerMode::Automatic {
+            self.harness_examples(&proposals, true)?
+        } else {
+            self.repo.harness.clone()
+        };
         if work.organizer_settings.mode == OrganizerMode::Automatic
             && self.organizer_apply_metadata(&proposals, true).is_err()
         {
@@ -844,6 +1651,7 @@ impl Actor {
             self.organizer_changed();
             return Ok(());
         }
+        self.repo.harness = memory;
         next.failures = 0;
         next.retry_at_ms = None;
         next.paused = false;
@@ -962,7 +1770,10 @@ impl Actor {
                 return Err("整理建议已过期，请刷新后重试".into());
             }
         }
+        let memory = self.harness_examples(&proposals, false)?;
         self.organizer_apply_metadata(&proposals, false)?;
+        self.organizer_cancel();
+        self.repo.harness = memory;
         for r in &mut self.repo.organizer.records {
             if seen.contains(&r.candidate.source) {
                 r.status = Status::Done;
@@ -1023,6 +1834,7 @@ impl Actor {
         !self.pending.is_empty()
             || self.repo.paths.is_dirty()
             || self.repo.organizer.dirty
+            || self.repo.harness.dirty
             || !self.deleted.is_empty()
             || self.settings_dirty
             || !self.vectors.items.is_empty()
@@ -2215,6 +3027,97 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::HarnessContext { token, request_id } => {
+                    let result = self.harness_context(token);
+                    self.emit(Event::HarnessContext {
+                        token,
+                        request_id,
+                        result,
+                    });
+                    Ok(())
+                }
+                Command::HarnessTool {
+                    token,
+                    call_id,
+                    name,
+                    arguments,
+                } => {
+                    let result = self.harness_tool(token, &call_id, name, arguments);
+                    self.emit(Event::HarnessToolResult {
+                        token,
+                        call_id,
+                        result,
+                    });
+                    Ok(())
+                }
+                Command::HarnessFinish { token, request_id } => {
+                    let result = self
+                        .harness_guard(token)
+                        .map_err(|e| e.message)
+                        .and_then(|_| self.repo.harness.finish());
+                    if self.repo.harness.dirty {
+                        self.mark_dirty();
+                    }
+                    self.emit(Event::HarnessFinished {
+                        token,
+                        request_id,
+                        result,
+                    });
+                    Ok(())
+                }
+                Command::HarnessFailed {
+                    token,
+                    code,
+                    message,
+                    retryable,
+                } => {
+                    self.harness_failed(token, code, message, retryable);
+                    Ok(())
+                }
+                Command::HarnessCheckpoint { token, checkpoint } => {
+                    if let Ok(work) = self.harness_guard(token) {
+                        if checkpoint.rounds > work.organizer_settings.max_rounds {
+                            self.harness_failed(
+                                token,
+                                "round_limit".into(),
+                                "检查点轮次超过当前配置".into(),
+                                false,
+                            );
+                        } else if let Err(e) = self.repo.harness.checkpoint(checkpoint) {
+                            self.harness_failed(token, e.code, e.message, e.retryable);
+                        } else {
+                            self.mark_dirty();
+                        }
+                    }
+                    Ok(())
+                }
+                Command::HarnessMemorySnapshot { request_id } => {
+                    self.emit(Event::HarnessMemoryState {
+                        request_id,
+                        snapshot: self.repo.harness.snapshot(),
+                    });
+                    Ok(())
+                }
+                Command::HarnessFeedback {
+                    request_id,
+                    sources,
+                    reason,
+                    scope,
+                } => {
+                    let result = self.harness_feedback(request_id, sources, reason, scope);
+                    self.harness_memory_receipt(request_id, result);
+                    Ok(())
+                }
+                Command::HarnessMemoryEdit { request_id, input } => {
+                    let result = self.harness_memory_edit(request_id, input);
+                    self.harness_memory_receipt(request_id, result);
+                    Ok(())
+                }
+                Command::HarnessMemoryDelete { request_id, ids } => {
+                    let result = self.harness_memory_delete(request_id, ids);
+                    self.harness_memory_receipt(request_id, result);
+                    Ok(())
+                }
                 Command::OrganizerProgress { request_id } => {
                     self.emit(Event::OrganizerProgress {
                         request_id,
@@ -2240,12 +3143,18 @@ impl Actor {
                 }
                 Command::OrganizerSnapshot { request_id } => {
                     let result = self.organizer_reconcile();
+                    let mut snapshot = self
+                        .repo
+                        .organizer
+                        .snapshot(self.organizer_work.is_some(), now_ms());
+                    if self.repo.harness.blocked {
+                        snapshot.storage_error =
+                            Some("Pi 记忆或任务状态损坏/超限，已暂停；原始历史可继续使用".into());
+                        snapshot.paused = true;
+                    }
                     self.emit(Event::OrganizerState {
                         request_id,
-                        snapshot: self
-                            .repo
-                            .organizer
-                            .snapshot(self.organizer_work.is_some(), now_ms()),
+                        snapshot,
                     });
                     result
                 }

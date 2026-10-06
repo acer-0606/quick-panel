@@ -2422,6 +2422,12 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
+                // Task2 compile compatibility; Task3 must route these correlated replies.
+                Event::HarnessContext { .. }
+                | Event::HarnessToolResult { .. }
+                | Event::HarnessFinished { .. }
+                | Event::HarnessMemoryState { .. }
+                | Event::HarnessMemoryReceipt { .. } => {}
                 Event::OrganizerProgress {
                     request_id,
                     progress,

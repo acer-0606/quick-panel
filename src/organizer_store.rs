@@ -11,6 +11,7 @@ pub(crate) enum Status {
     Processing,
     Ready(Proposal),
     Done,
+    Attention { code: String, message: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Record {
@@ -91,6 +92,15 @@ impl OrganizerStore {
                     return Err("整理缓存版本无效".into());
                 }
             }
+            if let Status::Attention { code, message } = &r.status
+                && (!crate::harness_tools::text_valid(code, 128, false)
+                    || message.chars().count() > 1024
+                    || message
+                        .chars()
+                        .any(|c| c.is_control() || crate::claude::is_bidi(c)))
+            {
+                return Err("整理需处理记录无效".into());
+            }
             if matches!(r.status, Status::Processing) {
                 r.status = Status::Queued;
                 state.dirty = true;
@@ -120,7 +130,7 @@ impl OrganizerStore {
                         Status::Queued => Stage::Waiting,
                         Status::Processing => Stage::Processing,
                         Status::Ready(_) => Stage::Ready,
-                        Status::Done => return None,
+                        Status::Done | Status::Attention { .. } => return None,
                     };
                     Some((r.candidate.source.clone(), stage))
                 })
@@ -151,6 +161,18 @@ impl OrganizerStore {
                     }
                 })
                 .collect(),
+            attention: self
+                .records
+                .iter()
+                .filter_map(|r| match &r.status {
+                    Status::Attention { code, message } => Some(crate::harness_tools::Attention {
+                        source: r.candidate.source.clone(),
+                        code: code.clone(),
+                        message: message.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect(),
             queued: self
                 .records
                 .iter()
@@ -178,6 +200,8 @@ impl OrganizerStore {
                                 + p.alias.as_ref().map_or(0, String::capacity)
                                 + tags_bytes(&p.tags)
                                 + p.reason.capacity()
+                        } else if let Status::Attention { code, message } = &r.status {
+                            code.capacity() + message.capacity()
                         } else {
                             0
                         }
@@ -300,6 +324,12 @@ impl OrganizerStore {
         self.retry_at_ms = None;
         self.paused = false;
         self.next_at_ms = 0;
+        for r in &mut self.records {
+            if matches!(r.status, Status::Attention { .. }) {
+                r.status = Status::Queued;
+                self.dirty = true;
+            }
+        }
         self.capacity_released();
     }
     pub fn recover(&mut self) {

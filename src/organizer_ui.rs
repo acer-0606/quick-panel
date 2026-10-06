@@ -206,6 +206,7 @@ pub fn parse_organizer_fields(values: &[String]) -> Result<OrganizerSettings, St
             .map_err(|_| "间隔请输入 30–3600 秒")?,
         batch_size: values[4].trim().parse().map_err(|_| "每批请输入 1–8 条")?,
         instructions: values[5].trim().into(),
+        ..OrganizerSettings::default()
     };
     settings.validate()?;
     Ok(settings)

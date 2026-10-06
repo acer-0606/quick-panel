@@ -37,6 +37,8 @@ pub enum OrganizerScope {
 #[serde(default)]
 pub struct OrganizerSettings {
     pub enabled: bool,
+    pub memory_enabled: bool,
+    pub max_rounds: u32,
     pub mode: OrganizerMode,
     pub scope: OrganizerScope,
     pub interval_seconds: u32,
@@ -47,6 +49,8 @@ impl Default for OrganizerSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            memory_enabled: true,
+            max_rounds: 4,
             mode: OrganizerMode::Suggest,
             scope: OrganizerScope::SavedAndPaths,
             interval_seconds: 60,
@@ -57,6 +61,9 @@ impl Default for OrganizerSettings {
 }
 impl OrganizerSettings {
     pub fn validate(&self) -> Result<(), String> {
+        if !(2..=8).contains(&self.max_rounds) {
+            return Err("Pi 最大轮次须为 2–8".into());
+        }
         if !(30..=3600).contains(&self.interval_seconds)
             || !(1..=MAX_BATCH_SIZE).contains(&self.batch_size)
         {
@@ -139,6 +146,7 @@ pub struct Snapshot {
     pub retry_at_ms: Option<i64>,
     pub paused: bool,
     pub saturated: bool,
+    pub attention: Vec<crate::harness_tools::Attention>,
 }
 
 fn bounded_text(text: &str, max_chars: usize, multiline: bool) -> bool {

@@ -166,6 +166,47 @@ pub struct SaveStats {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    HarnessContext {
+        token: u64,
+        request_id: u64,
+    },
+    HarnessTool {
+        token: u64,
+        call_id: String,
+        name: crate::pi_harness::ToolName,
+        arguments: serde_json::Value,
+    },
+    HarnessCheckpoint {
+        token: u64,
+        checkpoint: crate::pi_harness::Checkpoint,
+    },
+    HarnessFinish {
+        token: u64,
+        request_id: u64,
+    },
+    HarnessFailed {
+        token: u64,
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    HarnessFeedback {
+        request_id: u64,
+        sources: Vec<crate::organizer::Source>,
+        reason: String,
+        scope: crate::harness_tools::FeedbackScope,
+    },
+    HarnessMemorySnapshot {
+        request_id: u64,
+    },
+    HarnessMemoryEdit {
+        request_id: u64,
+        input: crate::harness_tools::MemoryEdit,
+    },
+    HarnessMemoryDelete {
+        request_id: u64,
+        ids: Vec<u64>,
+    },
     OrganizerDetail {
         request_id: u64,
         source: crate::organizer::Source,
@@ -232,6 +273,30 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    HarnessContext {
+        token: u64,
+        request_id: u64,
+        result: Result<crate::harness_tools::PiContext, crate::pi_harness::ToolError>,
+    },
+    HarnessToolResult {
+        token: u64,
+        call_id: String,
+        result: crate::pi_harness::HostResult<serde_json::Value>,
+    },
+    HarnessFinished {
+        token: u64,
+        request_id: u64,
+        result: Result<Vec<crate::organizer::Proposal>, String>,
+    },
+    HarnessMemoryState {
+        request_id: u64,
+        snapshot: crate::harness_tools::MemorySnapshot,
+    },
+    HarnessMemoryReceipt {
+        request_id: u64,
+        result: Result<(), String>,
+        pending_save: bool,
+    },
     OrganizerProgress {
         request_id: u64,
         progress: crate::organizer_display::Progress,

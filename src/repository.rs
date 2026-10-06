@@ -43,6 +43,7 @@ pub(crate) struct CommitEffects {
     pub sources_removed: bool,
 }
 pub(crate) struct Repository {
+    pub(crate) harness: crate::harness_store::HarnessStore,
     pub(crate) organizer: crate::organizer_store::OrganizerStore,
     pub(crate) paths: crate::path_activity_store::PathActivityStore,
     pub(crate) connection: Connection,
@@ -167,7 +168,9 @@ impl Repository {
             .map_err(|e| e.to_string())?;
         let paths = crate::path_activity_store::PathActivityStore::load(&connection)?;
         let organizer = crate::organizer_store::OrganizerStore::load(&connection)?;
+        let harness = crate::harness_store::HarnessStore::load(&connection);
         let repo = Self {
+            harness,
             organizer,
             paths,
             connection,
@@ -710,12 +713,14 @@ impl Repository {
         }
         self.paths.write(&tx)?;
         self.organizer.write(&tx)?;
+        self.harness.write(&tx)?;
         let observed_rowid = tx
             .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         self.paths.committed();
         self.organizer.committed();
+        self.harness.committed();
         self.observed_rowid = observed_rowid;
         self.retention_policy = Some(policy);
         if maintain {
