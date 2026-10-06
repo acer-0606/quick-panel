@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 
 #[derive(Clone)]
 pub struct RowDetail {
+    pub title: String,
     pub text: String,
     pub saved_at_ms: Option<i64>,
     pub visited_at_ms: Option<i64>,
@@ -151,6 +152,7 @@ impl Entry {
             }
         }
         RowDetail {
+            title: self.title().into(),
             text,
             saved_at_ms: self.saved().map(|item| item.created_at_ms),
             visited_at_ms: self.suggested().map(|path| path.last_seen_ms),
@@ -166,6 +168,11 @@ impl Entry {
     pub fn title(&self) -> &str {
         match self {
             Self::Function(result) => result.title,
+            Self::Saved(item)
+                if item.kind != ItemKind::Clipboard && !item.alias.trim().is_empty() =>
+            {
+                item.alias.trim()
+            }
             Self::Saved(item) => &item.title,
             Self::Suggested(path) => &path.path.title,
         }
@@ -255,6 +262,43 @@ impl Entry {
             None
         }
     }
+}
+
+/// Display metadata is built once for a result snapshot, never persisted.
+pub fn row_details(rows: &[Entry], query: &str) -> Vec<RowDetail> {
+    let paths: Vec<_> = rows
+        .iter()
+        .map(|entry| {
+            entry
+                .saved()
+                .filter(|item| item.kind != ItemKind::Clipboard)
+                .map(|item| item.subtitle.as_str())
+                .or_else(|| entry.suggested().map(|path| path.path.as_str()))
+        })
+        .collect();
+    let labels = crate::path_labels::labels(&paths, query);
+    rows.iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let mut detail = entry.detail(query);
+            if let Some(Some(label)) = labels.get(index) {
+                let custom = entry.saved().is_some_and(|item| {
+                    !item.alias.trim().is_empty()
+                        || item.title.to_lowercase() != label.leaf.to_lowercase()
+                });
+                if !custom {
+                    detail.title.clone_from(&label.title);
+                }
+                detail.text = label.context.clone();
+                if let Some(path) = entry.suggested() {
+                    detail
+                        .text
+                        .push_str(&format!(" · 外部观察 · {} 次", path.visits));
+                }
+            }
+            detail
+        })
+        .collect()
 }
 
 struct Spec {

@@ -258,8 +258,9 @@ struct RenderState {
     dpi: u32,
     colors: Rc<theme::Colors>,
     font: HFONT,
-    saved_times: Vec<String>,
-    row_details: Vec<palette::RowDetail>,
+    saved_times: Rc<Vec<String>>,
+    row_details: Rc<Vec<palette::RowDetail>>,
+    query: String,
     items: Vec<PaletteEntry>,
     image: Option<Arc<Image>>,
 }
@@ -602,8 +603,9 @@ pub fn run() -> Result<(), String> {
             render: RefCell::new(Rc::new(RenderState {
                 dpi: 96,
                 colors: host_colors,
-                saved_times: Vec::new(),
-                row_details: Vec::new(),
+                saved_times: Rc::new(Vec::new()),
+                row_details: Rc::new(Vec::new()),
+                query: String::new(),
                 font: HFONT::default(),
                 items: Vec::new(),
                 image: None,
@@ -711,31 +713,35 @@ impl App {
     fn sync_render(&self) {
         unsafe {
             if let Some(host) = self.host.as_ref() {
+                let previous = host.render.borrow().clone();
+                let (row_details, saved_times) =
+                    if previous.items == self.items && previous.query == self.query {
+                        (previous.row_details.clone(), previous.saved_times.clone())
+                    } else {
+                        let details = palette::row_details(&self.items, &self.query);
+                        let times = details
+                            .iter()
+                            .map(|detail| {
+                                detail
+                                    .saved_at_ms
+                                    .map(local_saved_time)
+                                    .or_else(|| {
+                                        detail
+                                            .visited_at_ms
+                                            .map(|time| format!("访 {}", local_saved_time(time)))
+                                    })
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+                        (Rc::new(details), Rc::new(times))
+                    };
                 *host.render.borrow_mut() = Rc::new(RenderState {
                     dpi: self.dpi,
                     colors: self.colors.clone(),
                     font: self.font,
-                    saved_times: self
-                        .items
-                        .iter()
-                        .map(|entry| {
-                            let detail = entry.detail(&self.query);
-                            detail
-                                .saved_at_ms
-                                .map(local_saved_time)
-                                .or_else(|| {
-                                    detail
-                                        .visited_at_ms
-                                        .map(|time| format!("访 {}", local_saved_time(time)))
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect(),
-                    row_details: self
-                        .items
-                        .iter()
-                        .map(|entry| entry.detail(&self.query))
-                        .collect(),
+                    saved_times,
+                    row_details,
+                    query: self.query.clone(),
                     items: self.items.clone(),
                     image: self.image.clone(),
                 });
@@ -1841,6 +1847,8 @@ impl App {
             },
         );
         if self.items == items {
+            self.sync_render();
+            let _ = InvalidateRect(Some(self.list), None, false);
             self.selection();
             return;
         }
@@ -1875,8 +1883,18 @@ impl App {
         self.sync_render();
         SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(0)), None);
         SendMessageW(self.list, LB_RESETCONTENT, None, None);
-        for item in &self.items {
-            let title = wide(item.title());
+        let details = self
+            .host
+            .as_ref()
+            .map(|host| host.render.borrow().row_details.clone());
+        for (index, item) in self.items.iter().enumerate() {
+            let title = wide(
+                details
+                    .as_ref()
+                    .and_then(|details| details.get(index))
+                    .map(|detail| detail.title.as_str())
+                    .unwrap_or_else(|| item.title()),
+            );
             SendMessageW(
                 self.list,
                 LB_ADDSTRING,
@@ -3418,7 +3436,11 @@ unsafe fn render_message(
                 let mut title = wide(&format!(
                     "{}{}",
                     if item.pinned() { "★ " } else { "" },
-                    item.title()
+                    render
+                        .row_details
+                        .get(draw.itemID as usize)
+                        .map(|detail| detail.title.as_str())
+                        .unwrap_or_else(|| item.title())
                 ));
                 let mut rect = draw.rcItem;
                 rect.left += render.s(14);
