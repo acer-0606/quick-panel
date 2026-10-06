@@ -131,6 +131,54 @@ fn late_results_keep_visible_order_and_append_new_matches() {
     );
 }
 
+// A late query refresh after AI metadata must leave an open preview alone, but
+// selecting a different source or changing its actual target still reloads it.
+#[test]
+fn late_ai_metadata_refresh_keeps_preview_only_for_the_same_unchanged_source() {
+    use quick_panel::path_activity::PathSuggestion;
+    let old = Entry::Saved(saved("a"));
+    let mut new = saved("a");
+    new.alias = "AI 别名".into();
+    new.tags = vec!["AI 标签".into()];
+    assert!(palette::same_preview_source(
+        Some(&old),
+        Some(&Entry::Saved(new.clone()))
+    ));
+    new.subtitle = "C:/Different/Target".into();
+    assert!(!palette::same_preview_source(
+        Some(&old),
+        Some(&Entry::Saved(new))
+    ));
+    assert!(!palette::same_preview_source(
+        Some(&old),
+        Some(&Entry::Saved(saved("b")))
+    ));
+    assert!(!palette::same_preview_source(Some(&old), None));
+    let path = PathSuggestion {
+        key: "c:\\originalcase\\logs".into(),
+        path: "C:\\OriginalCase\\Logs".into(),
+        title: "Logs".into(),
+        kind: ItemKind::Folder,
+        alias: String::new(),
+        tags: vec![],
+        visits: 1,
+        last_seen_ms: 1,
+    };
+    let old = Entry::Suggested(path.clone().into());
+    let mut new = path;
+    new.alias = "项目日志".into();
+    new.tags = vec!["项目".into()];
+    assert!(palette::same_preview_source(
+        Some(&old),
+        Some(&Entry::Suggested(new.clone().into()))
+    ));
+    new.path = "C:\\Different\\Logs".into();
+    assert!(!palette::same_preview_source(
+        Some(&old),
+        Some(&Entry::Suggested(new.into()))
+    ));
+}
+
 #[test]
 fn organizer_entry_exposes_global_cooldown_without_per_item_errors() {
     let mut p = progress("a", Stage::Waiting);

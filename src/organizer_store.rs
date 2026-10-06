@@ -106,7 +106,7 @@ impl OrganizerStore {
             .count()
     }
     /// Pure in-memory projection: no candidate/context clone, reconciliation or dirty flag.
-    pub fn progress(&self, enabled: bool) -> crate::organizer_display::Progress {
+    pub fn progress(&self, enabled: bool, now_ms: i64) -> crate::organizer_display::Progress {
         use crate::organizer_display::{Progress, Stage};
         if !enabled {
             return Progress::default();
@@ -126,12 +126,16 @@ impl OrganizerStore {
                 })
                 .collect(),
             paused: self.paused,
-            cooling: self.retry_at_ms.is_some(),
+            cooling: self.retry_at_ms.is_some_and(|deadline| deadline > now_ms)
+                && !self
+                    .records
+                    .iter()
+                    .any(|r| matches!(r.status, Status::Processing)),
             saturated: self.saturated || self.ready_count() >= MAX_READY_PROPOSALS,
             storage_error: self.blocked,
         }
     }
-    pub fn snapshot(&self, in_flight: bool) -> Snapshot {
+    pub fn snapshot(&self, in_flight: bool, now_ms: i64) -> Snapshot {
         Snapshot {
             storage_error: self
                 .blocked
@@ -154,7 +158,9 @@ impl OrganizerStore {
                 .count(),
             in_flight,
             failures: self.failures,
-            retry_at_ms: self.retry_at_ms,
+            retry_at_ms: self
+                .retry_at_ms
+                .filter(|deadline| *deadline > now_ms && !in_flight),
             paused: self.paused,
             saturated: self.saturated || self.ready_count() >= MAX_READY_PROPOSALS,
         }
@@ -373,6 +379,42 @@ fn candidate_bytes(c: &Candidate) -> usize {
 mod tests {
     use super::*;
     #[test]
+    fn expired_cooldown_does_not_hide_an_automatic_retry() {
+        use crate::organizer_display::Stage;
+        let mut store = OrganizerStore {
+            retry_at_ms: Some(100),
+            failures: 1,
+            ..Default::default()
+        };
+        assert!(store.progress(true, 99).cooling);
+        assert!(store.snapshot(false, 99).retry_at_ms.is_some());
+        assert!(!store.progress(true, 100).cooling);
+        assert!(store.snapshot(false, 100).retry_at_ms.is_none());
+        store.records.push(Record {
+            candidate: Candidate {
+                source: Source::SavedItem { id: "retry".into() },
+                fingerprint: "f".into(),
+                expected_version: "v".into(),
+                kind: crate::model::ItemKind::Folder,
+                title: "logs".into(),
+                alias: String::new(),
+                tags: vec![],
+                context: "C:/logs".into(),
+            },
+            status: Status::Processing,
+        });
+        let p = store.progress(true, 101);
+        assert_eq!(p.items[0].1, Stage::Processing);
+        assert!(p.label().contains("整理中") && !p.label().contains("冷却"));
+        assert!(store.snapshot(true, 101).retry_at_ms.is_none());
+        assert_eq!(store.failures, 1);
+        assert_eq!(store.retry_at_ms, Some(100));
+        assert!(
+            !store.dirty,
+            "reading display state must not schedule a save"
+        );
+    }
+    #[test]
     fn freed_ready_capacity_clears_saturation_without_requeueing_sources() {
         let candidate = Candidate {
             source: Source::SavedItem { id: "one".into() },
@@ -398,10 +440,10 @@ mod tests {
             }),
         });
         store.forget(&Source::SavedItem { id: "one".into() });
-        assert!(!store.snapshot(false).saturated);
+        assert!(!store.snapshot(false, 0).saturated);
         assert!(store.records.is_empty());
         store.saturated = true;
         store.reset();
-        assert!(!store.snapshot(false).saturated);
+        assert!(!store.snapshot(false, 0).saturated);
     }
 }

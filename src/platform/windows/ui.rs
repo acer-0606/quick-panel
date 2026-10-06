@@ -2170,15 +2170,15 @@ impl App {
         if self.items == items {
             self.sync_render();
             let _ = InvalidateRect(Some(self.list), None, false);
-            self.selection();
+            self.selection_with_preview(self.organizer_preserve_order);
             return;
         }
-        let selected_content = self
+        let selected_entry = self
             .state
             .selected_index()
             .and_then(|i| self.items.get(i))
-            .and_then(PaletteEntry::saved)
             .cloned();
+        let selected_content = selected_entry.as_ref().and_then(PaletteEntry::saved);
         let top_index = SendMessageW(self.list, LB_GETTOPINDEX, None, None).0.max(0) as usize;
         let top_id = self.items.get(top_index).map(|e| e.id().to_owned());
         self.items = items;
@@ -2195,7 +2195,6 @@ impl App {
             .and_then(|i| self.items.get(i))
             .and_then(PaletteEntry::saved);
         let version_changed = selected_content
-            .as_ref()
             .zip(current_content)
             .is_some_and(|(old, next)| !crate::preview::same_content_version(old, next));
         if selected_before.as_deref() != self.state.selected_id() || version_changed {
@@ -2230,7 +2229,12 @@ impl App {
         SendMessageW(self.list, LB_SETTOPINDEX, Some(WPARAM(top)), None);
         SendMessageW(self.list, WM_SETREDRAW, Some(WPARAM(1)), None);
         let _ = InvalidateRect(Some(self.list), None, true);
-        self.selection();
+        let keep_preview = self.organizer_preserve_order
+            && palette::same_preview_source(
+                selected_entry.as_ref(),
+                self.state.selected_index().and_then(|i| self.items.get(i)),
+            );
+        self.selection_with_preview(keep_preview);
     }
     unsafe fn capture(&mut self) {
         let sequence = clipboard::sequence_number();
@@ -2700,6 +2704,9 @@ impl App {
         }
     }
     unsafe fn selection(&mut self) {
+        self.selection_with_preview(false);
+    }
+    unsafe fn selection_with_preview(&mut self, keep_preview: bool) {
         let previous = self.state.selected_id().map(str::to_owned);
         let i = SendMessageW(self.list, LB_GETCURSEL, None, None).0;
         if i >= 0 {
@@ -2732,7 +2739,7 @@ impl App {
         } else {
             "Enter 打开 · Esc 关闭 · 右键更多"
         });
-        if self.preview_open {
+        if self.preview_open && !(keep_preview && previous.as_deref() == self.state.selected_id()) {
             if function {
                 self.clear_preview();
             } else {

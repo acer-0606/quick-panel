@@ -271,6 +271,23 @@ impl Entry {
     }
 }
 
+/// Only trusted organizer refreshes may retain the existing preview across
+/// alias/tag changes. A different source, target, kind or title must reload it.
+pub fn same_preview_source(before: Option<&Entry>, after: Option<&Entry>) -> bool {
+    match (before, after) {
+        (Some(Entry::Saved(a)), Some(Entry::Saved(b))) => {
+            a.id == b.id && a.kind == b.kind && a.title == b.title && a.subtitle == b.subtitle
+        }
+        (Some(Entry::Suggested(a)), Some(Entry::Suggested(b))) => {
+            a.path.key == b.path.key
+                && a.path.path == b.path.path
+                && a.path.kind == b.path.kind
+                && a.path.title == b.path.title
+        }
+        _ => false,
+    }
+}
+
 /// Keep already-visible rows in place when an older in-flight query completes
 /// after a metadata-only AI update. New matches keep their order at the end.
 pub fn preserve_visible_order(previous: &[Entry], mut next: Vec<Entry>) -> Vec<Entry> {

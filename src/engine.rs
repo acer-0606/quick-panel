@@ -2221,7 +2221,7 @@ impl Actor {
                         progress: self
                             .repo
                             .organizer
-                            .progress(self.settings.organizer.enabled),
+                            .progress(self.settings.organizer.enabled, now_ms()),
                     });
                     Ok(())
                 }
@@ -2242,7 +2242,10 @@ impl Actor {
                     let result = self.organizer_reconcile();
                     self.emit(Event::OrganizerState {
                         request_id,
-                        snapshot: self.repo.organizer.snapshot(self.organizer_work.is_some()),
+                        snapshot: self
+                            .repo
+                            .organizer
+                            .snapshot(self.organizer_work.is_some(), now_ms()),
                     });
                     result
                 }
