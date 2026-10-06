@@ -5,3 +5,7 @@
 *.db-wal
 *.db-shm
 .DS_Store
+
+/agent-runtime/node_modules/
+/agent-runtime/.pnpm-store/
+/agent-runtime/dist/

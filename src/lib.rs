@@ -20,6 +20,7 @@ pub mod path_activity;
 mod path_activity_store;
 mod path_labels;
 pub mod path_observer;
+pub mod pi_harness;
 #[cfg(windows)]
 pub mod platform;
 pub mod preview;

@@ -1,0 +1,1 @@
+{"type":"start","protocol":1,"request_id":"fixture","model":"claude-fixture","effort":"low","instructions":"整理合成测试元数据","item_refs":[{"index":0,"kind":"text","title":"测试一","version":"v1"}],"max_rounds":4,"checkpoint":null}
