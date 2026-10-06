@@ -27,6 +27,14 @@
 - fresh 打包仅清理废弃生成文件 dist/SHA256SUMS.txt，先校验 owned path；实际测试确认软链接拒绝且目标保留、其他 dist 文件保持。最终校验仅使用 dist/SHA256SUMS，全部 23 成员再次核对 source/stage/ZIP、CRC、体积与 SHA。
 - 本批 focused 80/80（14 worker + 32 portable UI + 2 coordinator + 32 actor）；source-final full 457/0/2，所有生产修改已包含。Node 源码与 bundle 未变，沿用此前 30/30 真实 Pi suite，不重复未变化的套件。
 
+## 最终审查与交付收尾
+
+最终产品源码为 `d0dd6e47b6366c4a49dae1af2a9f691ba9d20625`。一次全功能审查提出的保存重试、空 IME 组合、反馈长度、旧校验文件和部分子控件重绘五项，在同一修复提交后经一次范围复审全部关闭；未发现修复引入的新 Critical、Important 或 Minor。Windows 实机验收边界仍保留。
+
+主控独立读取最终全套日志，汇总为 457 passed / 0 failed / 2 既有 ignored、38 个 suite summaries、无 warning，并核对最终严格检查、Release 与退出保存 core-check 三项 true。交付 ZIP 的全部 23 个成员逐字节核对当前 source、staging 与归档，CRC、SHA-256 和外置唯一清单均一致。补充本段后仅重新打包和核对文档成员，没有变更产品源码或重复运行测试。
+
+计划、过程记录、三个实施报告、审查与复审、RED/GREEN、构建及独立校验证据保留在项目的 `target/verification-2026-10-07-pi-harness/`；运行时二进制已保存在便携包内。本轮五项实施取舍及代价见 [设计中的实施取舍](superpowers/specs/2026-10-07-pi-harness-design.md#实施取舍)。代码和交付物继续保留在原目录与 `codex/quick-panel` 分支。
+
 ## 本轮 Task 3 审查修复
 
 Task 3 的451项全套包含以下回归（亦保留在最终457项中），Node生产协议与bundle未改，沿用已通过的30项Node验证：
