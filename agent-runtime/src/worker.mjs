@@ -45,12 +45,12 @@ const validators = new Map(specs.map(([name, , s]) => [name, Compile(s)]));
 const declarations = specs.map(([name, description, parameters]) => ({ name, description, parameters: JSON.parse(JSON.stringify(parameters)) }));
 const USAGE = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const incarnation = randomUUID();
-let task, agent, pending, terminal = false, sequence = 0, counters = { rounds: 0, calls: 0, elapsed_ms: 0 }, began = 0, timer;
+let task, agent, pending, terminal = false, sequence = 0, counters = { rounds: 0, calls: 0, elapsed_ms: 0 }, began = 0, timer, lastSettledJson;
 function elapsed() {
   return Math.min(LIMIT.deadline, counters.elapsed_ms + (began ? Math.max(0, Math.floor(performance.now() - began)) : 0));
 }
-function emit(frame) {
-  if (terminal && !["failed", "completed"].includes(frame.type)) return;
+function emit(frame, terminalCheckpoint = false) {
+  if (terminal && !["failed", "completed"].includes(frame.type) && !(terminalCheckpoint && frame.type === "checkpoint")) return;
   const line = JSON.stringify(frame);
   if (bytes(line) > LIMIT.frame) fail("frame_limit", "Outbound frame exceeds limit");
   process.stdout.write(line + "\n");
@@ -63,6 +63,18 @@ function stop(error) {
   const waiter = pending;
   pending = void 0;
   waiter?.reject(error);
+  // Refresh budgets against the last validated settled transcript, never Agent's
+  // possibly partial tool batch. This path cannot call stop recursively.
+  if (lastSettledJson !== undefined) {
+    try {
+      const cp = makeCheckpoint(lastSettledJson);
+      emit({type:"checkpoint",request_id:task.request_id,checkpoint:cp}, true);
+    } catch {
+      // Invalid initial checkpoints have no retained transcript. Reserved envelope
+      // headroom makes validated transcripts refreshable through the full budget.
+      // A destroyed output pipe still requires the host's exit-without-receipt guard.
+    }
+  }
   emit({ type: "failed", request_id: ident(task?.request_id) ? task.request_id : null, error: { code: error.code ?? "runtime", message: String(error.message ?? error).slice(0, 1024), retryable: error.retryable === true } });
   process.stdin.pause();
   process.exitCode = 1;
@@ -149,15 +161,26 @@ function validTextContent(v) {
   return typeof v === "string" || Array.isArray(v) && v.every((c) => object(c) && Object.keys(c).length === 2 && c.type === "text" && typeof c.text === "string");
 }
 // Only settled transcripts may be checkpointed; counters also reserve in-flight work.
+function makeCheckpoint(messages_json) {
+  const cp = {messages_json, rounds:counters.rounds, calls:counters.calls, elapsed_ms:elapsed()};
+  validateCheckpoint(cp);
+  return cp;
+}
+function reserveCheckpointEnvelope(cp) {
+  // A terminal refresh may grow decimal counter fields. Keep that fixed, tiny
+  // envelope headroom so a checkpoint at the byte boundary remains refreshable.
+  if (bytes({...cp,rounds:8,calls:LIMIT.calls,elapsed_ms:LIMIT.deadline}) > LIMIT.checkpoint) fail("checkpoint_limit", "Checkpoint cannot fit terminal budget envelope");
+}
 function checkpoint(messages) {
-  const cp = { messages_json: JSON.stringify(messages), rounds: counters.rounds, calls: counters.calls, elapsed_ms: elapsed() };
   try {
-    validateCheckpoint(cp);
+    const cp = makeCheckpoint(JSON.stringify(messages));
+    reserveCheckpointEnvelope(cp);
+    lastSettledJson = cp.messages_json;
+    emit({type:"checkpoint",request_id:task.request_id,checkpoint:cp});
   } catch (error) {
     stop(error);
     throw error;
   }
-  emit({ type: "checkpoint", request_id: task.request_id, checkpoint: cp });
 }
 function admitted(messages) {
   const indices = /* @__PURE__ */ new Set();
@@ -280,7 +303,9 @@ async function start(frame) {
   if (frame.checkpoint != null) {
     messages = validateCheckpoint(frame.checkpoint);
     if (messages[0].content !== systemPrompt(frame)) fail("protocol", "Checkpoint task profile mismatch");
+    reserveCheckpointEnvelope(frame.checkpoint);
     counters = { rounds: frame.checkpoint.rounds, calls: frame.checkpoint.calls, elapsed_ms: frame.checkpoint.elapsed_ms ?? 0 };
+    lastSettledJson = frame.checkpoint.messages_json;
   }
   began = performance.now();
   timer = setTimeout(() => stop(new Failure("deadline", "Task active time exhausted")), Math.max(1, LIMIT.deadline - counters.elapsed_ms));

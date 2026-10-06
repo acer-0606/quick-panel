@@ -332,3 +332,91 @@ test('malformed structured content and invalid UTF-8 fail as protocol errors',as
 test('escaped lone Unicode surrogates are rejected consistently with Rust JSON',async()=>{
  const raw=JSON.stringify(start).replace('claude-fixture','\\ud800')+'\n';const r=await run((f,send)=>{if(f.type==='llm')reply(f,send,ok(response([])));},start,{raw});assert.equal(terminal(r).error.code,'protocol');
 });
+
+test('failed model wait is checkpointed and automatic recovery exhausts the cumulative deadline', async () => {
+  const fixture = JSON.parse(await readFile(new URL('../fixtures/protocol-v1.json', import.meta.url)));
+  const checkpoint = {...fixture.runtime.find(f => f.type === 'checkpoint').checkpoint, elapsed_ms:119600};
+  const first = await run((f, send, child) => {
+    if (f.type === 'llm') {
+      const timer = setTimeout(() => reply(f, send, {ok:false,error:{code:'TRANSIENT_NETWORK',message:'synthetic delayed failure',retryable:true}}),250);
+      child.once('close', () => clearTimeout(timer));
+    }
+  }, {...start, checkpoint});
+  assert.equal(terminal(first).error.code, 'TRANSIENT_NETWORK');
+  const afterFailure = first.frames.filter(f => f.type === 'checkpoint').at(-1).checkpoint;
+  assert.ok(afterFailure.elapsed_ms >= 119800, `failed wait must count: ${afterFailure.elapsed_ms}`);
+  assert.equal(afterFailure.messages_json, checkpoint.messages_json);
+  const recovered = await run((f, send, child) => {
+    if (f.type === 'llm') {
+      const timer = setTimeout(() => reply(f, send, ok(response([tool('after-failure')]))),250);
+      child.once('close', () => clearTimeout(timer));
+    }
+    if (f.type === 'tool') reply(f,send,ok({accepted:true,index:0}));
+    if (f.type === 'finish') reply(f,send,ok({accepted:true,submitted_indices:[0]}));
+  }, {...start, checkpoint:afterFailure});
+  assert.equal(terminal(recovered).error.code, 'deadline');
+  assert.equal(recovered.frames.filter(f => f.type === 'completed').length, 0);
+  const finalCheckpoint = recovered.frames.filter(f => f.type === 'checkpoint').at(-1).checkpoint;
+  assert.equal(finalCheckpoint.elapsed_ms,120000);
+  assert.ok(finalCheckpoint.rounds >= afterFailure.rounds);
+});
+
+test('failure halfway through tools refreshes only the last settled transcript and reserved counters', async () => {
+  const fixture = JSON.parse(await readFile(new URL('../fixtures/protocol-v1.json', import.meta.url)));
+  const checkpoint = {...fixture.runtime.find(f => f.type === 'checkpoint').checkpoint, elapsed_ms:40000};
+  let toolCount=0;
+  const result=await run((f,send,child)=>{
+    if(f.type==='llm') reply(f,send,ok(response([tool('context-a','items_get_context',{index:0}),tool('usage-b','usage_get_summary',{index:0})])));
+    if(f.type==='tool'){
+      if(++toolCount===1)reply(f,send,ok({title:'synthetic settled host action'}));
+      else {
+        const timer=setTimeout(()=>reply(f,send,{ok:false,error:{code:'STALE_SOURCE',message:'synthetic invalidated batch',retryable:false}}),75);
+        child.once('close',()=>clearTimeout(timer));
+      }
+    }
+  },{...start,checkpoint});
+  assert.equal(terminal(result).error.code,'STALE_SOURCE');
+  const last=result.frames.filter(f=>f.type==='checkpoint').at(-1).checkpoint;
+  assert.ok(last.elapsed_ms>=40060,`host wait must count: ${last.elapsed_ms}`);
+  assert.equal(last.messages_json,checkpoint.messages_json,'must not checkpoint a partial assistant/tool batch');
+  assert.equal(last.calls,checkpoint.calls+2);
+  assert.equal(last.rounds,checkpoint.rounds+1);
+  assert.equal(result.frames.at(-2).type,'checkpoint');
+  assert.equal(result.frames.filter(f=>f.type==='failed').length,1);
+});
+
+test('failure awaiting completion receipt refreshes the fully staged transcript',async()=>{
+  const result=await run((f,send,child)=>{
+    if(f.type==='llm')reply(f,send,ok(response([tool('staged-before-failure')])));
+    if(f.type==='tool')reply(f,send,ok({accepted:true,index:0}));
+    if(f.type==='finish'){
+      const timer=setTimeout(()=>reply(f,send,{ok:false,error:{code:'TRANSIENT_NETWORK',message:'synthetic completion wait failure',retryable:true}}),75);
+      child.once('close',()=>clearTimeout(timer));
+    }
+  });
+  assert.equal(terminal(result).error.code,'TRANSIENT_NETWORK');
+  const checkpoints=result.frames.filter(f=>f.type==='checkpoint');
+  const settled=checkpoints.at(-2).checkpoint;
+  const failure=checkpoints.at(-1).checkpoint;
+  assert.equal(failure.messages_json,settled.messages_json);
+  assert.ok(failure.elapsed_ms>=settled.elapsed_ms+60);
+  assert.equal(JSON.parse(failure.messages_json).at(-1).role,'toolResult');
+  assert.equal(result.frames.at(-2).type,'checkpoint');
+});
+
+test('checkpoint envelope byte exhaustion emits one terminal without recursive refresh',async()=>{
+  const fixture=JSON.parse(await readFile(new URL('../fixtures/protocol-v1.json',import.meta.url)));
+  const base={...fixture.runtime.find(f=>f.type==='checkpoint').checkpoint,elapsed_ms:0,calls:0};
+  const messages=JSON.parse(base.messages_json);
+  messages[1].content='';
+  const empty={...base,messages_json:JSON.stringify(messages)};
+  const count=128*1024-Buffer.byteLength(JSON.stringify(empty));
+  messages[1].content='x'.repeat(count);
+  const checkpoint={...base,messages_json:JSON.stringify(messages)};
+  assert.equal(Buffer.byteLength(JSON.stringify(checkpoint)),128*1024);
+  const result=await run(()=>{}, {...start,checkpoint});
+  assert.equal(terminal(result).error.code,'checkpoint_limit');
+  assert.equal(result.frames.filter(f=>f.type==='failed').length,1);
+  assert.equal(result.frames.filter(f=>f.type==='checkpoint'||f.type==='llm').length,0);
+  assert.equal(result.code,1);
+});
