@@ -18,7 +18,8 @@ use windows::{
         UI::{
             Controls::*,
             HiDpi::GetDpiForWindow,
-            Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus},
+            Shell::{DefSubclassProc, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -37,6 +38,9 @@ struct View {
     dpi: u32,
     done: bool,
     revision: u64,
+    viewport: HWND,
+    scroll_y: i32,
+    geometry: Option<crate::organizer_ui::MemoryLayout>,
 }
 unsafe fn set(hwnd: HWND, value: &str) {
     if text(hwnd) != value {
@@ -317,52 +321,192 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
         }
     }
 }
-unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
-    let (controls, dpi, feedback) = {
+unsafe fn scroll_content(ptr: *const RefCell<View>, position: i32) {
+    let (viewport, old, geometry) = {
         let v = (*ptr).borrow();
-        (v.controls.clone(), v.dpi, v.target.is_some())
+        (v.viewport, v.scroll_y, v.geometry.clone())
+    };
+    let Some(geometry) = geometry else {
+        return;
+    };
+    let position = crate::organizer_ui::clamp_scroll(
+        position,
+        geometry.content_height,
+        geometry.viewport_height,
+    );
+    (*ptr).borrow_mut().scroll_y = position;
+    let info = SCROLLINFO {
+        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+        fMask: SIF_RANGE | SIF_PAGE | SIF_POS | SIF_DISABLENOSCROLL,
+        nMin: 0,
+        nMax: geometry.content_height - 1,
+        nPage: geometry.viewport_height as u32,
+        nPos: position,
+        ..Default::default()
+    };
+    SetScrollInfo(viewport, SB_VERT, &info, true);
+    ScrollWindowEx(
+        viewport,
+        0,
+        old - position,
+        None,
+        None,
+        None,
+        None,
+        SW_SCROLLCHILDREN | SW_INVALIDATE,
+    );
+}
+unsafe fn reveal_control(ptr: *const RefCell<View>, hwnd: HWND) {
+    let (index, position, geometry) = {
+        let v = (*ptr).borrow();
+        (
+            v.controls.iter().take(7).position(|c| *c == hwnd),
+            v.scroll_y,
+            v.geometry.clone(),
+        )
+    };
+    if let (Some(index), Some(geometry)) = (index, geometry) {
+        scroll_content(
+            ptr,
+            crate::organizer_ui::memory_focus_scroll(&geometry, index, position),
+        );
+    }
+}
+unsafe extern "system" fn focus_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    if msg == WM_SETFOCUS {
+        reveal_control(data as *const RefCell<View>, hwnd);
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+unsafe extern "system" fn viewport_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    let ptr = data as *const RefCell<View>;
+    if msg == WM_VSCROLL || msg == WM_MOUSEWHEEL {
+        let (position, dpi, height) = {
+            let v = (*ptr).borrow();
+            (
+                v.scroll_y,
+                v.dpi,
+                v.geometry.as_ref().map_or(1, |g| g.viewport_height),
+            )
+        };
+        let step = 24 * dpi as i32 / 96;
+        let next = if msg == WM_MOUSEWHEEL {
+            position - ((wp.0 >> 16) as u16 as i16 as i32) / 120 * step * 3
+        } else {
+            match wp.0 & 0xffff {
+                0 => position - step,
+                1 => position + step,
+                2 => position - height,
+                3 => position + height,
+                4 | 5 => {
+                    let mut info = SCROLLINFO {
+                        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
+                        fMask: SIF_TRACKPOS,
+                        ..Default::default()
+                    };
+                    let _ = GetScrollInfo(hwnd, SB_VERT, &mut info);
+                    info.nTrackPos
+                }
+                6 => 0,
+                7 => i32::MAX,
+                _ => position,
+            }
+        };
+        scroll_content(ptr, next);
+        return LRESULT(0);
+    }
+    if [
+        WM_COMMAND,
+        WM_CTLCOLOREDIT,
+        WM_CTLCOLORSTATIC,
+        WM_CTLCOLORLISTBOX,
+    ]
+    .contains(&msg)
+    {
+        return SendMessageW(GetParent(hwnd).unwrap_or_default(), msg, Some(wp), Some(lp));
+    }
+    if msg == WM_ERASEBKGND {
+        let mut rect = RECT::default();
+        let _ = GetClientRect(hwnd, &mut rect);
+        FillRect(
+            HDC(wp.0 as *mut _),
+            &rect,
+            (*ptr).borrow().colors.background,
+        );
+        return LRESULT(1);
+    }
+    DefSubclassProc(hwnd, msg, wp, lp)
+}
+unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
+    let (controls, dpi, feedback, viewport, scroll_y) = {
+        let v = (*ptr).borrow();
+        (
+            v.controls.clone(),
+            v.dpi,
+            v.target.is_some(),
+            v.viewport,
+            v.scroll_y,
+        )
     };
     if controls.len() != 11 {
         return;
     }
-    let mut r = RECT::default();
-    let _ = GetClientRect(hwnd, &mut r);
-    let s = |v| v * dpi as i32 / 96;
-    let w = (r.right - s(28)).max(1);
-    let footer = r.bottom - s(46);
-    let middle = (footer - s(148)).max(s(130));
-    let list_h = if feedback {
-        0
-    } else {
-        (middle / 2 - s(24)).max(s(50))
-    };
-    let detail_y = s(62) + list_h;
-    let editor_y = detail_y + s(66);
-    let editor_h = (middle + s(48) - editor_y).max(s(54));
-    let pos = [
-        (14, 10, w, s(44)),
-        (14, 62, w, list_h),
-        (14, detail_y, w, s(60)),
-        (14, editor_y, w, editor_h),
-        (14, footer - s(70), s(240), s(160)),
-        (270, footer - s(68), s(140), s(26)),
-        (270, footer - s(36), s(250), s(26)),
-        (14, footer, s(148), s(32)),
-        (172, footer, s(104), s(32)),
-        (286, footer, s(80), s(32)),
-        (0, footer, s(80), s(32)),
-    ];
-    for (i, (x, y, width, height)) in pos.into_iter().enumerate() {
-        let x = if i == 10 { r.right - s(94) } else { s(x) };
-        let y = if i < 2 { s(y) } else { y };
-        let _ = MoveWindow(controls[i], x, y, width, height.max(1), true);
+    let mut rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut rect);
+    let geometry = crate::organizer_ui::memory_layout(rect.right, rect.bottom, dpi, feedback);
+    let _ = MoveWindow(viewport, 0, 0, rect.right, geometry.viewport_height, true);
+    let scroll_y = crate::organizer_ui::clamp_scroll(
+        scroll_y,
+        geometry.content_height,
+        geometry.viewport_height,
+    );
+    for (index, r) in geometry.fields.iter().enumerate() {
+        // The combo's extra height is its popup, not another content field.
+        let height = if index == 4 {
+            160 * dpi as i32 / 96
+        } else {
+            r.height
+        };
+        let _ = MoveWindow(
+            controls[index],
+            r.x,
+            r.y - scroll_y,
+            r.width.max(1),
+            height.max(1),
+            true,
+        );
+        let _ = ShowWindow(
+            controls[index],
+            if r.height == 0 { SW_HIDE } else { SW_SHOW },
+        );
+    }
+    for (index, r) in geometry.buttons.iter().enumerate() {
+        let _ = MoveWindow(controls[index + 7], r.x, r.y, r.width, r.height, true);
     }
     if feedback {
-        let _ = ShowWindow(controls[1], SW_HIDE);
-        let _ = ShowWindow(controls[5], SW_HIDE);
-        let _ = ShowWindow(controls[6], SW_HIDE);
         let _ = ShowWindow(controls[9], SW_HIDE);
     }
+    {
+        let mut v = (*ptr).borrow_mut();
+        v.geometry = Some(geometry);
+        v.scroll_y = scroll_y;
+    }
+    scroll_content(ptr, scroll_y);
+    reveal_control(ptr, GetFocus());
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
@@ -386,8 +530,31 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 render(ptr);
                 return LRESULT(0);
             }
+            WM_MOUSEWHEEL => {
+                let viewport = (*ptr).borrow().viewport;
+                return SendMessageW(viewport, msg, Some(wp), Some(lp));
+            }
             WM_SIZE => {
                 layout(hwnd, ptr);
+                return LRESULT(0);
+            }
+            WM_GETMINMAXINFO => {
+                let dpi = (*ptr).borrow().dpi as i32;
+                let mut monitor = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                let _ = GetMonitorInfoW(
+                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                    &mut monitor,
+                );
+                let info = &mut *(lp.0 as *mut MINMAXINFO);
+                info.ptMinTrackSize = POINT {
+                    x: (320 * dpi / 96)
+                        .min((monitor.rcWork.right - monitor.rcWork.left - 24).max(1)),
+                    y: (280 * dpi / 96)
+                        .min((monitor.rcWork.bottom - monitor.rcWork.top - 24).max(1)),
+                };
                 return LRESULT(0);
             }
             WM_CLOSE => {
@@ -421,6 +588,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 let old = {
                     let mut v = (*ptr).borrow_mut();
+                    v.scroll_y = v.scroll_y * dpi as i32 / v.dpi as i32;
                     v.dpi = dpi;
                     std::mem::replace(&mut v.font, font)
                 };
@@ -516,6 +684,9 @@ unsafe fn show_form(
         dpi,
         done: false,
         revision: u64::MAX,
+        viewport: HWND::default(),
+        scroll_y: 0,
+        geometry: None,
     }));
     let title = if target.is_some() {
         w!("反馈并重做")
@@ -526,7 +697,7 @@ unsafe fn show_form(
         WS_EX_DLGMODALFRAME,
         class,
         title,
-        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX,
         monitor.rcWork.left + (monitor.rcWork.right - monitor.rcWork.left - width) / 2,
         monitor.rcWork.top + (monitor.rcWork.bottom - monitor.rcWork.top - height) / 2,
         width,
@@ -539,6 +710,37 @@ unsafe fn show_form(
         let _ = DeleteObject(view.borrow().font.into());
         return;
     };
+    let Ok(viewport) = CreateWindowExW(
+        WS_EX_CONTROLPARENT,
+        w!("STATIC"),
+        PCWSTR::null(),
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPCHILDREN,
+        0,
+        0,
+        1,
+        1,
+        Some(hwnd),
+        None,
+        None,
+        None,
+    ) else {
+        let _ = DestroyWindow(hwnd);
+        let _ = DeleteObject(view.borrow().font.into());
+        return;
+    };
+    view.borrow_mut().viewport = viewport;
+    if !SetWindowSubclass(
+        viewport,
+        Some(viewport_proc),
+        1,
+        (&*view as *const RefCell<View>) as usize,
+    )
+    .as_bool()
+    {
+        let _ = DestroyWindow(hwnd);
+        let _ = DeleteObject(view.borrow().font.into());
+        return;
+    }
     let create = |class: PCWSTR, label: &str, style: WINDOW_STYLE, id: usize| {
         let label = wide(label);
         CreateWindowExW(
@@ -550,7 +752,7 @@ unsafe fn show_form(
             0,
             1,
             1,
-            Some(hwnd),
+            Some(if id < 7 { viewport } else { hwnd }),
             Some(HMENU(id as *mut _)),
             None,
             None,
@@ -706,6 +908,14 @@ unsafe fn show_form(
     } else {
         controls[1]
     };
+    for control in controls.iter().take(7) {
+        let _ = SetWindowSubclass(
+            *control,
+            Some(focus_proc),
+            2,
+            (&*view as *const RefCell<View>) as usize,
+        );
+    }
     view.borrow_mut().controls = controls;
     theme::apply(hwnd, view.borrow().colors.dark);
     layout(hwnd, &*view);

@@ -799,3 +799,92 @@ pub fn displayed_feedback(
         }))
         .collect()
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+impl MemoryRect {
+    pub fn bottom(self) -> i32 {
+        self.y + self.height
+    }
+    pub fn right(self) -> i32 {
+        self.x + self.width
+    }
+}
+#[derive(Clone, Debug)]
+pub struct MemoryLayout {
+    pub fields: [MemoryRect; 7],
+    pub buttons: [MemoryRect; 4],
+    pub viewport_height: i32,
+    pub content_height: i32,
+}
+pub fn memory_layout(width: i32, height: i32, dpi: u32, feedback: bool) -> MemoryLayout {
+    let scale = |v: i32| v * dpi as i32 / 96;
+    let margin = scale(14);
+    let gap = scale(10);
+    let button_height = scale(32);
+    let rows = if width >= scale(480) { 1 } else { 2 };
+    let footer_height = rows * (button_height + gap) + margin;
+    let viewport_height = (height - footer_height).max(1);
+    // The viewport's vertical scrollbar retains its own gutter at every DPI.
+    let field_width = (width - 2 * margin - scale(20)).max(1);
+    let mut fields = [MemoryRect::default(); 7];
+    let mut y = gap;
+    for (index, logical_height) in [48, 128, 64, 128, 28, 26, 26].into_iter().enumerate() {
+        if feedback && [1, 5, 6].contains(&index) {
+            continue;
+        }
+        let field_height = scale(logical_height).min((viewport_height - 2 * gap).max(1));
+        fields[index] = MemoryRect {
+            x: margin,
+            y,
+            width: field_width,
+            height: field_height,
+        };
+        y += field_height + gap;
+    }
+    let mut buttons = [MemoryRect::default(); 4];
+    if rows == 1 {
+        let mut x = margin;
+        for (i, width) in [148, 104, 80, 80].into_iter().enumerate() {
+            buttons[i] = MemoryRect {
+                x,
+                y: viewport_height + gap,
+                width: scale(width),
+                height: button_height,
+            };
+            x += scale(width) + gap;
+        }
+    } else {
+        let column = ((width - 2 * margin - gap) / 2).max(1);
+        for (index, button) in buttons.iter_mut().enumerate() {
+            *button = MemoryRect {
+                x: margin + (index as i32 % 2) * (column + gap),
+                y: viewport_height + gap + (index as i32 / 2) * (button_height + gap),
+                width: column,
+                height: button_height,
+            };
+        }
+    }
+    MemoryLayout {
+        fields,
+        buttons,
+        viewport_height,
+        content_height: y + margin,
+    }
+}
+pub fn memory_focus_scroll(layout: &MemoryLayout, index: usize, position: i32) -> i32 {
+    let field = layout.fields[index];
+    let next = if field.y < position {
+        field.y
+    } else if field.bottom() > position + layout.viewport_height {
+        field.bottom() - layout.viewport_height
+    } else {
+        position
+    };
+    clamp_scroll(next, layout.content_height, layout.viewport_height)
+}

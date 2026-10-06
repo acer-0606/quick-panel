@@ -478,3 +478,145 @@ fn deadline_interrupts_a_child_that_never_reads_a_large_start_frame() {
     };
     assert_eq!(code, "deadline");
 }
+
+fn settled_runtime_checkpoint() -> quick_panel::pi_harness::Checkpoint {
+    use quick_panel::{model::Command, pi_harness::ToolError};
+    let worker = HarnessWorker::new(
+        paths(),
+        |_, _| Err(ToolError::new("TRANSIENT_NETWORK", "synthetic", true)),
+        Arc::new(|| {}),
+    );
+    worker.start(synthetic_work()).unwrap();
+    context_reply(&worker);
+    let mut latest = None;
+    loop {
+        match wait(&worker) {
+            Output::Actor(Command::HarnessCheckpoint { checkpoint, .. }) => {
+                latest = Some(checkpoint)
+            }
+            Output::Actor(Command::HarnessFailed { .. }) => return latest.unwrap(),
+            _ => panic!("unexpected output"),
+        }
+    }
+}
+fn resume_context(worker: &HarnessWorker, checkpoint: quick_panel::pi_harness::Checkpoint) {
+    use quick_panel::{
+        harness_tools::PiContext,
+        model::{Command, Event},
+        pi_harness::*,
+    };
+    let Output::Actor(Command::HarnessContext { token, request_id }) = wait(worker) else {
+        panic!()
+    };
+    assert!(worker.reply(Event::HarnessContext {
+        token,
+        request_id,
+        result: Ok(PiContext {
+            model: "fixture".into(),
+            effort: PublicEffort::Default,
+            instructions: String::new(),
+            item_refs: vec![ItemRef {
+                index: 0,
+                kind: "folder".into(),
+                title: "合成".into(),
+                version: "v1".into()
+            }],
+            max_rounds: 4,
+            checkpoint: Some(checkpoint)
+        })
+    }));
+}
+#[test]
+fn restored_near_deadline_collects_final_checkpoint_while_transport_is_still_blocked() {
+    use quick_panel::{model::Command, pi_harness::ToolError};
+    let mut cp = settled_runtime_checkpoint();
+    cp.elapsed_ms = 119_750;
+    cp.validate().unwrap();
+    let (entered, enter) = std::sync::mpsc::sync_channel(1);
+    let (release, gate) = std::sync::mpsc::sync_channel(1);
+    let gate = std::sync::Mutex::new(gate);
+    let worker = HarnessWorker::new(
+        paths(),
+        move |_, _| {
+            entered.send(()).unwrap();
+            gate.lock().unwrap().recv().unwrap();
+            Err(ToolError::new(
+                "TRANSIENT_NETWORK",
+                "late synthetic transport error",
+                true,
+            ))
+        },
+        Arc::new(|| {}),
+    );
+    worker.start(synthetic_work()).unwrap();
+    resume_context(&worker, cp);
+    enter.recv_timeout(Duration::from_secs(3)).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(worker.busy());
+    let mut checkpoints = vec![];
+    while let Some(out) = worker.take() {
+        if let Output::Actor(Command::HarnessCheckpoint { checkpoint, .. }) = out {
+            checkpoints.push(checkpoint);
+        }
+    }
+    let received_while_blocked = checkpoints.iter().any(|cp| cp.elapsed_ms == 120_000);
+    release.send(()).unwrap();
+    let failure = loop {
+        match wait(&worker) {
+            Output::Actor(Command::HarnessCheckpoint { checkpoint, .. }) => {
+                checkpoints.push(checkpoint)
+            }
+            Output::Actor(Command::HarnessFailed {
+                code, retryable, ..
+            }) => break (code, retryable),
+            _ => panic!("unexpected terminal"),
+        }
+    };
+    assert_eq!(
+        failure,
+        ("deadline".into(), false),
+        "Node deadline must outrank late HTTP/broken-pipe fallback"
+    );
+    let final_cp = checkpoints.last().unwrap();
+    final_cp.validate().unwrap();
+    assert_eq!(final_cp.elapsed_ms, 120_000);
+    assert_eq!(final_cp.rounds, 2);
+    assert!(
+        received_while_blocked,
+        "already-decoded checkpoint must not wait behind HTTP"
+    );
+    assert!(!worker.busy());
+}
+#[test]
+fn independent_collector_rejects_foreign_and_unsettled_checkpoints() {
+    use quick_panel::model::Command;
+    let cp = settled_runtime_checkpoint();
+    for foreign in [true, false] {
+        let mut bad = cp.clone();
+        if !foreign {
+            let mut messages: Vec<serde_json::Value> =
+                serde_json::from_str(&bad.messages_json).unwrap();
+            messages.push(serde_json::json!({"role":"toolResult","toolCallId":"orphan","toolName":"items_get_context","content":[],"isError":false,"timestamp":0}));
+            bad.messages_json = serde_json::to_string(&messages).unwrap();
+            assert!(bad.validate().is_err());
+        }
+        let frame = serde_json::json!({"type":"checkpoint","request_id":if foreign {"foreign"}else{"91"},"checkpoint":bad});
+        let dir = tempfile::tempdir().unwrap();
+        let module = dir.path().join("invalid-cp.mjs");
+        std::fs::write(&module,format!("console.log('{{\"type\":\"ready\",\"protocol\":1}}');process.stdin.once('data',()=>console.log(JSON.stringify({frame})));setInterval(()=>{{}},1000)")).unwrap();
+        let mut p = paths();
+        p.module = module;
+        let worker = worker(p).with_timeout(Duration::from_secs(2));
+        worker.start(synthetic_work()).unwrap();
+        context_reply(&worker);
+        let Output::Actor(Command::HarnessFailed {
+            code, retryable, ..
+        }) = wait(&worker)
+        else {
+            panic!("invalid checkpoint must never reach actor")
+        };
+        assert_eq!(code, "protocol");
+        assert!(!retryable);
+        assert!(worker.take().is_none());
+    }
+}

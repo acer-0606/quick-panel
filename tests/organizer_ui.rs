@@ -696,3 +696,81 @@ fn attention_rows_remain_non_applicable_and_status_explains_local_recovery() {
     assert_eq!(state.feedback_target().unwrap().1.rejected_alias, None);
     assert!(state.status(true).contains("需处理"));
 }
+#[test]
+fn memory_small_screen_layout_scrolls_every_field_without_overlap_or_footer_obstruction() {
+    for dpi in [96, 144, 192] {
+        for (width, height) in [(1000, 620), (800, 500), (640, 360)] {
+            for feedback in [false, true] {
+                let layout = memory_layout(width, height, dpi, feedback);
+                for (index, field) in layout
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.height > 0)
+                {
+                    assert!(
+                        field.x >= 0 && field.right() <= width,
+                        "horizontal bounds dpi={dpi} field={index}"
+                    );
+                    for other in layout
+                        .fields
+                        .iter()
+                        .skip(index + 1)
+                        .filter(|r| r.height > 0)
+                    {
+                        assert!(
+                            field.right() <= other.x
+                                || other.right() <= field.x
+                                || field.bottom() <= other.y
+                                || other.bottom() <= field.y,
+                            "content overlap dpi={dpi} width={width} height={height}: {field:?} / {other:?}"
+                        );
+                    }
+                    let scroll = memory_focus_scroll(&layout, index, 0);
+                    assert!(
+                        field.y - scroll >= 0 && field.bottom() - scroll <= layout.viewport_height,
+                        "field cannot be revealed: dpi={dpi} field={index}"
+                    );
+                }
+                for (i, button) in layout.buttons.iter().enumerate() {
+                    assert!(
+                        button.y >= layout.viewport_height
+                            && button.bottom() <= height
+                            && button.right() <= width
+                            && button.x >= 0,
+                        "footer must stay outside viewport"
+                    );
+                    for other in layout.buttons.iter().skip(i + 1) {
+                        assert!(
+                            button.right() <= other.x
+                                || other.right() <= button.x
+                                || button.bottom() <= other.y
+                                || other.bottom() <= button.y,
+                            "footer overlap"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_focus_scroll_reveals_reverse_tab_targets_and_clamps_after_resize() {
+    for dpi in [96, 144, 192] {
+        let layout = memory_layout(640, 360, dpi, false);
+        let mut position = layout.content_height;
+        for index in (0..7).rev() {
+            position = memory_focus_scroll(&layout, index, position);
+            let field = layout.fields[index];
+            assert!(
+                position >= 0
+                    && position <= (layout.content_height - layout.viewport_height).max(0)
+            );
+            assert!(field.y - position >= 0 && field.bottom() - position <= layout.viewport_height);
+        }
+        let larger = memory_layout(1200, 900, dpi, false);
+        let position = memory_focus_scroll(&larger, 6, layout.content_height);
+        assert!(position <= (larger.content_height - larger.viewport_height).max(0));
+    }
+}

@@ -75,6 +75,8 @@ struct State {
     child: Mutex<Option<OwnedChild>>,
     output: Mutex<VecDeque<Output>>,
     checkpoint: Mutex<Option<Command>>,
+    runtime_failure: Mutex<Option<ToolError>>,
+    reader: Mutex<Option<thread::JoinHandle<()>>>,
     reply: Mutex<Option<SyncSender<Event>>>,
     notify: Arc<dyn Fn() + Send + Sync>,
 }
@@ -106,6 +108,8 @@ impl HarnessWorker {
                 child: Mutex::new(None),
                 output: Mutex::new(VecDeque::new()),
                 checkpoint: Mutex::new(None),
+                runtime_failure: Mutex::new(None),
+                reader: Mutex::new(None),
                 reply: Mutex::new(None),
                 notify,
             }),
@@ -145,6 +149,7 @@ impl HarnessWorker {
         }
         self.state.cancelled.store(false, Ordering::Release);
         self.state.timed_out.store(false, Ordering::Release);
+        *self.state.runtime_failure.lock().unwrap() = None;
         let (tx, rx) = mpsc::sync_channel(1);
         *self.state.reply.lock().unwrap() = Some(tx);
         let state = self.state.clone();
@@ -196,6 +201,22 @@ impl HarnessWorker {
                     let _ = child.child.kill();
                     let _ = child.child.wait();
                 }
+                // The receiver is gone and the owned process is dead. Joining only here
+                // drains bytes already in stdout before choosing a fallback terminal.
+                let reader = state.reader.lock().unwrap().take();
+                if let Some(reader) = reader {
+                    let _ = reader.join();
+                }
+                let result = if result.is_err() && !state.cancelled.load(Ordering::Acquire) {
+                    state
+                        .runtime_failure
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .map_or(result, Err)
+                } else {
+                    result
+                };
                 *state.reply.lock().unwrap() = None;
                 let mut outputs = state.output.lock().unwrap();
                 if !state.exiting.load(Ordering::Acquire) {
@@ -301,6 +322,9 @@ fn failed(token: u64, err: ToolError) -> Command {
 fn check(state: &State, deadline: Instant) -> Result<(), ToolError> {
     if state.cancelled.load(Ordering::Acquire) {
         return Err(error("cancelled", "整理已取消"));
+    }
+    if let Some(failure) = state.runtime_failure.lock().unwrap().clone() {
+        return Err(failure);
     }
     if Instant::now() >= deadline {
         return Err(error("deadline", "整理达到执行时限，可重试"));
@@ -484,17 +508,66 @@ fn run(
     check(state, deadline)?;
     let (frames_tx, frames) = mpsc::sync_channel(1);
     let stderr_tx = frames_tx.clone();
-    thread::spawn(move || {
+    let started = Arc::new(AtomicBool::new(false));
+    let reader_started = started.clone();
+    let reader_state = state.clone();
+    let reader_token = work.map(|work| work.token);
+    let reader = thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
         loop {
             let value = read_runtime_frame(&mut reader)
                 .map_err(|_| error("protocol", "Pi 返回了无效或过大的消息"));
-            let terminal = !matches!(value, Ok(Some(_)));
+            if reader_started.load(Ordering::Acquire) {
+                match value {
+                    Ok(Some(RuntimeFrame::Checkpoint {
+                        request_id,
+                        checkpoint,
+                    })) => {
+                        if reader_token.is_some_and(|token| request_id == token.to_string()) {
+                            let mut latest = reader_state.checkpoint.lock().unwrap();
+                            if !reader_state.exiting.load(Ordering::Acquire) {
+                                *latest = Some(Command::HarnessCheckpoint {
+                                    token: reader_token.unwrap(),
+                                    checkpoint,
+                                });
+                            }
+                            drop(latest);
+                            (reader_state.notify)();
+                            continue;
+                        }
+                        *reader_state.runtime_failure.lock().unwrap() =
+                            Some(error("protocol", "Pi 检查点身份不匹配"));
+                        break;
+                    }
+                    Ok(Some(RuntimeFrame::Failed {
+                        request_id,
+                        error: failure,
+                    })) => {
+                        let failure = if reader_token.is_some_and(|token| {
+                            request_id.as_deref() == Some(token.to_string().as_str())
+                        }) {
+                            localize_failure(failure)
+                        } else {
+                            error("protocol", "Pi 终态身份不匹配")
+                        };
+                        *reader_state.runtime_failure.lock().unwrap() = Some(failure);
+                        break;
+                    }
+                    Err(failure) => {
+                        *reader_state.runtime_failure.lock().unwrap() = Some(failure);
+                        break;
+                    }
+                    _ => (),
+                }
+            }
+            let terminal = !matches!(value, Ok(Some(_)))
+                || matches!(value, Ok(Some(RuntimeFrame::Completed { .. })));
             if frames_tx.send(value).is_err() || terminal {
                 break;
             }
         }
     });
+    *state.reader.lock().unwrap() = Some(reader);
     thread::spawn(move || {
         let mut reader = stderr;
         let mut bytes = [0; 4096];
@@ -547,6 +620,7 @@ fn run(
         accepted: true,
         submitted_indices: context.item_refs.iter().map(|i| i.index).collect(),
     };
+    started.store(true, Ordering::Release);
     send(
         &mut input,
         HostFrame::Start {
@@ -582,6 +656,9 @@ fn run(
                     return Err(error("protocol", "Pi 模型或调用标识不匹配"));
                 }
                 let result = transport(work, request);
+                if let Some(failure) = state.runtime_failure.lock().unwrap().clone() {
+                    return Err(failure);
+                }
                 check(state, deadline)?;
                 let result = match result {
                     Ok(response) => {
@@ -637,20 +714,6 @@ fn run(
                         result,
                     },
                 )?;
-            }
-            RuntimeFrame::Checkpoint {
-                request_id: id,
-                checkpoint,
-            } if id == request_id => {
-                let mut latest = state.checkpoint.lock().unwrap();
-                if !state.exiting.load(Ordering::Acquire) {
-                    *latest = Some(Command::HarnessCheckpoint {
-                        token: work.token,
-                        checkpoint,
-                    });
-                }
-                drop(latest);
-                (state.notify)();
             }
             RuntimeFrame::Finish {
                 request_id: id,
