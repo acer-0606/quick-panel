@@ -83,6 +83,8 @@ impl Engine {
             .name("quick-panel-storage".into())
             .spawn(move || {
                 let mut actor = Actor {
+                    organizer_work: None,
+                    organizer_token: 0,
                     repo,
                     options,
                     settings,
@@ -107,6 +109,9 @@ impl Engine {
                     events: events_tx,
                     notifier,
                 };
+                if actor.repo.organizer.dirty {
+                    actor.mark_dirty();
+                }
                 actor.emit(Event::Ready(actor.settings.clone()));
                 let exit_ready = actor.run(commands);
                 let events = actor.events.clone();
@@ -318,6 +323,8 @@ struct SemanticStatusWork {
 }
 
 struct Actor {
+    organizer_work: Option<crate::organizer::Work>,
+    organizer_token: u64,
     repo: Repository,
     options: EngineOptions,
     settings: Settings,
@@ -359,6 +366,12 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64
+}
+fn organizer_hash(value: &impl serde::Serialize) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(value).expect("serializable organizer identity"))
+    )
 }
 fn item_bytes(item: &StoredItem) -> usize {
     item.text.len().saturating_add(
@@ -418,6 +431,504 @@ fn scope_matches(kind: ItemKind, scope: Scope) -> bool {
     )
 }
 impl Actor {
+    // All organizer reads are bounded metadata/text-slice reads; representations never enter work.
+    fn organizer_candidate(
+        &self,
+        source: &crate::organizer::Source,
+    ) -> Result<Option<crate::organizer::Candidate>, String> {
+        use crate::organizer::{Candidate, OrganizerScope, Source};
+        let scope = self.settings.organizer.scope;
+        let (kind, title, alias, tags, context, fingerprint, version) = match source {
+            Source::SavedItem { id } => {
+                if scope == OrganizerScope::PathsOnly || self.deleted.contains(id) {
+                    return Ok(None);
+                }
+                let item = if let Some(p) = self.pending.get(id) {
+                    StoredItem {
+                        summary: p.item.summary.clone(),
+                        target: p.item.target.clone(),
+                        open_with: p.item.open_with.clone(),
+                        text: String::new(),
+                        representations: vec![],
+                    }
+                } else {
+                    let Some(item) = self.repo.metadata(id)? else {
+                        return Ok(None);
+                    };
+                    item
+                };
+                let s = &item.summary;
+                if s.kind == ItemKind::Clipboard
+                    && ((!s.pinned && scope != OrganizerScope::AllTextAndPaths)
+                        || self
+                            .settings
+                            .excluded_apps
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&s.subtitle)))
+                {
+                    return Ok(None);
+                }
+                if let Some(path) = &item.target
+                    && crate::path_activity::normalize_path(path).is_ok_and(|p| {
+                        crate::path_activity::excluded(
+                            &p,
+                            &self.settings.path_activity.excluded_paths,
+                        )
+                    })
+                {
+                    return Ok(None);
+                }
+                let context = if s.kind == ItemKind::Clipboard {
+                    if let Some(p) = self
+                        .pending
+                        .get(id)
+                        .filter(|p| p.mutation == Mutation::Content)
+                    {
+                        p.item.text.chars().take(1024).collect()
+                    } else {
+                        self.repo.organizer_context(id)?
+                    }
+                } else {
+                    item.target
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(1024)
+                        .collect()
+                };
+                if s.kind == ItemKind::Clipboard && context.trim().is_empty() {
+                    return Ok(None);
+                }
+                let fingerprint = organizer_hash(&(id, s.kind, &item.target));
+                let version = organizer_hash(&(
+                    &fingerprint,
+                    &s.title,
+                    &s.alias,
+                    &s.tags,
+                    s.pinned,
+                    &s.subtitle,
+                    &item.open_with,
+                ));
+                (
+                    s.kind,
+                    s.title.chars().take(256).collect(),
+                    s.alias.clone(),
+                    s.tags.clone(),
+                    context,
+                    fingerprint,
+                    version,
+                )
+            }
+            Source::ObservedPath { normalized_path } => {
+                if scope == OrganizerScope::SavedOnly {
+                    return Ok(None);
+                }
+                let Some((target, kind, alias, tags)) = self.repo.paths.organizer_item(
+                    normalized_path,
+                    &self.settings.path_activity,
+                    now_ms(),
+                ) else {
+                    return Ok(None);
+                };
+                let fingerprint = organizer_hash(&(normalized_path, kind, &target));
+                let version = organizer_hash(&(&fingerprint, &alias, &tags));
+                let title = target
+                    .trim_end_matches('\\')
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&target)
+                    .chars()
+                    .take(256)
+                    .collect();
+                (
+                    kind,
+                    title,
+                    alias,
+                    tags,
+                    target.chars().take(1024).collect(),
+                    fingerprint,
+                    version,
+                )
+            }
+        };
+        let candidate = Candidate {
+            source: source.clone(),
+            fingerprint,
+            expected_version: version,
+            kind,
+            title,
+            alias,
+            tags,
+            context,
+        };
+        if crate::organizer::validate_candidate(&candidate).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(candidate))
+    }
+    fn organizer_changed(&mut self) {
+        if self.repo.organizer.dirty {
+            self.mark_dirty();
+        }
+        self.emit(Event::OrganizerChanged);
+    }
+    fn organizer_enqueue(&mut self, source: crate::organizer::Source) -> Result<(), String> {
+        if self.settings.organizer.enabled
+            && !self.exiting
+            && let Some(c) = self.organizer_candidate(&source)?
+        {
+            if self.repo.organizer.enqueue(c) {
+                self.organizer_changed();
+            }
+        }
+        Ok(())
+    }
+    fn organizer_cancel(&mut self) {
+        self.organizer_work = None;
+        self.repo.organizer.recover();
+    }
+    fn organizer_reconcile(&mut self) -> Result<(), String> {
+        use crate::organizer_store::Status;
+        let records = self.repo.organizer.records.clone();
+        let mut invalid = Vec::new();
+        for r in records {
+            let current = self.organizer_candidate(&r.candidate.source)?;
+            if current.as_ref().is_none_or(|c| {
+                !matches!(r.status, Status::Done)
+                    && c.expected_version != r.candidate.expected_version
+            }) {
+                invalid.push(r.candidate.source);
+            }
+        }
+        // Retention may already have removed a durable record in the commit;
+        // check the active snapshot independently from the remaining cache.
+        let mut cancel = false;
+        if let Some(work) = &self.organizer_work {
+            for c in &work.candidates {
+                if self.organizer_candidate(&c.source)?.as_ref() != Some(c) {
+                    cancel = true;
+                    break;
+                }
+            }
+        }
+        if cancel {
+            self.organizer_cancel();
+        }
+        let changed = cancel || !invalid.is_empty();
+        for source in invalid {
+            self.repo.organizer.forget(&source);
+        }
+        if changed {
+            self.organizer_changed();
+        }
+        Ok(())
+    }
+    fn organizer_tick(&mut self) -> Result<(), String> {
+        use crate::organizer_store::Status;
+        self.organizer_reconcile()?;
+        let now = now_ms();
+        if self.exiting
+            || !self.settings.organizer.enabled
+            || self.settings.organizer.validate().is_err()
+            || self.settings.ai.model.trim().is_empty()
+            || self.settings.ai.encrypted_key.is_empty()
+            || self.organizer_work.is_some()
+            || self.repo.organizer.paused
+            || self.repo.organizer.retry_at_ms.is_some_and(|t| t > now)
+            || self.repo.organizer.next_at_ms > now
+        {
+            return Ok(());
+        }
+        let room = if self.settings.organizer.mode == crate::organizer::OrganizerMode::Suggest {
+            crate::organizer::MAX_READY_PROPOSALS.saturating_sub(self.repo.organizer.ready_count())
+        } else {
+            self.settings.organizer.batch_size
+        };
+        let count = self.settings.organizer.batch_size.min(room);
+        if count == 0 {
+            return Ok(());
+        }
+        let mut reserved = self.repo.organizer.clone();
+        let mut candidates = Vec::new();
+        for index in 0..reserved.records.len() {
+            if candidates.len() == count {
+                break;
+            }
+            if !matches!(reserved.records[index].status, Status::Queued) {
+                continue;
+            }
+            let candidate = reserved.records[index].candidate.clone();
+            if self.settings.organizer.mode == crate::organizer::OrganizerMode::Suggest {
+                // Reserve worst-case validated output before transmitting any source.
+                // Four-byte scalar values also dominate JSON quote escaping.
+                reserved.records[index].status = Status::Ready(crate::organizer::Proposal {
+                    candidate: candidate.clone(),
+                    alias: Some("𐐀".repeat(48)),
+                    tags: (0..4).map(|i| format!("{i}{}", "𐐀".repeat(23))).collect(),
+                    reason: "𐐀".repeat(256),
+                });
+            }
+            if !reserved.fits() {
+                break;
+            }
+            candidates.push(candidate);
+        }
+        if candidates.is_empty() {
+            if !self.repo.organizer.saturated
+                && self
+                    .repo
+                    .organizer
+                    .records
+                    .iter()
+                    .any(|r| matches!(r.status, Status::Queued))
+            {
+                self.repo.organizer.saturated = true;
+                self.repo.organizer.dirty = true;
+                self.organizer_changed();
+            }
+            return Ok(());
+        }
+        self.organizer_token = self.organizer_token.wrapping_add(1);
+        let work = crate::organizer::Work {
+            token: self.organizer_token,
+            ai_settings: self.settings.ai.clone(),
+            organizer_settings: self.settings.organizer.clone(),
+            candidates,
+        };
+        for r in &mut self.repo.organizer.records {
+            if work.candidates.contains(&r.candidate) {
+                r.status = Status::Processing;
+            }
+        }
+        self.repo.organizer.next_at_ms =
+            now.saturating_add(i64::from(self.settings.organizer.interval_seconds) * 1000);
+        self.repo.organizer.dirty = true;
+        self.organizer_work = Some(work.clone());
+        self.organizer_changed();
+        self.emit(Event::OrganizerWork(work));
+        Ok(())
+    }
+    fn organizer_failed(&mut self) {
+        self.repo.organizer.recover();
+        let state = &mut self.repo.organizer;
+        state.failures = state.failures.saturating_add(1).min(3);
+        state.paused = state.failures >= 3;
+        state.retry_at_ms = Some(now_ms().saturating_add(if state.failures == 1 {
+            300_000
+        } else {
+            600_000
+        }));
+        state.dirty = true;
+        self.organizer_changed();
+    }
+    fn organizer_complete(
+        &mut self,
+        token: u64,
+        result: Result<Vec<crate::organizer::Proposal>, String>,
+    ) -> Result<(), String> {
+        use crate::organizer::{MAX_READY_PROPOSALS, OrganizerMode};
+        use crate::organizer_store::Status;
+        self.organizer_reconcile()?;
+        let Some(work) = self
+            .organizer_work
+            .as_ref()
+            .filter(|w| w.token == token)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if self.exiting
+            || !self.settings.organizer.enabled
+            || self.settings.ai != work.ai_settings
+            || self.settings.organizer != work.organizer_settings
+        {
+            self.organizer_cancel();
+            self.organizer_changed();
+            return Ok(());
+        }
+        self.organizer_work = None;
+        let proposals = match result {
+            Ok(p)
+                if p.len() == work.candidates.len()
+                    && p.iter()
+                        .zip(&work.candidates)
+                        .all(|(p, c)| p.candidate == *c && p.validate().is_ok()) =>
+            {
+                p
+            }
+            _ => {
+                self.organizer_failed();
+                return Ok(());
+            }
+        };
+        let mut next = self.repo.organizer.clone();
+        for proposal in &proposals {
+            if let Some(r) = next
+                .records
+                .iter_mut()
+                .find(|r| r.candidate == proposal.candidate)
+            {
+                r.status = if work.organizer_settings.mode == OrganizerMode::Automatic {
+                    Status::Done
+                } else {
+                    Status::Ready(proposal.clone())
+                };
+            }
+        }
+        if next.ready_count() > MAX_READY_PROPOSALS || !next.fits() {
+            self.repo.organizer.recover();
+            self.repo.organizer.saturated = true;
+            self.repo.organizer.dirty = true;
+            self.organizer_changed();
+            return Ok(());
+        }
+        if work.organizer_settings.mode == OrganizerMode::Automatic
+            && self.organizer_apply_metadata(&proposals, true).is_err()
+        {
+            self.repo.organizer.recover();
+            self.repo.organizer.paused = true;
+            self.repo.organizer.saturated = true;
+            self.repo.organizer.dirty = true;
+            self.organizer_changed();
+            return Ok(());
+        }
+        next.failures = 0;
+        next.retry_at_ms = None;
+        next.paused = false;
+        next.dirty = true;
+        self.repo.organizer = next;
+        self.organizer_changed();
+        Ok(())
+    }
+    fn organizer_apply_metadata(
+        &mut self,
+        proposals: &[crate::organizer::Proposal],
+        automatic: bool,
+    ) -> Result<(), String> {
+        use crate::organizer::Source;
+        // Validate every source before mutating any source: mixed stale selections are atomic.
+        for p in proposals {
+            p.validate()?;
+            if self.organizer_candidate(&p.candidate.source)?.as_ref() != Some(&p.candidate) {
+                return Err("整理建议已过期，请刷新后重试".into());
+            }
+        }
+        let mut saved = Vec::new();
+        let mut paths = Vec::new();
+        for p in proposals {
+            let mut alias = p.candidate.alias.clone();
+            if (!automatic || alias.is_empty())
+                && let Some(value) = &p.alias
+            {
+                alias = value.clone();
+            }
+            let mut tags = p.candidate.tags.clone();
+            for tag in &p.tags {
+                if !tags.contains(tag) && tags.len() < 32 {
+                    tags.push(tag.clone());
+                }
+            }
+            match &p.candidate.source {
+                Source::SavedItem { id } => {
+                    let item = if self.pending.contains_key(id) {
+                        None
+                    } else {
+                        Some(self.repo.metadata(id)?.ok_or("整理来源不存在")?)
+                    };
+                    saved.push((id.clone(), alias, tags, item));
+                }
+                Source::ObservedPath { normalized_path } => {
+                    paths.push((normalized_path.clone(), alias, tags))
+                }
+            }
+        }
+        if !self.repo.paths.can_annotate(&paths) {
+            return Err("路径元数据缓存已满".into());
+        }
+        if !saved.is_empty() {
+            self.source_generation += 1;
+            self.queries
+                .semantic_revision
+                .fetch_add(1, Ordering::AcqRel);
+            self.emit(Event::Changed);
+        }
+        for (id, alias, tags, item) in saved {
+            if let Some(p) = self.pending.get_mut(&id) {
+                p.item.summary.alias = alias;
+                p.item.summary.tags = tags;
+                if p.mutation != Mutation::Content {
+                    p.mutation = Mutation::SearchMetadata;
+                }
+            } else if let Some(mut item) = item {
+                item.summary.alias = alias;
+                item.summary.tags = tags;
+                self.pending.insert(
+                    id,
+                    PendingItem {
+                        item,
+                        mutation: Mutation::SearchMetadata,
+                    },
+                );
+            }
+        }
+        if !paths.is_empty() {
+            self.emit(Event::PathActivityChanged);
+        }
+        for (path, alias, tags) in paths {
+            self.repo.paths.annotate(&path, alias, tags);
+        }
+        self.mark_dirty();
+        Ok(())
+    }
+    fn organizer_apply(
+        &mut self,
+        proposals: Vec<crate::organizer::Proposal>,
+    ) -> Result<(), String> {
+        use crate::organizer_store::Status;
+        if proposals.is_empty() || proposals.len() > crate::organizer::MAX_READY_PROPOSALS {
+            return Err("请选择有效的整理建议".into());
+        }
+        let mut seen = HashSet::new();
+        for p in &proposals {
+            if !seen.insert(p.candidate.source.clone())
+                || !self
+                    .repo
+                    .organizer
+                    .records
+                    .iter()
+                    .any(|r| r.candidate == p.candidate && matches!(r.status, Status::Ready(_)))
+            {
+                return Err("整理建议已过期，请刷新后重试".into());
+            }
+        }
+        self.organizer_apply_metadata(&proposals, false)?;
+        for r in &mut self.repo.organizer.records {
+            if seen.contains(&r.candidate.source) {
+                r.status = Status::Done;
+            }
+        }
+        self.repo.organizer.dirty = true;
+        self.organizer_changed();
+        self.flush();
+        Ok(())
+    }
+    fn organizer_dismiss(&mut self, sources: Vec<crate::organizer::Source>) -> Result<(), String> {
+        if sources.len() > crate::organizer::MAX_RECORDS {
+            return Err("整理选择超过上限".into());
+        }
+        for r in &mut self.repo.organizer.records {
+            if sources.contains(&r.candidate.source)
+                && matches!(r.status, crate::organizer_store::Status::Ready(_))
+            {
+                r.status = crate::organizer_store::Status::Done;
+                self.repo.organizer.dirty = true;
+            }
+        }
+        self.organizer_changed();
+        self.flush();
+        Ok(())
+    }
+
     fn query_checkpoint(&self) -> Result<(), String> {
         if let Some((generation, revision)) = self.query_guard
             && (self.queries.generation.load(Ordering::Acquire) != generation
@@ -448,6 +959,7 @@ impl Actor {
     fn dirty(&self) -> bool {
         !self.pending.is_empty()
             || self.repo.paths.is_dirty()
+            || self.repo.organizer.dirty
             || !self.deleted.is_empty()
             || self.settings_dirty
             || !self.vectors.items.is_empty()
@@ -614,12 +1126,13 @@ impl Actor {
                 .get(&id)
                 .map_or(Mutation::Metadata, |p| p.mutation);
             self.pending.insert(
-                id,
+                id.clone(),
                 PendingItem {
                     item: old,
                     mutation,
                 },
             );
+            self.organizer_enqueue(crate::organizer::Source::SavedItem { id: id.clone() })?;
             self.mark_dirty();
             self.emit(Event::Changed);
             return Ok(());
@@ -662,7 +1175,7 @@ impl Actor {
         self.source_generation += 1;
         self.deleted.remove(&id);
         self.pending.insert(
-            id,
+            id.clone(),
             PendingItem {
                 item: StoredItem {
                     summary,
@@ -674,6 +1187,7 @@ impl Actor {
                 mutation: Mutation::Content,
             },
         );
+        self.organizer_enqueue(crate::organizer::Source::SavedItem { id })?;
         self.mark_dirty();
         self.emit(Event::Changed);
         if self.pending_bytes() >= self.options.max_pending_bytes {
@@ -987,6 +1501,7 @@ impl Actor {
         };
         self.pending
             .insert(input.id, PendingItem { item, mutation });
+        self.organizer_reconcile()?;
         self.source_generation += 1;
         self.mark_dirty();
         self.emit(Event::Changed);
@@ -1470,7 +1985,7 @@ impl Actor {
         self.source_generation += 1;
         self.deleted.remove(&id);
         self.pending.insert(
-            id,
+            id.clone(),
             PendingItem {
                 item: StoredItem {
                     summary,
@@ -1482,6 +1997,8 @@ impl Actor {
                 mutation: Mutation::Content,
             },
         );
+        self.organizer_reconcile()?;
+        self.organizer_enqueue(crate::organizer::Source::SavedItem { id })?;
         self.mark_dirty();
         self.emit(Event::Changed);
         self.flush();
@@ -1504,10 +2021,15 @@ impl Actor {
             .pending
             .get(&id)
             .map_or(Mutation::Metadata, |p| p.mutation);
-        self.pending.insert(id, PendingItem { item, mutation });
+        self.pending
+            .insert(id.clone(), PendingItem { item, mutation });
         self.mark_dirty();
         self.emit(Event::Changed);
         if pinned.is_some() {
+            self.organizer_reconcile()?;
+            if pinned == Some(true) {
+                self.organizer_enqueue(crate::organizer::Source::SavedItem { id })?;
+            }
             self.flush();
         }
         Ok(())
@@ -1630,7 +2152,36 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::OrganizerTick => self.organizer_tick(),
+                Command::OrganizerComplete { token, result } => {
+                    self.organizer_complete(token, result)
+                }
+                Command::OrganizerSnapshot { request_id } => {
+                    let result = self.organizer_reconcile();
+                    self.emit(Event::OrganizerState {
+                        request_id,
+                        snapshot: self.repo.organizer.snapshot(self.organizer_work.is_some()),
+                    });
+                    result
+                }
+                Command::OrganizerApply { proposals } => self.organizer_apply(proposals),
+                Command::OrganizerDismiss { sources } => self.organizer_dismiss(sources),
+                Command::OrganizerRetry => {
+                    self.organizer_cancel();
+                    self.repo.organizer.reset();
+                    self.organizer_changed();
+                    self.flush();
+                    Ok(())
+                }
                 Command::ObservePaths(observations) => {
+                    let before: Vec<_> = observations
+                        .iter()
+                        .filter_map(|o| crate::path_activity::normalize_path(&o.path).ok())
+                        .map(|p| {
+                            let r = self.repo.paths.observation_revision(&p);
+                            (p, r)
+                        })
+                        .collect();
                     if self
                         .repo
                         .paths
@@ -1638,13 +2189,27 @@ impl Actor {
                     {
                         self.mark_dirty();
                         self.emit(Event::PathActivityChanged);
+                        for (path, revision) in before {
+                            if self.repo.paths.observation_revision(&path) != revision {
+                                if let Err(e) =
+                                    self.organizer_enqueue(crate::organizer::Source::ObservedPath {
+                                        normalized_path: path,
+                                    })
+                                {
+                                    self.error(e);
+                                }
+                            }
+                        }
                     }
-                    Ok(())
+                    self.organizer_reconcile()
                 }
                 Command::SuppressPath(path) => match self.repo.paths.suppress(&path) {
                     Ok(true) => {
                         self.mark_dirty();
                         self.emit(Event::PathActivityChanged);
+                        if let Err(e) = self.organizer_reconcile() {
+                            self.error(e);
+                        }
                         self.flush();
                         Ok(())
                     }
@@ -1655,6 +2220,9 @@ impl Actor {
                     if self.repo.paths.clear() {
                         self.mark_dirty();
                         self.emit(Event::PathActivityChanged);
+                        if let Err(e) = self.organizer_reconcile() {
+                            self.error(e);
+                        }
                         self.flush();
                     }
                     Ok(())
@@ -1697,7 +2265,23 @@ impl Actor {
                         self.source_generation += 1;
                     }
                     let paths_changed = self.settings.path_activity != settings.path_activity;
+                    let organizer_changed = self.settings.ai != settings.ai
+                        || self.settings.organizer != settings.organizer
+                        || paths_changed
+                        || self.settings.excluded_apps != settings.excluded_apps;
+                    if organizer_changed {
+                        self.organizer_cancel();
+                        if self.settings.organizer.enabled
+                            || settings.organizer.enabled
+                            || !self.repo.organizer.records.is_empty()
+                        {
+                            self.repo.organizer.reset();
+                        }
+                    }
                     self.settings = settings;
+                    if let Err(e) = self.organizer_reconcile() {
+                        self.error(e);
+                    }
                     if paths_changed {
                         self.emit(Event::PathActivityChanged);
                     }
@@ -1720,7 +2304,12 @@ impl Actor {
                         }
                     };
                     self.pending.remove(&id);
+                    self.repo
+                        .organizer
+                        .forget(&crate::organizer::Source::SavedItem { id: id.clone() });
                     self.deleted.insert(id);
+                    self.organizer_cancel();
+                    self.organizer_changed();
                     self.mark_dirty();
                     self.emit(Event::Changed);
                     if immediate {
@@ -1749,6 +2338,7 @@ impl Actor {
                         });
                     }
                     self.exiting = true;
+                    self.organizer_cancel();
                     if self.flush() {
                         // Drop SQLite before the final acknowledgement.
                         self.repo.checkpoint();
@@ -1776,6 +2366,8 @@ mod status_scheduling_tests {
         settings.embedding.model = "status-fixture".into();
         settings.embedding.index_scope = crate::semantic::IndexScope::AllText;
         let actor = Actor {
+            organizer_work: None,
+            organizer_token: 0,
             repo: Repository::open(std::path::Path::new(":memory:")).unwrap(),
             options: EngineOptions::new(":memory:".into()),
             settings,

@@ -299,6 +299,8 @@ fn path_batches_wait_for_main_results_and_reject_late_query_events() {
         path: "C:\\A".into(),
         title: "A".into(),
         kind: ItemKind::Folder,
+        alias: String::new(),
+        tags: vec![],
         visits: 3,
         last_seen_ms: 5,
     };

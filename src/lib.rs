@@ -12,6 +12,7 @@ pub mod engine;
 pub mod hotkeys;
 pub mod model;
 pub mod organizer;
+mod organizer_store;
 pub mod palette;
 pub mod path_activity;
 mod path_activity_store;

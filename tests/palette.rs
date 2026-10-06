@@ -391,6 +391,8 @@ fn suggested(number: usize) -> quick_panel::path_activity::PathSuggestion {
         path: format!("C:\\Path{number}"),
         title: format!("Path{number}"),
         kind: ItemKind::Folder,
+        alias: String::new(),
+        tags: vec![],
         visits: 7,
         last_seen_ms: 999,
     }

@@ -14,6 +14,8 @@ const HALF_LIFE_MS: f64 = 7.0 * 86_400_000.0;
 #[derive(Clone)]
 struct Row {
     target: String,
+    alias: String,
+    tags: Vec<String>,
     kind: ItemKind,
     visits: u64,
     last_seen: i64,
@@ -54,8 +56,23 @@ impl PathActivityStore {
         } else {
             "path"
         };
+        let metadata_column = if has_column(db, "alias")? {
+            "coalesce(alias,''),coalesce(tags,'[]')"
+        } else {
+            "'','[]'"
+        };
         let sql = format!(
-            "SELECT path,kind,visits,last_seen_ms,weight,hidden,{target_column} FROM path_activity WHERE length(path)<=8192 AND length({target_column})<=8192 ORDER BY hidden DESC,last_seen_ms DESC,path LIMIT 1152"
+            "SELECT path,kind,visits,last_seen_ms,weight,hidden,{target_column},{metadata_column} FROM path_activity WHERE length(path)<=8192 AND length({target_column})<=8192 AND length({metadata_column_alias})<=192 AND length({metadata_column_tags})<=4096 ORDER BY hidden DESC,last_seen_ms DESC,path LIMIT 1152",
+            metadata_column_alias = if has_column(db, "alias")? {
+                "coalesce(alias,'')"
+            } else {
+                "''"
+            },
+            metadata_column_tags = if has_column(db, "tags")? {
+                "coalesce(tags,'[]')"
+            } else {
+                "'[]'"
+            }
         );
         let mut statement = db.prepare(&sql).map_err(|e| e.to_string())?;
         let records = statement
@@ -68,11 +85,13 @@ impl PathActivityStore {
                     r.get::<_, f64>(4)?,
                     r.get::<_, bool>(5)?,
                     r.get::<_, String>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, String>(8)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
         for record in records {
-            let (path, kind, visits, last_seen, weight, hidden, target) =
+            let (path, kind, visits, last_seen, weight, hidden, target, alias, tags) =
                 record.map_err(|e| e.to_string())?;
             if normalize_path(&target).as_ref() != Ok(&path)
                 || !matches!(kind, 1 | 2)
@@ -83,11 +102,24 @@ impl PathActivityStore {
             {
                 continue;
             }
-            store.bytes += Self::row_bytes(&path, &target);
+            let tags: Vec<String> = serde_json::from_str(&tags).unwrap_or_default();
+            if alias.chars().count() > 48
+                || tags.len() > 32
+                || tags.iter().any(|t| t.chars().count() > 24)
+            {
+                continue;
+            }
+            let extra = Self::metadata_bytes(&alias, &tags);
+            if store.bytes + Self::row_bytes(&path, &target) + extra > MAX_BYTES {
+                continue;
+            }
+            store.bytes += Self::row_bytes(&path, &target) + extra;
             store.rows.insert(
                 path,
                 Row {
                     target,
+                    alias,
+                    tags,
                     kind: if kind == 1 {
                         ItemKind::Folder
                     } else {
@@ -102,6 +134,24 @@ impl PathActivityStore {
         }
         Ok(store)
     }
+    fn metadata_bytes(alias: &str, tags: &[String]) -> usize {
+        alias.len()
+            + tags
+                .iter()
+                .map(|t| t.len() + std::mem::size_of::<String>())
+                .sum::<usize>()
+    }
+    pub fn can_annotate(&self, updates: &[(String, String, Vec<String>)]) -> bool {
+        let mut bytes = self.bytes;
+        for (path, alias, tags) in updates {
+            if let Some(row) = self.rows.get(path) {
+                bytes = bytes
+                    .saturating_sub(Self::metadata_bytes(&row.alias, &row.tags))
+                    .saturating_add(Self::metadata_bytes(alias, tags));
+            }
+        }
+        bytes <= MAX_BYTES
+    }
     fn row_bytes(path: &str, target: &str) -> usize {
         // Path plus dirty-set key, node/row overhead, and temporary search metadata.
         path.len()
@@ -114,6 +164,39 @@ impl PathActivityStore {
             < if hidden { MAX_HIDDEN } else { MAX_ACTIVE }
             && self.bytes.saturating_add(Self::row_bytes(path, target)) <= MAX_BYTES
     }
+    pub fn organizer_item(
+        &self,
+        path: &str,
+        settings: &PathActivitySettings,
+        now: i64,
+    ) -> Option<(String, ItemKind, String, Vec<String>)> {
+        let row = self.rows.get(path)?;
+        if !settings.enabled
+            || row.hidden
+            || row.last_seen < now.saturating_sub(RETENTION_MS)
+            || excluded(path, &settings.excluded_paths)
+        {
+            return None;
+        }
+        Some((
+            row.target.clone(),
+            row.kind,
+            row.alias.clone(),
+            row.tags.clone(),
+        ))
+    }
+    pub fn observation_revision(&self, path: &str) -> Option<(u64, i64)> {
+        self.rows.get(path).map(|r| (r.visits, r.last_seen))
+    }
+    pub fn annotate(&mut self, path: &str, alias: String, tags: Vec<String>) {
+        if let Some(row) = self.rows.get_mut(path) {
+            self.bytes = self.bytes - Self::metadata_bytes(&row.alias, &row.tags)
+                + Self::metadata_bytes(&alias, &tags);
+            row.alias = alias;
+            row.tags = tags;
+            self.dirty.insert(path.into());
+        }
+    }
     pub fn is_dirty(&self) -> bool {
         self.cleared || self.expired_before.is_some() || !self.dirty.is_empty()
     }
@@ -122,7 +205,9 @@ impl PathActivityStore {
         let before = self.rows.len();
         self.rows.retain(|key, row| {
             if !row.hidden && row.last_seen < cutoff {
-                self.bytes = self.bytes.saturating_sub(Self::row_bytes(key, &row.target));
+                self.bytes = self.bytes.saturating_sub(
+                    Self::row_bytes(key, &row.target) + Self::metadata_bytes(&row.alias, &row.tags),
+                );
                 self.dirty.remove(key);
                 false
             } else {
@@ -205,6 +290,8 @@ impl PathActivityStore {
                     path.clone(),
                     Row {
                         target,
+                        alias: String::new(),
+                        tags: vec![],
                         kind: observation.kind,
                         visits: 1,
                         last_seen: time,
@@ -238,6 +325,8 @@ impl PathActivityStore {
                 path.clone(),
                 Row {
                     target,
+                    alias: String::new(),
+                    tags: vec![],
                     kind: ItemKind::Folder,
                     visits: 0,
                     last_seen: 0,
@@ -314,8 +403,8 @@ impl PathActivityStore {
                     title: title.clone(),
                     subtitle: path.clone(),
                     kind: row.kind,
-                    alias: String::new(),
-                    tags: vec![],
+                    alias: row.alias.clone(),
+                    tags: row.tags.clone(),
                     pinned: false,
                     created_at_ms: row.last_seen,
                     last_used_ms: row.last_seen,
@@ -355,6 +444,8 @@ impl PathActivityStore {
                     .unwrap_or(path)
                     .to_owned(),
                 kind: row.kind,
+                alias: row.alias.clone(),
+                tags: row.tags.clone(),
                 visits: row.visits,
                 last_seen_ms: row.last_seen,
             })
@@ -369,6 +460,15 @@ impl PathActivityStore {
             tx.execute("ALTER TABLE path_activity ADD COLUMN target TEXT", [])
                 .map_err(|e| e.to_string())?;
         }
+        for (column, kind) in [("alias", "TEXT"), ("tags", "TEXT")] {
+            if !has_column(tx, column)? {
+                tx.execute(
+                    &format!("ALTER TABLE path_activity ADD COLUMN {column} {kind}"),
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
         if self.cleared {
             tx.execute("DELETE FROM path_activity", [])
                 .map_err(|e| e.to_string())?;
@@ -382,7 +482,7 @@ impl PathActivityStore {
         }
         for path in &self.dirty {
             if let Some(row) = self.rows.get(path) {
-                tx.execute("INSERT INTO path_activity(path,kind,visits,last_seen_ms,weight,hidden,target) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,visits=excluded.visits,last_seen_ms=excluded.last_seen_ms,weight=excluded.weight,hidden=excluded.hidden,target=excluded.target", params![path, if row.kind == ItemKind::Folder { 1 } else { 2 }, row.visits as i64, row.last_seen, row.weight, row.hidden, row.target]).map_err(|e| e.to_string())?;
+                tx.execute("INSERT INTO path_activity(path,kind,visits,last_seen_ms,weight,hidden,target,alias,tags) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(path) DO UPDATE SET kind=excluded.kind,visits=excluded.visits,last_seen_ms=excluded.last_seen_ms,weight=excluded.weight,hidden=excluded.hidden,target=excluded.target,alias=excluded.alias,tags=excluded.tags", params![path, if row.kind == ItemKind::Folder { 1 } else { 2 }, row.visits as i64, row.last_seen, row.weight, row.hidden, row.target, row.alias, serde_json::to_string(&row.tags).map_err(|e|e.to_string())?]).map_err(|e| e.to_string())?;
             }
         }
         Ok(())
@@ -402,6 +502,15 @@ fn has_target_column(db: &Connection) -> Result<bool, String> {
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('path_activity') WHERE name='target')",
         [],
         |row| row.get(0),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn has_column(db: &Connection, column: &str) -> Result<bool, String> {
+    db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('path_activity') WHERE name=?1)",
+        [column],
+        |r| r.get(0),
     )
     .map_err(|e| e.to_string())
 }

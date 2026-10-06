@@ -2080,6 +2080,10 @@ impl App {
     unsafe fn events(&mut self) {
         while let Some(event) = self.engine.as_ref().and_then(|e| e.try_recv().ok()) {
             match event {
+                // Native organizer integration replaces these explicit adapter arms.
+                Event::OrganizerWork(_)
+                | Event::OrganizerState { .. }
+                | Event::OrganizerChanged => {}
                 Event::PathSuggestions { request_id, items } => {
                     if self.state.is_current(request_id)
                         && let Some(paths) = self.path_batches.paths(request_id, items)

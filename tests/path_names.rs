@@ -94,6 +94,8 @@ fn observed_paths_and_saved_paths_share_the_same_display_logic() {
         path: r"D:\work\乙\server\logs".into(),
         title: "logs".into(),
         kind: ItemKind::Folder,
+        alias: String::new(),
+        tags: vec![],
         visits: 4,
         last_seen_ms: 99,
     };
@@ -110,4 +112,28 @@ fn observed_paths_and_saved_paths_share_the_same_display_logic() {
         rows[1].suggestion_action().unwrap().target.as_deref(),
         Some(r"D:\work\乙\server\logs")
     );
+}
+
+#[test]
+fn observed_alias_wins_disambiguation_and_explicit_action_preserves_tags_and_target() {
+    let suggestion = quick_panel::path_activity::PathSuggestion {
+        key: "c:\\project\\logs".into(),
+        path: "C:\\Project\\Logs".into(),
+        title: "Logs".into(),
+        alias: "项目运行记录".into(),
+        tags: vec!["运行".into()],
+        kind: ItemKind::Folder,
+        visits: 1,
+        last_seen_ms: 99,
+    };
+    let rows = vec![
+        Entry::Suggested(suggestion.into()),
+        path("other", "C:\\Other\\Logs"),
+    ];
+    assert_eq!(rows[0].title(), "项目运行记录");
+    assert_eq!(palette::row_details(&rows, "")[0].title, "项目运行记录");
+    let action = rows[0].suggestion_action().unwrap();
+    assert_eq!(action.summary.alias, "项目运行记录");
+    assert_eq!(action.summary.tags, vec!["运行"]);
+    assert_eq!(action.target.as_deref(), Some("C:\\Project\\Logs"));
 }

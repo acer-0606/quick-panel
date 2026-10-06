@@ -1,0 +1,776 @@
+use quick_panel::{engine::Engine, model::*, organizer::*, path_activity::*};
+use rusqlite::Connection;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+#[test]
+fn reading_a_dirty_snapshot_does_not_emit_change_and_retrigger_itself() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    settings(&e, config(OrganizerMode::Suggest));
+    capture(&e, "snapshot fixture");
+    snapshot(&e);
+    e.send(Command::OrganizerSnapshot { request_id: 19 })
+        .unwrap();
+    let mut changed = 0;
+    wait(&e, |event| {
+        assert!(
+            !matches!(event, Event::OrganizerChanged),
+            "read-only snapshot must not publish another change"
+        );
+        matches!(event, Event::OrganizerState { request_id: 19, .. })
+    });
+    while let Ok(event) = e.try_recv() {
+        if matches!(event, Event::OrganizerChanged) {
+            changed += 1;
+        }
+    }
+    assert_eq!(changed, 0);
+    stop(&e);
+}
+#[test]
+fn empty_ticks_are_read_only_and_do_not_create_the_optional_table() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    for _ in 0..3 {
+        e.send(Command::OrganizerTick).unwrap();
+        let s = snapshot(&e);
+        assert!(!s.saturated);
+        assert!(!s.in_flight);
+    }
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='organizer_state'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn automatic_path_metadata_uses_normal_deadline_without_semantic_invalidation() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let mut options = EngineOptions::new(p.clone());
+    options.save_interval_ms = 300;
+    let e = Engine::start(options, Arc::new(|| {})).unwrap();
+    wait(&e, |v| matches!(v, Event::Ready(_)));
+    settings(&e, config(OrganizerMode::Automatic));
+    observe(&e, "C:/Deadline");
+    let w = work(&e);
+    complete(&e, &w);
+    snapshot(&e);
+    let event = wait(&e, |v| matches!(v, Event::Saved(_)));
+    assert!(matches!(event,Event::Saved(s) if !s.semantic_status_changed));
+    let db = Connection::open(&p).unwrap();
+    let alias: String = db
+        .query_row("SELECT alias FROM path_activity", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(alias, "项目资料");
+    stop(&e);
+}
+
+#[test]
+fn excluded_application_and_expired_observation_never_produce_new_work() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    let mut s = config(OrganizerMode::Suggest);
+    s.excluded_apps = vec!["fixture.exe".into()];
+    settings(&e, s);
+    capture(&e, "excluded body");
+    assert_eq!(snapshot(&e).queued, 0);
+    observe(&e, "C:/Expiry");
+    let _w = work(&e);
+    flush(&e);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    db.execute("UPDATE path_activity SET last_seen_ms=0", [])
+        .unwrap();
+    drop(db);
+    let e = open(&p);
+    e.send(Command::OrganizerRetry).unwrap();
+    e.send(Command::OrganizerTick).unwrap();
+    let s = snapshot(&e);
+    assert_eq!(s.queued, 0);
+    assert!(!s.in_flight);
+    stop(&e);
+}
+fn wait(e: &Engine, f: impl Fn(&Event) -> bool) -> Event {
+    let end = Instant::now() + Duration::from_secs(5);
+    loop {
+        match e.try_recv() {
+            Ok(v) if f(&v) => return v,
+            Ok(Event::Error { message, .. }) => panic!("{message}"),
+            Ok(_) => (),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(Instant::now() < end, "timeout");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(x) => panic!("{x}"),
+        }
+    }
+}
+fn open(p: &std::path::Path) -> Engine {
+    let e = Engine::start(EngineOptions::new(p.into()), Arc::new(|| {})).unwrap();
+    wait(&e, |v| matches!(v, Event::Ready(_)));
+    e
+}
+fn settings(e: &Engine, s: Settings) {
+    e.send(Command::SaveSettings(s)).unwrap();
+    wait(e, |v| matches!(v, Event::Saved(_)));
+}
+fn config(mode: OrganizerMode) -> Settings {
+    let mut s = Settings::default();
+    s.organizer.enabled = true;
+    s.organizer.mode = mode;
+    s.organizer.scope = OrganizerScope::AllTextAndPaths;
+    s.path_activity.enabled = true;
+    s.ai.model = "fixture".into();
+    s.ai.encrypted_key = "fixture".into();
+    s
+}
+fn snapshot(e: &Engine) -> Snapshot {
+    e.send(Command::OrganizerSnapshot { request_id: 17 })
+        .unwrap();
+    match wait(e, |v| {
+        matches!(v, Event::OrganizerState { request_id: 17, .. })
+    }) {
+        Event::OrganizerState { snapshot, .. } => snapshot,
+        _ => unreachable!(),
+    }
+}
+fn work(e: &Engine) -> Work {
+    e.send(Command::OrganizerTick).unwrap();
+    match wait(e, |v| matches!(v, Event::OrganizerWork(_))) {
+        Event::OrganizerWork(w) => w,
+        _ => unreachable!(),
+    }
+}
+fn complete(e: &Engine, w: &Work) {
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Ok(w
+            .candidates
+            .iter()
+            .map(|c| Proposal {
+                candidate: c.clone(),
+                alias: Some("项目资料".into()),
+                tags: vec!["工作".into()],
+                reason: "已有项目资料上下文".into(),
+            })
+            .collect()),
+    })
+    .unwrap();
+}
+fn capture(e: &Engine, text: &str) {
+    e.send(Command::Capture(ClipboardSnapshot {
+        text: text.into(),
+        representations: vec![Representation {
+            format: "HTML Format".into(),
+            data: vec![1, 2, 3],
+        }],
+        source_app: "fixture.exe".into(),
+        captured_at_ms: now(),
+    }))
+    .unwrap();
+}
+fn stop(e: &Engine) {
+    e.send(Command::Shutdown).unwrap();
+    wait(e, |v| matches!(v, Event::ExitReady));
+}
+fn flush(e: &Engine) {
+    e.send(Command::Flush).unwrap();
+    wait(e, |v| matches!(v, Event::Saved(_)));
+}
+fn load(e: &Engine, id: &str) -> StoredItem {
+    e.send(Command::Load {
+        id: id.into(),
+        request_id: 7,
+    })
+    .unwrap();
+    match wait(e, |v| matches!(v, Event::Loaded { request_id: 7, .. })) {
+        Event::Loaded { item, .. } => item.unwrap(),
+        _ => unreachable!(),
+    }
+}
+fn observe(e: &Engine, path: &str) {
+    e.send(Command::ObservePaths(vec![PathObservation {
+        path: path.into(),
+        kind: ItemKind::Folder,
+        observed_at_ms: now(),
+        source: ObservationSource::Explorer,
+    }]))
+    .unwrap();
+}
+#[test]
+fn suggest_manual_apply_preserves_pending_body_formats_and_deduplicates() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    capture(&e, &"正文".repeat(3000));
+    let w = work(&e);
+    assert_eq!(w.candidates[0].context.chars().count(), 1024);
+    assert!(!w.candidates[0].expected_version.is_empty());
+    complete(&e, &w);
+    let s = snapshot(&e);
+    assert_eq!(s.proposals.len(), 1);
+    assert!(
+        load(&e, &w.candidates[0].source.saved_id())
+            .summary
+            .alias
+            .is_empty()
+    );
+    e.send(Command::OrganizerApply {
+        proposals: s.proposals,
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    let id = w.candidates[0].source.saved_id();
+    let item = load(&e, &id);
+    assert_eq!(item.text, "正文".repeat(3000));
+    assert_eq!(item.representations[0].data, vec![1, 2, 3]);
+    assert_eq!(item.summary.alias, "项目资料");
+    capture(&e, &item.text);
+    e.send(Command::Used(id)).unwrap();
+    assert_eq!(snapshot(&e).queued, 0);
+    stop(&e);
+    let e = open(&p);
+    assert!(snapshot(&e).proposals.is_empty());
+    stop(&e);
+}
+trait SavedId {
+    fn saved_id(&self) -> String;
+}
+impl SavedId for Source {
+    fn saved_id(&self) -> String {
+        match self {
+            Source::SavedItem { id } => id.clone(),
+            _ => panic!("saved"),
+        }
+    }
+}
+#[test]
+fn automatic_path_alias_is_searchable_without_favorite_and_is_deferred() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Automatic));
+    observe(&e, r"C:\Projects\CaseSensitive\Logs");
+    let w = work(&e);
+    complete(&e, &w);
+    assert!(snapshot(&e).proposals.is_empty());
+    e.send(Command::Search(SearchQuery {
+        text: "项目资料".into(),
+        scope: Scope::All,
+        request_id: 8,
+    }))
+    .unwrap();
+    let paths = match wait(&e, |v| {
+        matches!(v, Event::PathSuggestions { request_id: 8, .. })
+    }) {
+        Event::PathSuggestions { items, .. } => items,
+        _ => unreachable!(),
+    };
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].path, r"C:\Projects\CaseSensitive\Logs");
+    assert_eq!(paths[0].alias, "项目资料");
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='organizer_state'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    stop(&e);
+    let e = open(&p);
+    observe(&e, r"C:\Projects\CaseSensitive\Logs");
+    assert_eq!(snapshot(&e).queued, 0);
+    stop(&e);
+}
+#[test]
+fn settings_stale_delete_and_closed_organizer_gate_results() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    let mut s = config(OrganizerMode::Suggest);
+    settings(&e, s.clone());
+    capture(&e, "stale");
+    let w = work(&e);
+    s.organizer.enabled = false;
+    settings(&e, s.clone());
+    complete(&e, &w);
+    assert!(snapshot(&e).proposals.is_empty());
+    s.organizer.enabled = true;
+    settings(&e, s);
+    let w = work(&e);
+    e.send(Command::Delete(w.candidates[0].source.saved_id()))
+        .unwrap();
+    complete(&e, &w);
+    assert!(snapshot(&e).proposals.is_empty());
+    stop(&e);
+}
+#[test]
+fn failure_cooldown_and_ready_survive_restart_without_retroactive_history() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    capture(&e, "old history");
+    settings(&e, config(OrganizerMode::Suggest));
+    assert_eq!(snapshot(&e).queued, 0);
+    capture(&e, "new history");
+    let w = work(&e);
+    e.send(Command::OrganizerComplete {
+        token: w.token,
+        result: Err("fixture failure".into()),
+    })
+    .unwrap();
+    let s = snapshot(&e);
+    assert_eq!(s.failures, 1);
+    assert!(s.retry_at_ms.unwrap() >= now() + 299_000);
+    stop(&e);
+    let e = open(&p);
+    let s = snapshot(&e);
+    assert_eq!(s.failures, 1);
+    assert_eq!(s.queued, 1);
+    e.send(Command::OrganizerRetry).unwrap();
+    let w = work(&e);
+    complete(&e, &w);
+    let s = snapshot(&e);
+    assert_eq!(s.proposals.len(), 1);
+    stop(&e);
+    let e = open(&p);
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    let mut s = config(OrganizerMode::Automatic);
+    s.organizer.enabled = false;
+    settings(&e, s);
+    let s = snapshot(&e);
+    assert_eq!(s.proposals.len(), 1);
+    e.send(Command::OrganizerDismiss {
+        sources: s
+            .proposals
+            .iter()
+            .map(|p| p.candidate.source.clone())
+            .collect(),
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    stop(&e);
+}
+
+#[test]
+fn queue_budget_preserves_source_content_and_exposes_saturation() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    let mut s = config(OrganizerMode::Suggest);
+    s.organizer.batch_size = 8;
+    settings(&e, s);
+    for i in 0..260 {
+        capture(&e, &format!("bounded fixture {i}"));
+    }
+    let state = snapshot(&e);
+    assert_eq!(state.queued, 256);
+    assert!(state.saturated);
+    for _ in 0..16 {
+        e.send(Command::OrganizerRetry).unwrap();
+        let w = work(&e);
+        assert_eq!(w.candidates.len(), 8);
+        complete(&e, &w);
+        snapshot(&e);
+    }
+    let state = snapshot(&e);
+    assert_eq!(state.proposals.len(), 128);
+    assert_eq!(state.queued, 128);
+    e.send(Command::OrganizerRetry).unwrap();
+    e.send(Command::OrganizerTick).unwrap();
+    assert!(!snapshot(&e).in_flight);
+    let mut automatic = config(OrganizerMode::Automatic);
+    automatic.organizer.batch_size = 8;
+    settings(&e, automatic);
+    let w = work(&e);
+    assert_eq!(w.candidates.len(), 8);
+    complete(&e, &w);
+    let after = snapshot(&e);
+    assert_eq!(after.proposals.len(), 128);
+    assert_eq!(after.queued, 120);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        260
+    );
+    let bytes: i64 = db
+        .query_row(
+            "SELECT length(CAST(data AS BLOB)) FROM organizer_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes <= MAX_STORE_BYTES as i64);
+    let e = open(&p);
+    assert_eq!(snapshot(&e).proposals.len(), 128);
+    stop(&e);
+}
+fn favorite(e: &Engine, id: &str, alias: &str, tags: Vec<String>) {
+    e.send(Command::SaveFavorite(FavoriteInput {
+        id: Some(id.into()),
+        kind: ItemKind::Folder,
+        title: id.into(),
+        target: format!("C:/Fixture/{id}"),
+        alias: alias.into(),
+        tags,
+        open_with: Some("fixture-open".into()),
+    }))
+    .unwrap();
+    wait(e, |v| matches!(v, Event::Saved(_)));
+}
+#[test]
+fn automatic_saved_alias_preserves_manual_metadata_target_and_disk_representations() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Automatic));
+    favorite(&e, "saved", "人工名", vec!["原标签".into()]);
+    let w = work(&e);
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).queued, 0);
+    let item = load(&e, "saved");
+    assert_eq!(item.summary.alias, "人工名");
+    assert_eq!(item.summary.tags, vec!["原标签", "工作"]);
+    assert_eq!(item.target.as_deref(), Some("C:/Fixture/saved"));
+    assert_eq!(item.open_with.as_deref(), Some("fixture-open"));
+    flush(&e);
+    e.send(Command::OrganizerRetry).unwrap();
+    capture(&e, "disk body fixture");
+    flush(&e);
+    let w = work(&e);
+    complete(&e, &w);
+    snapshot(&e);
+    flush(&e);
+    let item = load(&e, &w.candidates[0].source.saved_id());
+    assert_eq!(item.text, "disk body fixture");
+    assert_eq!(item.representations[0].data, vec![1, 2, 3]);
+    stop(&e);
+}
+#[test]
+fn transaction_failure_preserves_atomic_receipts() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    favorite(&e, "one", "", vec![]);
+    favorite(&e, "two", "", vec![]);
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    assert_eq!(proposals.len(), 2);
+    flush(&e);
+    let db = Connection::open(&p).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_organizer BEFORE UPDATE ON items BEGIN SELECT RAISE(ABORT,'fixture'); END").unwrap();
+    e.send(Command::OrganizerApply {
+        proposals: proposals.clone(),
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Error { .. }));
+    let summary: String = db
+        .query_row("SELECT summary FROM items WHERE id='one'", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        serde_json::from_str::<ItemSummary>(&summary)
+            .unwrap()
+            .alias
+            .is_empty()
+    );
+    let saved: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(saved.matches("\"Ready\"").count(), 2);
+    db.execute_batch("DROP TRIGGER fail_organizer").unwrap();
+    flush(&e);
+    assert_eq!(load(&e, "one").summary.alias, "项目资料");
+    let saved: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(!saved.contains("\"Ready\""));
+    stop(&e);
+}
+#[test]
+fn invalid_partial_results_pause_after_three_persisted_failures() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let mut e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    capture(&e, "failure fixture");
+    for failure in 1..=3 {
+        let w = work(&e);
+        e.send(Command::OrganizerComplete {
+            token: w.token,
+            result: Ok(vec![]),
+        })
+        .unwrap();
+        let state = snapshot(&e);
+        assert_eq!(state.failures, failure);
+        assert_eq!(state.paused, failure == 3);
+        assert!(state.retry_at_ms.unwrap() >= now() + if failure == 1 { 299_000 } else { 599_000 });
+        stop(&e);
+        drop(e);
+        let db = Connection::open(&p).unwrap();
+        let raw: String = db
+            .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+            .unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        value["retry_at_ms"] = 0.into();
+        value["next_at_ms"] = 0.into();
+        db.execute("UPDATE organizer_state SET data=?1", [value.to_string()])
+            .unwrap();
+        drop(db);
+        e = open(&p);
+    }
+    e.send(Command::OrganizerTick).unwrap();
+    let state = snapshot(&e);
+    assert!(state.paused);
+    assert!(!state.in_flight);
+    e.send(Command::OrganizerRetry).unwrap();
+    let w = work(&e);
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    stop(&e);
+}
+
+#[test]
+fn config_clear_and_scope_changes_revoke_work_but_keep_ready_when_switching_modes() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    let mut s = config(OrganizerMode::Suggest);
+    settings(&e, s.clone());
+    observe(&e, "C:/Ready");
+    let w = work(&e);
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    s.organizer.mode = OrganizerMode::Automatic;
+    settings(&e, s.clone());
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    observe(&e, "C:/Inflight");
+    let w = work(&e);
+    s.ai.model = "different".into();
+    settings(&e, s.clone());
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    e.send(Command::ClearPathActivity).unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    assert!(snapshot(&e).proposals.is_empty());
+    assert_eq!(snapshot(&e).queued, 0);
+    s.organizer.scope = OrganizerScope::PathsOnly;
+    settings(&e, s);
+    favorite(&e, "excluded-saved", "", vec![]);
+    assert_eq!(snapshot(&e).queued, 0);
+    stop(&e);
+}
+#[test]
+fn default_scope_pin_and_exclusion_gate_and_stale_multi_selection_is_atomic() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    let mut s = config(OrganizerMode::Suggest);
+    s.organizer.scope = OrganizerScope::SavedAndPaths;
+    s.path_activity.excluded_paths = vec!["C:/Private".into()];
+    settings(&e, s.clone());
+    capture(&e, "plain");
+    assert_eq!(snapshot(&e).queued, 0);
+    e.send(Command::Search(SearchQuery {
+        text: "plain".into(),
+        scope: Scope::Clipboard,
+        request_id: 1,
+    }))
+    .unwrap();
+    let id = match wait(&e, |v| matches!(v, Event::Results { request_id: 1, .. })) {
+        Event::Results { items, .. } => items[0].id.clone(),
+        _ => unreachable!(),
+    };
+    e.send(Command::Pin {
+        id: id.clone(),
+        pinned: true,
+    })
+    .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    favorite(&e, "other", "", vec![]);
+    let w = work(&e);
+    complete(&e, &w);
+    let proposals = snapshot(&e).proposals;
+    assert_eq!(proposals.len(), 2);
+    e.send(Command::Pin { id, pinned: false }).unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    e.send(Command::OrganizerApply { proposals }).unwrap();
+    wait(&e, |v| matches!(v, Event::Error { .. }));
+    assert!(load(&e, "other").summary.alias.is_empty());
+    observe(&e, "C:/Private/Secret");
+    observe(&e, "C:/Allowed/Logs");
+    assert_eq!(snapshot(&e).queued, 1);
+    e.send(Command::OrganizerRetry).unwrap();
+    let w = work(&e);
+    e.send(Command::SuppressPath("C:/Allowed/Logs".into()))
+        .unwrap();
+    wait(&e, |v| matches!(v, Event::Saved(_)));
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).proposals.len(), 1);
+    stop(&e);
+}
+#[test]
+fn inflight_restart_recovers_without_ignoring_interval_and_done_receipts_evict_first() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Automatic));
+    capture(&e, "inflight");
+    let _w = work(&e);
+    flush(&e);
+    let db = Connection::open(&p).unwrap();
+    let raw: String = db
+        .query_row("SELECT data FROM organizer_state", [], |r| r.get(0))
+        .unwrap();
+    assert!(raw.contains("Processing"));
+    stop(&e);
+    // Simulate a crash image with Processing as captured above, not graceful shutdown recovery.
+    db.execute("UPDATE organizer_state SET data=?1", [raw])
+        .unwrap();
+    drop(db);
+    let e = open(&p);
+    assert_eq!(snapshot(&e).queued, 1);
+    e.send(Command::OrganizerTick).unwrap();
+    assert!(!snapshot(&e).in_flight);
+    e.send(Command::OrganizerRetry).unwrap();
+    let w = work(&e);
+    complete(&e, &w);
+    snapshot(&e);
+    for i in 0..256 {
+        capture(&e, &format!("after receipt {i}"));
+    }
+    let s = snapshot(&e);
+    assert_eq!(s.queued, 256);
+    assert!(!s.saturated);
+    stop(&e);
+}
+
+#[test]
+fn byte_budget_stops_network_before_ready_growth_and_preserves_all_sources() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    settings(&e, config(OrganizerMode::Suggest));
+    for i in 0..240 {
+        e.send(Command::SaveFavorite(FavoriteInput {
+            id: Some(format!("large-{i}")),
+            kind: ItemKind::Folder,
+            title: format!("large-{i}"),
+            target: format!("C:/{}", "路径".repeat(510)),
+            alias: "人".repeat(256),
+            tags: (0..32)
+                .map(|n| format!("{n:02}{}", "标".repeat(62)))
+                .collect(),
+            open_with: None,
+        }))
+        .unwrap();
+        wait(&e, |v| matches!(v, Event::Saved(_)));
+    }
+    let s = snapshot(&e);
+    assert!(s.queued < 240);
+    assert!(s.saturated);
+    e.send(Command::OrganizerTick).unwrap();
+    assert!(
+        !snapshot(&e).in_flight,
+        "must reserve room for bounded proposal before sending source data"
+    );
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        240
+    );
+    let n: i64 = db
+        .query_row(
+            "SELECT length(CAST(data AS BLOB)) FROM organizer_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(n <= MAX_STORE_BYTES as i64);
+}
+#[test]
+fn oversized_durable_state_pauses_only_organizer_without_discarding_it() {
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("db");
+    let e = open(&p);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    db.execute_batch("CREATE TABLE organizer_state(id INTEGER PRIMARY KEY,data TEXT)")
+        .unwrap();
+    db.execute(
+        "INSERT INTO organizer_state VALUES(1,?1)",
+        [" ".repeat(MAX_STORE_BYTES + 1)],
+    )
+    .unwrap();
+    drop(db);
+    let e = open(&p);
+    let s = snapshot(&e);
+    assert!(s.paused);
+    assert!(s.storage_error.is_some());
+    settings(&e, config(OrganizerMode::Suggest));
+    e.send(Command::OrganizerRetry).unwrap();
+    capture(&e, "usable original history");
+    e.send(Command::OrganizerTick).unwrap();
+    assert!(!snapshot(&e).in_flight);
+    stop(&e);
+    let db = Connection::open(&p).unwrap();
+    assert_eq!(
+        db.query_row("SELECT length(data) FROM organizer_state", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        MAX_STORE_BYTES as i64 + 1
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+#[test]
+fn retention_removal_revokes_inflight_without_error_or_resurrection() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("db"));
+    let mut s = config(OrganizerMode::Automatic);
+    s.max_history = 1;
+    settings(&e, s);
+    capture(&e, "expired first");
+    let w = work(&e);
+    capture(&e, "new second");
+    flush(&e);
+    complete(&e, &w);
+    let s = snapshot(&e);
+    assert!(!s.in_flight);
+    assert_eq!(s.queued, 1);
+    assert!(s.proposals.is_empty());
+    stop(&e);
+}

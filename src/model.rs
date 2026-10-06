@@ -166,6 +166,21 @@ pub struct SaveStats {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    OrganizerTick,
+    OrganizerComplete {
+        token: u64,
+        result: Result<Vec<crate::organizer::Proposal>, String>,
+    },
+    OrganizerSnapshot {
+        request_id: u64,
+    },
+    OrganizerApply {
+        proposals: Vec<crate::organizer::Proposal>,
+    },
+    OrganizerDismiss {
+        sources: Vec<crate::organizer::Source>,
+    },
+    OrganizerRetry,
     ObservePaths(Vec<crate::path_activity::PathObservation>),
     SuppressPath(String),
     ClearPathActivity,
@@ -205,6 +220,12 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    OrganizerWork(crate::organizer::Work),
+    OrganizerState {
+        request_id: u64,
+        snapshot: crate::organizer::Snapshot,
+    },
+    OrganizerChanged,
     PathSuggestions {
         request_id: u64,
         items: Vec<crate::path_activity::PathSuggestion>,

@@ -174,6 +174,7 @@ impl Entry {
                 item.alias.trim()
             }
             Self::Saved(item) => &item.title,
+            Self::Suggested(path) if !path.path.alias.trim().is_empty() => path.path.alias.trim(),
             Self::Suggested(path) => &path.path.title,
         }
     }
@@ -242,8 +243,8 @@ impl Entry {
                 kind: path.kind,
                 title: path.title.clone(),
                 subtitle: path.path.clone(),
-                alias: String::new(),
-                tags: vec![],
+                alias: path.alias.clone(),
+                tags: path.tags.clone(),
                 pinned: false,
                 created_at_ms: 0,
                 last_used_ms: path.last_seen_ms,
@@ -285,7 +286,9 @@ pub fn row_details(rows: &[Entry], query: &str) -> Vec<RowDetail> {
                 let custom = entry.saved().is_some_and(|item| {
                     !item.alias.trim().is_empty()
                         || item.title.to_lowercase() != label.leaf.to_lowercase()
-                });
+                }) || entry
+                    .suggested()
+                    .is_some_and(|path| !path.alias.trim().is_empty());
                 if !custom {
                     detail.title.clone_from(&label.title);
                 }

@@ -130,6 +130,8 @@ pub struct Work {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
+    /// Local cache is unreadable; source history remains usable and no work is sent.
+    pub storage_error: Option<String>,
     pub proposals: Vec<Proposal>,
     pub queued: usize,
     pub in_flight: bool,
@@ -148,6 +150,10 @@ fn bounded_text(text: &str, max_chars: usize, multiline: bool) -> bool {
 }
 fn metadata_text(text: &str, max_chars: usize) -> bool {
     !text.trim().is_empty() && text == text.trim() && bounded_text(text, max_chars, false)
+}
+
+pub(crate) fn validate_candidate(candidate: &Candidate) -> Result<(), String> {
+    validate_batch(std::slice::from_ref(candidate))
 }
 
 fn validate_batch(candidates: &[Candidate]) -> Result<(), String> {

@@ -43,6 +43,7 @@ pub(crate) struct CommitEffects {
     pub sources_removed: bool,
 }
 pub(crate) struct Repository {
+    pub(crate) organizer: crate::organizer_store::OrganizerStore,
     pub(crate) paths: crate::path_activity_store::PathActivityStore,
     pub(crate) connection: Connection,
     wal_path: std::path::PathBuf,
@@ -165,7 +166,9 @@ impl Repository {
             .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         let paths = crate::path_activity_store::PathActivityStore::load(&connection)?;
+        let organizer = crate::organizer_store::OrganizerStore::load(&connection)?;
         let repo = Self {
+            organizer,
             paths,
             connection,
             wal_path: wal_path.into(),
@@ -212,6 +215,17 @@ impl Repository {
             })
         })
         .transpose()
+    }
+    pub fn organizer_context(&self, id: &str) -> Result<String, String> {
+        self.connection
+            .query_row(
+                "SELECT substr(text,1,1024) FROM items WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map(|v| v.unwrap_or_default())
+            .map_err(|e| e.to_string())
     }
     pub fn load(&self, id: &str, blobs: bool) -> Result<Option<StoredItem>, String> {
         let raw: Option<(String, String, Option<String>, Option<String>)> = self
@@ -690,12 +704,18 @@ impl Repository {
                 .map_err(|e| e.to_string())?;
         }
         crate::semantic_store::commit(&tx, pending, vectors, &removed, self.repair_vectors)?;
+        for id in &removed {
+            self.organizer
+                .forget(&crate::organizer::Source::SavedItem { id: id.clone() });
+        }
         self.paths.write(&tx)?;
+        self.organizer.write(&tx)?;
         let observed_rowid = tx
             .query_row("SELECT coalesce(max(rowid),0) FROM items", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())?;
         self.paths.committed();
+        self.organizer.committed();
         self.observed_rowid = observed_rowid;
         self.retention_policy = Some(policy);
         if maintain {

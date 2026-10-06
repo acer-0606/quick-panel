@@ -37,6 +37,10 @@ pub struct PathSuggestion {
     pub path: String,
     pub title: String,
     pub kind: ItemKind,
+    #[serde(default)]
+    pub alias: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub visits: u64,
     pub last_seen_ms: i64,
 }
