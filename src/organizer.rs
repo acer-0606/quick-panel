@@ -192,6 +192,19 @@ pub fn prepare(
     organizer: &OrganizerSettings,
     candidates: &[Candidate],
 ) -> Result<claude::HttpRequest, String> {
+    claude::prepare_messages(settings, key, SYSTEM, payload(organizer, candidates)?, 2048)
+}
+
+/// The same double-encoded Messages body used by prepare, without credentials.
+pub(crate) fn request_body(
+    settings: &AiSettings,
+    organizer: &OrganizerSettings,
+    candidates: &[Candidate],
+) -> Result<Vec<u8>, String> {
+    claude::messages_body(settings, SYSTEM, payload(organizer, candidates)?, 2048)
+}
+
+fn payload(organizer: &OrganizerSettings, candidates: &[Candidate]) -> Result<Value, String> {
     if !organizer.enabled {
         return Err("AI 管家尚未启用".into());
     }
@@ -204,13 +217,7 @@ pub fn prepare(
         "index":index, "kind":match candidate.kind { ItemKind::Clipboard => "clipboard", ItemKind::Folder => "folder", ItemKind::Document => "document" },
         "title":candidate.title,"alias":candidate.alias,"tags":candidate.tags,"context":candidate.context
     })).collect::<Vec<_>>();
-    claude::prepare_messages(
-        settings,
-        key,
-        SYSTEM,
-        json!({"instructions":organizer.instructions,"items":items}),
-        2048,
-    )
+    Ok(json!({"instructions":organizer.instructions,"items":items}))
 }
 
 #[derive(Deserialize)]

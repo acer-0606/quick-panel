@@ -45,6 +45,68 @@ fn candidates() -> Vec<Candidate> {
         },
     ]
 }
+
+// At every valid field maximum, a single source fits even after both layers of
+// JSON escaping. Oversized input must be rejected locally instead of truncated.
+#[test]
+fn single_candidate_extremes_fit_real_messages_and_invalid_boundaries_fail_closed() {
+    for unit in ["😀", "\\", "\""] {
+        let mut batch = candidates();
+        batch.truncate(1);
+        batch[0].source = Source::SavedItem {
+            id: "s".repeat(4096),
+        };
+        batch[0].title = unit.repeat(256);
+        batch[0].alias = unit.repeat(256);
+        batch[0].tags = (0..32)
+            .map(|n| {
+                format!(
+                    "{}{last}",
+                    unit.repeat(63),
+                    last = char::from_u32(0x10000 + n).unwrap()
+                )
+            })
+            .collect();
+        batch[0].context = unit.repeat(1024);
+        let ai = AiSettings {
+            model: "😀".repeat(256),
+            effort: Effort::XHigh,
+            ..config()
+        };
+        let settings = OrganizerSettings {
+            instructions: unit.repeat(512),
+            batch_size: 8,
+            ..enabled()
+        };
+        let request = organizer::prepare(&ai, "synthetic-key", &settings, &batch).unwrap();
+        println!("single maximum unit {unit:?}: {} bytes", request.body.len());
+        assert!(request.body.len() < 64 * 1024);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let payload: Value =
+            serde_json::from_str(body["messages"][0]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["items"][0]["context"], batch[0].context);
+        assert_eq!(payload["items"][0]["tags"].as_array().unwrap().len(), 32);
+        batch[0].alias.push('中');
+        assert!(organizer::prepare(&ai, "synthetic-key", &settings, &batch).is_err());
+        batch[0].alias.pop();
+        batch[0].context = "\n\r\t".repeat(341) + "\n";
+        let settings = OrganizerSettings {
+            instructions: "\n\r\t".repeat(170) + "\n\r",
+            ..settings
+        };
+        assert!(
+            organizer::prepare(&ai, "synthetic-key", &settings, &batch)
+                .unwrap()
+                .body
+                .len()
+                < 64 * 1024
+        );
+        batch[0].source = Source::SavedItem {
+            id: "invalid\0".into(),
+        };
+        assert!(organizer::prepare(&ai, "synthetic-key", &settings, &batch).is_err());
+    }
+}
 fn envelope(items: Value) -> Vec<u8> {
     serde_json::to_vec(&json!({"stop_reason":"end_turn","content":[
         {"type":"text","text":json!({"items":items}).to_string()}

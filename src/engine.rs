@@ -669,6 +669,7 @@ impl Actor {
             || !self.settings.organizer.enabled
             || self.settings.organizer.validate().is_err()
             || self.settings.ai.model.trim().is_empty()
+            || crate::claude::parse_endpoint(&self.settings.ai.endpoint).is_err()
             || self.settings.ai.encrypted_key.is_empty()
             || self.organizer_work.is_some()
             || self.repo.organizer.paused
@@ -693,26 +694,48 @@ impl Actor {
             organizer_settings: self.settings.organizer.clone(),
             candidates: Vec::new(),
         };
+        let mut store_blocked = false;
         for record in self
             .repo
             .organizer
             .records
             .iter()
             .filter(|r| matches!(r.status, Status::Queued))
-            .take(count)
         {
-            let mut trial = reserved.clone();
+            if work.candidates.len() == count {
+                break;
+            }
+            // Invalid local records stay queued and cannot block later valid
+            // sources. Valid single candidates always fit the wire bounds.
+            if crate::organizer::validate_candidate(&record.candidate).is_err() {
+                continue;
+            }
             let mut expanded = work.clone();
             expanded.candidates.push(record.candidate.clone());
             expanded.candidates.shrink_to_fit();
+            if crate::organizer::request_body(
+                &expanded.ai_settings,
+                &expanded.organizer_settings,
+                &expanded.candidates,
+            )
+            .is_err()
+            {
+                if work.candidates.is_empty() {
+                    continue;
+                }
+                break;
+            }
+            let mut trial = reserved.clone();
             if !trial.reserve_work(&expanded) {
+                store_blocked = true;
                 break;
             }
             reserved = trial;
             work = expanded;
         }
         if work.candidates.is_empty() {
-            if !self.repo.organizer.saturated
+            if store_blocked
+                && !self.repo.organizer.saturated
                 && self
                     .repo
                     .organizer

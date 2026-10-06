@@ -28,6 +28,7 @@ const LIST: usize = 10;
 const ALIAS: usize = 11;
 const TAGS: usize = 12;
 struct View {
+    list_refresh: crate::organizer_ui::ListRefresh,
     editor_refresh: crate::organizer_ui::EditorRefresh,
     state: Rc<RefCell<ReviewState>>,
     submit: Rc<dyn Fn(Command)>,
@@ -218,19 +219,7 @@ unsafe fn render(ptr: *const RefCell<View>) {
         (
             s.revision,
             s.status(enabled),
-            s.snapshot
-                .proposals
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        p.candidate.title.clone(),
-                        p.alias.clone().unwrap_or_else(|| "保留原别名".into()),
-                        p.tags.join("、"),
-                        s.checked(i),
-                    )
-                })
-                .collect::<Vec<_>>(),
+            s.list_rows(),
             s.selected_index(),
             s.pending(),
             s.needs_save(),
@@ -256,50 +245,73 @@ unsafe fn render(ptr: *const RefCell<View>) {
             "应用所选"
         },
     );
-    SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
-    SendMessageW(list, LVM_DELETEALLITEMS, None, None);
-    for (i, (title, alias, tags, checked)) in rows.iter().enumerate() {
-        let title = wide(title);
-        let mut item = LVITEMW {
-            mask: LVIF_TEXT,
-            iItem: i as i32,
-            pszText: windows::core::PWSTR(title.as_ptr() as *mut _),
-            ..Default::default()
-        };
-        SendMessageW(
-            list,
-            LVM_INSERTITEMW,
-            None,
-            Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
-        );
-        for (column, value) in [(1, alias), (2, tags)] {
-            let value = wide(value);
+    let top = SendMessageW(list, LVM_GETTOPINDEX, None, None).0.max(0) as usize;
+    let old_offset = row_top(list, top).map_or(0, |y| y - viewport_top(list));
+    let update = (*ptr)
+        .borrow_mut()
+        .list_refresh
+        .replace(&rows, top, old_offset);
+    if update.rebuild {
+        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(0)), None);
+        SendMessageW(list, LVM_DELETEALLITEMS, None, None);
+    }
+    for (i, row) in rows.iter().enumerate() {
+        if update.rebuild {
+            let title = wide(&row.title);
             let mut item = LVITEMW {
+                mask: LVIF_TEXT,
                 iItem: i as i32,
-                iSubItem: column,
-                pszText: windows::core::PWSTR(value.as_ptr() as *mut _),
+                pszText: windows::core::PWSTR(title.as_ptr() as *mut _),
                 ..Default::default()
             };
             SendMessageW(
                 list,
-                LVM_SETITEMTEXTW,
+                LVM_INSERTITEMW,
+                None,
+                Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
+            );
+            for (column, value) in [(1, &row.alias), (2, &row.tags)] {
+                let value = wide(value);
+                let mut item = LVITEMW {
+                    iItem: i as i32,
+                    iSubItem: column,
+                    pszText: windows::core::PWSTR(value.as_ptr() as *mut _),
+                    ..Default::default()
+                };
+                SendMessageW(
+                    list,
+                    LVM_SETITEMTEXTW,
+                    Some(WPARAM(i)),
+                    Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
+                );
+            }
+        }
+        let checked = state.borrow().checked(i);
+        let mut item = LVITEMW {
+            stateMask: LVIS_STATEIMAGEMASK,
+            state: LIST_VIEW_ITEM_STATE_FLAGS(if checked { 2 << 12 } else { 1 << 12 }),
+            ..Default::default()
+        };
+        if SendMessageW(
+            list,
+            LVM_GETITEMSTATE,
+            Some(WPARAM(i)),
+            Some(LPARAM(LVIS_STATEIMAGEMASK.0 as isize)),
+        )
+        .0 as u32
+            != item.state.0
+        {
+            SendMessageW(
+                list,
+                LVM_SETITEMSTATE,
                 Some(WPARAM(i)),
                 Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
             );
         }
-        let mut item = LVITEMW {
-            stateMask: LVIS_STATEIMAGEMASK,
-            state: LIST_VIEW_ITEM_STATE_FLAGS(if *checked { 2 << 12 } else { 1 << 12 }),
-            ..Default::default()
-        };
-        SendMessageW(
-            list,
-            LVM_SETITEMSTATE,
-            Some(WPARAM(i)),
-            Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
-        );
     }
-    if let Some(i) = selection {
+    if update.rebuild
+        && let Some(i) = selection
+    {
         let mut item = LVITEMW {
             stateMask: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
             state: LIST_VIEW_ITEM_STATE_FLAGS(LVIS_SELECTED.0 | LVIS_FOCUSED.0),
@@ -312,8 +324,27 @@ unsafe fn render(ptr: *const RefCell<View>) {
             Some(LPARAM((&mut item as *mut LVITEMW) as isize)),
         );
     }
-    SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None);
-    let _ = InvalidateRect(Some(list), None, true);
+    if update.rebuild {
+        if let Some((index, offset)) = update.scroll {
+            // Establish the source's position, then restore the sub-row offset.
+            SendMessageW(
+                list,
+                LVM_ENSUREVISIBLE,
+                Some(WPARAM(index)),
+                Some(LPARAM(0)),
+            );
+            if let Some(y) = row_top(list, index) {
+                SendMessageW(
+                    list,
+                    LVM_SCROLL,
+                    Some(WPARAM(0)),
+                    Some(LPARAM((y - viewport_top(list) - offset) as isize)),
+                );
+            }
+        }
+        SendMessageW(list, WM_SETREDRAW, Some(WPARAM(1)), None);
+        let _ = InvalidateRect(Some(list), None, true);
+    }
     let _ = EnableWindow(apply, !pending && !blocked);
     let _ = EnableWindow(dismiss, !pending && !needs_save && !blocked);
     let _ = EnableWindow(retry, !pending && !needs_save && !blocked);
@@ -323,6 +354,36 @@ unsafe fn render(ptr: *const RefCell<View>) {
         v.rendering = false;
     }
     selected(ptr);
+}
+unsafe fn row_rect(list: HWND, index: usize) -> Option<RECT> {
+    let mut rect = RECT {
+        left: LVIR_BOUNDS as i32,
+        ..Default::default()
+    };
+    (SendMessageW(
+        list,
+        LVM_GETITEMRECT,
+        Some(WPARAM(index)),
+        Some(LPARAM((&mut rect as *mut RECT) as isize)),
+    )
+    .0 != 0)
+        .then_some(rect)
+}
+unsafe fn row_top(list: HWND, index: usize) -> Option<i32> {
+    row_rect(list, index).map(|rect| rect.top)
+}
+unsafe fn viewport_top(list: HWND) -> i32 {
+    let header = HWND(SendMessageW(list, LVM_GETHEADER, None, None).0 as *mut _);
+    let mut rect = RECT::default();
+    if header.0.is_null() || GetWindowRect(header, &mut rect).is_err() {
+        return 0;
+    }
+    let mut point = POINT {
+        x: rect.left,
+        y: rect.bottom,
+    };
+    let _ = ScreenToClient(list, &mut point);
+    point.y
 }
 unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
     let (controls, dpi) = {
@@ -601,6 +662,7 @@ pub unsafe fn show(
     let width = scale(800).min(work.right - work.left - 24);
     let height = scale(640).min(work.bottom - work.top - 24);
     let view = Box::new(RefCell::new(View {
+        list_refresh: crate::organizer_ui::ListRefresh::default(),
         editor_refresh: crate::organizer_ui::EditorRefresh::default(),
         state: state.clone(),
         submit,

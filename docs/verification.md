@@ -31,7 +31,17 @@
 
 Task 3 定点修复第 1 轮（基于 `a9aa6d2`）：原样保存 AI/管家设置不再取消实际在途结果；UI session 与 actor 使用同一相关配置比较，真正变更仍撤销且不提前释放网络占用。保存回执记录本批来源，只清本次提交的草稿和勾选，SavePending 延续同一来源集合。编辑框保存原始别名/标签文本，仅提交时规范化；同 source/version 的后台刷新不替换输入，必要替换等待 IME 结束，输入仍绑定实际显示的来源版本。
 
-本轮 focused 为 **25 passed / 0 failed**（organizer_ui 17、connection_test 6、真实 worker/actor coordinator 2）；先观察原样保存丢回执、未选中 A 草稿丢失、raw 尾逗号/空白消失等真实 RED，再修至 GREEN。IME 同时使用 Edit 子类的 Start/End 状态与 GCS_COMPSTR，尚未产生首个组合字符时也不替换或禁用编辑框。macOS/Windows all-target strict Clippy 和 Windows all-target cross-check 通过，最终 source 后更新 Windows Release。未重复 363 项整套；日志为 `task3-fix1-*.log`。ListView 阅读滚动与持续成功消息遮挡状态两条 Minor 仍按主控决定 deferred。Windows 实机 IME/光标/选择验收仍未执行，门控共享测试与交叉编译不能替代它。
+本轮 focused 为 **25 passed / 0 failed**（organizer_ui 17、connection_test 6、真实 worker/actor coordinator 2）；先观察原样保存丢回执、未选中 A 草稿丢失、raw 尾逗号/空白消失等真实 RED，再修至 GREEN。IME 同时使用 Edit 子类的 Start/End 状态与 GCS_COMPSTR，尚未产生首个组合字符时也不替换或禁用编辑框。macOS/Windows all-target strict Clippy 和 Windows all-target cross-check 通过，最终 source 后更新 Windows Release。该轮未重复 363 项整套；日志为 `task3-fix1-*.log`。该轮暂缓的 ListView 阅读滚动与持续成功消息遮挡状态两条 Minor 已在下面的最终修复中处理。Windows 实机 IME/光标/选择验收仍未执行，门控共享测试与交叉编译不能替代它。
+
+最终清单修复（基于 `0d695d6`）：actor 派发前使用与生产 `prepare` 共用的真实 Messages body 编码检查 64 KiB 上限，再预留既有 store/未来 Ready 的 2 MiB 预算。保留最大可发送前缀，其余保持 Queued；没有 worker 内隐藏请求队列，本地构造错误不发布失败 Work、不计接口冷却、不影响普通搜索。无效地址/模型沿既有管家配置提示处理，保留配置及来源。真实 Engine + `prepare` 的中文、emoji、引号和反斜杠 fixture 验证每个发布批次都可发送、余项继续、全部来源保留且 failures 始终为 0。单项全字段最大值三种转义极限真实 body 均为 **19,203 bytes**；另覆盖多行控制字符的合法转义及无效边界，非法整理元数据仍保留在主历史且不阻塞后续合法来源。
+
+原生审阅缓存仅保存最多 128 个展示行的 source/名称/别名/标签投影，详情、状态、checkbox 不触发行重建；必须重建时按稳定 source 恢复顶部与记录的像素偏移，来源被删除时优先后邻、再前邻。选择、checkbox、raw 草稿及 IME 延迟门控保留。成功回执与实时排队/处理中/冷却/暂停/容量状态并列，未保存及保存中提示优先，pending-save 和草稿守卫不因状态显示而解除。可移植测试覆盖行更新判定、插入/删除/显示变化后的锚点与偏移、成功后的五种实时状态及写失败保护；Windows 接线通过交叉编译，真实滚动尚未执行。
+
+最终 focused：**82 passed / 0 failed**（lib 8、Claude 17、organizer actor 24、protocol 12、UI 21，2 项容量用例留给最后 full）。host/Windows `cargo clippy --locked [--target x86_64-pc-windows-gnu] --all-targets -- -D warnings` 与 Windows `cargo check --locked --target x86_64-pc-windows-gnu --all-targets` 均通过；日志为 `/Volumes/QPPathNamesBuild/tmp/final-fix-*.log`。执行纪律记录：启动 host Clippy 时误把仍有 session-id 的最后 focused poll 当作完成，两条 Cargo 短暂重叠，均成功且无锁/编译故障；后续 Cargo 均等待明确 exit 后再启动。
+
+唯一一次最终 `cargo test --locked`：**379 passed / 0 failed / 2 既有 ignored**，34 个 suite summaries；全部 26 个 organizer actor 用例通过（45.04s），含两项既有缓存/Ready 大容量用例，最后代码下的 2 MiB 内存与未来结果预留仍成立。日志 `final-fix-full.log`。Windows all-target 编译涵盖现有 38 个 native fixtures，它们在 macOS 上执行 0 项。
+
+最后源码后的唯一一次 Windows GNU Release 构建通过（30.02s，`final-fix-release.log`）；`cargo fmt --all -- --check` 与 `git diff --check` 最终通过。最终 EXE 留在 RAM target，由主控统一同步。
 
 ## 外部常用路径与区域截图（当前版本）
 

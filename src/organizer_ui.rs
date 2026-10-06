@@ -154,7 +154,7 @@ pub fn effort_warning(models: &[ModelInfo], model: &str, effort: Effort) -> Opti
     })
 }
 pub fn organizer_config_warning(ai: &AiSettings) -> Option<String> {
-    if ai.model.trim().is_empty()
+    if crate::claude::validate_model(&ai.model).is_err()
         || ai.encrypted_key.is_empty()
         || crate::claude::parse_endpoint(&ai.endpoint).is_err()
     {
@@ -221,6 +221,47 @@ struct Draft {
     alias: String,
     tags: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewRow {
+    pub source: Source,
+    pub title: String,
+    pub alias: String,
+    pub tags: String,
+}
+
+#[derive(Default)]
+pub struct ListRefresh {
+    rows: Vec<ReviewRow>,
+}
+
+pub struct ListUpdate {
+    pub rebuild: bool,
+    pub scroll: Option<(usize, i32)>,
+}
+impl ListRefresh {
+    pub fn replace(&mut self, rows: &[ReviewRow], top: usize, offset: i32) -> ListUpdate {
+        if self.rows == rows {
+            return ListUpdate {
+                rebuild: false,
+                scroll: None,
+            };
+        }
+        let top = top.min(self.rows.len().saturating_sub(1));
+        // Keep the visible source through reorder/insertions. If it vanished,
+        // prefer its following survivor, then the nearest preceding survivor.
+        let scroll = self.rows[top..]
+            .iter()
+            .chain(self.rows[..top].iter().rev())
+            .find_map(|old| rows.iter().position(|row| row.source == old.source))
+            .map(|index| (index, offset));
+        self.rows = rows.to_vec();
+        ListUpdate {
+            rebuild: true,
+            scroll,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct ReviewState {
     pub config_warning: Option<String>,
@@ -243,6 +284,18 @@ pub struct ReviewState {
     preserve_failed_drafts: bool,
 }
 impl ReviewState {
+    pub fn list_rows(&self) -> Vec<ReviewRow> {
+        self.snapshot
+            .proposals
+            .iter()
+            .map(|p| ReviewRow {
+                source: p.candidate.source.clone(),
+                title: p.candidate.title.clone(),
+                alias: p.alias.clone().unwrap_or_else(|| "保留原别名".into()),
+                tags: p.tags.join("、"),
+            })
+            .collect()
+    }
     fn id(&mut self) -> u64 {
         self.next_id = self.next_id.wrapping_add(1);
         self.next_id
@@ -514,15 +567,25 @@ impl ReviewState {
         true
     }
     pub fn status(&self, enabled: bool) -> String {
+        if !self.message.is_empty()
+            && (self.pending() || self.needs_save || self.preserve_failed_drafts)
+        {
+            return self.message.clone();
+        }
         if let Some(error) = &self.snapshot.storage_error {
             return error.clone();
         }
         if let Some(warning) = &self.config_warning {
             return warning.clone();
         }
-        if !self.message.is_empty() {
-            return self.message.clone();
+        let live = self.live_status(enabled);
+        if self.message.is_empty() {
+            live
+        } else {
+            format!("{}；{live}", self.message)
         }
+    }
+    fn live_status(&self, enabled: bool) -> String {
         let s = &self.snapshot;
         if s.paused {
             return "连续失败，已暂停；可点击重试".into();

@@ -24,6 +24,163 @@ fn proposal() -> Proposal {
     }
 }
 
+// A successful decision must not hide why background work later stops.
+#[test]
+fn successful_receipt_keeps_live_paused_cooldown_capacity_and_queue_visible() {
+    for (snapshot, expected) in [
+        (
+            Snapshot {
+                paused: true,
+                ..Default::default()
+            },
+            "已暂停",
+        ),
+        (
+            Snapshot {
+                failures: 1,
+                retry_at_ms: Some(99),
+                ..Default::default()
+            },
+            "冷却",
+        ),
+        (
+            Snapshot {
+                saturated: true,
+                ..Default::default()
+            },
+            "容量已满",
+        ),
+        (
+            Snapshot {
+                queued: 7,
+                ..Default::default()
+            },
+            "待处理 7",
+        ),
+        (
+            Snapshot {
+                in_flight: true,
+                queued: 3,
+                ..Default::default()
+            },
+            "后台正在整理",
+        ),
+    ] {
+        let mut ui = ReviewState::default();
+        let id = ui.request_snapshot().unwrap();
+        ui.adopt_snapshot(
+            id,
+            Snapshot {
+                proposals: vec![proposal()],
+                ..Default::default()
+            },
+        );
+        ui.check(0, true);
+        let (id, _) = ui.begin_decision(false).unwrap();
+        ui.receipt(id, Ok(()), false);
+        let id = ui.request_snapshot().unwrap();
+        assert!(ui.adopt_snapshot(id, snapshot));
+        assert!(
+            ui.status(true).contains(expected),
+            "live state hidden: {}",
+            ui.status(true)
+        );
+    }
+}
+
+// Background status must not obscure an uncommitted save or release its draft guard.
+#[test]
+fn pending_save_failure_stays_visible_and_keeps_raw_drafts() {
+    let mut ui = ReviewState::default();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![proposal()],
+            paused: true,
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    ui.edit(" 草稿 ".into(), "标签, ".into());
+    ui.check(0, true);
+    let (id, _) = ui.begin_decision(false).unwrap();
+    ui.receipt(id, Err("磁盘故障".into()), true);
+    assert!(ui.status(true).contains("未保存：磁盘故障"));
+    assert!(ui.status(true).contains("重试保存"));
+    let id = ui.request_snapshot().unwrap();
+    assert!(!ui.adopt_snapshot(id, Snapshot::default()));
+    assert!(ui.needs_save());
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        (" 草稿 ".into(), "标签, ".into())
+    );
+}
+
+// A detail/count-only revision must leave a scrolled ListView's rows intact.
+#[test]
+fn list_refresh_keeps_rows_for_detail_status_and_checkbox_updates() {
+    let mut p = proposal();
+    p.candidate.kind = ItemKind::Folder;
+    let mut ui = ReviewState::default();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p.clone()],
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    ui.edit(" 原稿 ".into(), "项目, ".into());
+    let mut list = ListRefresh::default();
+    assert!(list.replace(&ui.list_rows(), 0, 0).rebuild);
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p],
+            queued: 7,
+            ..Default::default()
+        },
+    );
+    ui.check(0, true);
+    assert!(!list.replace(&ui.list_rows(), 0, -3).rebuild);
+    let (id, _, _) = ui.request_detail().unwrap();
+    assert!(ui.adopt_detail(id, Ok("C:/完整路径".into())));
+    assert!(!list.replace(&ui.list_rows(), 0, -3).rebuild);
+    assert_eq!(ui.selected_index(), Some(0));
+    assert!(ui.checked(0));
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        (" 原稿 ".into(), "项目, ".into())
+    );
+}
+
+// Rebuilding must anchor the stable source, or the next/previous survivor when it is removed.
+#[test]
+fn list_refresh_restores_source_anchor_and_pixel_offset_after_insertions_or_deletions() {
+    let row = |id: &str| ReviewRow {
+        source: Source::SavedItem { id: id.into() },
+        title: id.into(),
+        alias: String::new(),
+        tags: String::new(),
+    };
+    let mut list = ListRefresh::default();
+    list.replace(&[row("a"), row("b"), row("c"), row("d")], 0, 0);
+    let update = list.replace(&[row("x"), row("a"), row("b"), row("c"), row("d")], 2, -6);
+    assert!(update.rebuild);
+    assert_eq!(update.scroll, Some((3, -6)));
+    let update = list.replace(&[row("x"), row("a"), row("b"), row("d")], 3, -6);
+    assert_eq!(update.scroll, Some((3, -6)));
+    let update = list.replace(&[row("x"), row("a"), row("b")], 3, -6);
+    assert_eq!(update.scroll, Some((2, -6)));
+    let mut rows = vec![row("x"), row("a"), row("b")];
+    rows[2].alias = "修改后的显示别名".into();
+    assert_eq!(list.replace(&rows, 2, -2).scroll, Some((2, -2)));
+    assert_eq!(list.replace(&[], 2, -2).scroll, None);
+}
+
 // Wrong field indexes would mix the effort choice with credential controls.
 #[test]
 fn ai_form_reads_manual_model_and_appended_effort_without_moving_key_fields() {
@@ -189,6 +346,9 @@ fn organizer_configuration_checks_are_independent_of_search_opt_in() {
     };
     assert!(organizer_config_warning(&ai).is_none());
     assert!(!ai.enabled);
+    ai.model = "m".repeat(257);
+    assert!(organizer_config_warning(&ai).is_some());
+    ai.model = "manual".into();
     ai.endpoint.clear();
     assert!(organizer_config_warning(&ai).is_some());
 }

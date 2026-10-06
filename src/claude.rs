@@ -203,16 +203,23 @@ pub(crate) fn prepare_messages(
     payload: serde_json::Value,
     max_tokens: u32,
 ) -> Result<HttpRequest, String> {
-    if settings.model.trim().is_empty()
-        || settings.model.chars().count() > 256
-        || settings
-            .model
-            .chars()
-            .any(|character| character.is_control() || is_bidi(character))
-    {
-        return Err("AI 模型 ID 无效".into());
-    }
-    let endpoint = parse_endpoint(&settings.endpoint)?;
+    let body = messages_body(settings, system, payload, max_tokens)?;
+    Ok(HttpRequest {
+        endpoint: parse_endpoint(&settings.endpoint)?,
+        headers: request_headers(settings, key)?,
+        body,
+    })
+}
+
+/// Exact wire encoding shared with local dispatch budgeting. This performs no
+/// credential access, decryption or networking.
+pub(crate) fn messages_body(
+    settings: &AiSettings,
+    system: &str,
+    payload: serde_json::Value,
+    max_tokens: u32,
+) -> Result<Vec<u8>, String> {
+    validate_model(&settings.model)?;
     let mut envelope = json!({
         "model":settings.model,
         "max_tokens":max_tokens,
@@ -227,11 +234,19 @@ pub(crate) fn prepare_messages(
     if body.len() > MAX_REQUEST_BYTES {
         return Err("AI 请求过大".into());
     }
-    Ok(HttpRequest {
-        endpoint,
-        headers: request_headers(settings, key)?,
-        body,
-    })
+    Ok(body)
+}
+
+pub(crate) fn validate_model(model: &str) -> Result<(), String> {
+    if model.trim().is_empty()
+        || model.chars().count() > 256
+        || model
+            .chars()
+            .any(|character| character.is_control() || is_bidi(character))
+    {
+        return Err("AI 模型 ID 无效".into());
+    }
+    Ok(())
 }
 
 pub(crate) fn request_headers(

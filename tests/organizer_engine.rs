@@ -11,6 +11,186 @@ fn now() -> i64 {
         .as_millis() as i64
 }
 
+// The actual actor batch must fit the double-encoded Messages body before it
+// leaves the actor; local shrinking must never consume interface failures.
+#[test]
+fn wire_budget_dispatches_maximum_prefix_and_later_queued_sources_without_failures() {
+    for escaped in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let e = open(&d.path().join("wire-db"));
+        let mut s = config(OrganizerMode::Suggest);
+        s.organizer.batch_size = 8;
+        s.organizer.instructions = "中😀\"\\".repeat(128);
+        s.ai.effort = quick_panel::ai::Effort::XHigh;
+        settings(&e, s);
+        for i in 0..8 {
+            let unit = if escaped {
+                "😀\"\\中"
+            } else {
+                "目目目目"
+            };
+            e.send(Command::SaveFavorite(FavoriteInput {
+                id: Some(format!("wire-{i}")),
+                kind: ItemKind::Folder,
+                title: unit.repeat(64),
+                target: format!("C:/{}", "😀\\中".repeat(341)),
+                alias: unit.repeat(64),
+                tags: (0..32)
+                    .map(|j| format!("{j:02}{}", unit.repeat(15) + "😀中"))
+                    .collect(),
+                open_with: None,
+            }))
+            .unwrap();
+            wait(&e, |v| matches!(v, Event::Saved(_)));
+        }
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            let w = work(&e);
+            let body = quick_panel::organizer::prepare(
+                &w.ai_settings,
+                "fixture-key",
+                &w.organizer_settings,
+                &w.candidates,
+            )
+            .expect("actor published a locally oversized request")
+            .body;
+            assert!(body.len() <= 64 * 1024);
+            let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let payload: serde_json::Value =
+                serde_json::from_str(envelope["messages"][0]["content"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["items"][0]["title"], w.candidates[0].title);
+            for c in &w.candidates {
+                assert!(seen.insert(c.source.clone()));
+            }
+            let during = snapshot(&e);
+            assert_eq!(during.failures, 0);
+            assert_eq!(during.queued + seen.len(), 8);
+            if seen.len() == w.candidates.len() {
+                assert!(
+                    seen.len() < 8,
+                    "fixture must require multiple real actor batches"
+                );
+                let mut larger = w.candidates.clone();
+                let mut extra = larger[0].clone();
+                extra.source = Source::SavedItem {
+                    id: "next-legal-source".into(),
+                };
+                larger.push(extra);
+                assert!(
+                    quick_panel::organizer::prepare(
+                        &w.ai_settings,
+                        "fixture-key",
+                        &w.organizer_settings,
+                        &larger
+                    )
+                    .is_err(),
+                    "actor did not retain the maximum sendable prefix"
+                );
+            }
+            complete(&e, &w);
+            let after = snapshot(&e);
+            assert_eq!(after.failures, 0);
+            assert!(!after.paused && after.retry_at_ms.is_none());
+            assert_eq!(after.proposals.len(), seen.len());
+            if seen.len() == 8 {
+                break;
+            }
+            // Advance the existing explicit retry scheduling reset after a
+            // successful batch rather than waiting a real minute in a fixture.
+            e.send(Command::OrganizerRetry).unwrap();
+            snapshot(&e);
+        }
+        stop(&e);
+    }
+}
+
+// Invalid local configuration must not publish failing work or spend API
+// failures; fixing it must preserve and resume the original queued source.
+#[test]
+fn wire_preflight_keeps_sources_and_failures_when_local_configuration_is_invalid() {
+    let d = tempfile::tempdir().unwrap();
+    let e = open(&d.path().join("invalid-config"));
+    let mut s = config(OrganizerMode::Suggest);
+    for invalid_model in [true, false] {
+        s.ai.model = if invalid_model {
+            "x".repeat(257)
+        } else {
+            "fixture".into()
+        };
+        s.ai.endpoint = if invalid_model {
+            "https://example.com"
+        } else {
+            "invalid://endpoint"
+        }
+        .into();
+        settings(&e, s.clone());
+        favorite(&e, "original", "人工别名", vec!["人工标签".into()]);
+        e.send(Command::OrganizerTick).unwrap();
+        e.send(Command::OrganizerSnapshot { request_id: 987 })
+            .unwrap();
+        let Event::OrganizerState { snapshot, .. } = wait(&e, |event| {
+            assert!(
+                !matches!(event, Event::OrganizerWork(_)),
+                "invalid local configuration dispatched failing work"
+            );
+            matches!(
+                event,
+                Event::OrganizerState {
+                    request_id: 987,
+                    ..
+                }
+            )
+        }) else {
+            unreachable!()
+        };
+        assert_eq!(snapshot.queued, 1);
+        assert_eq!(snapshot.failures, 0);
+        assert!(!snapshot.in_flight && !snapshot.saturated && snapshot.retry_at_ms.is_none());
+    }
+    s.ai.model = "fixture".into();
+    s.ai.endpoint = "https://example.com".into();
+    settings(&e, s);
+    let w = work(&e);
+    assert_eq!(w.candidates[0].alias, "人工别名");
+    assert_eq!(w.candidates[0].tags, ["人工标签"]);
+    complete(&e, &w);
+    assert_eq!(snapshot(&e).failures, 0);
+    stop(&e);
+}
+
+// Metadata outside the organizer's boundary still belongs to the main history;
+// it must not starve the next valid source or be silently erased/truncated.
+#[test]
+fn invalid_organizer_source_boundary_preserves_favorite_and_allows_later_valid_work() {
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("boundary-db");
+    let e = open(&path);
+    settings(&e, config(OrganizerMode::Suggest));
+    let alias = "中".repeat(257);
+    favorite(&e, "oversized", &alias, vec![]);
+    favorite(&e, "valid", "原别名", vec![]);
+    let w = work(&e);
+    assert_eq!(w.candidates.len(), 1);
+    assert_eq!(
+        w.candidates[0].source,
+        Source::SavedItem { id: "valid".into() }
+    );
+    complete(&e, &w);
+    let state = snapshot(&e);
+    assert_eq!(state.failures, 0);
+    assert_eq!(state.proposals.len(), 1);
+    stop(&e);
+    let db = Connection::open(&path).unwrap();
+    let saved_alias: String = db
+        .query_row(
+            "SELECT json_extract(summary,'$.alias') FROM items WHERE id='oversized'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(saved_alias, alias);
+}
+
 // An unrelated Saved event cannot confirm this decision; its explicit receipt must follow a committed SQLite update.
 #[test]
 fn reviewed_decision_receipt_confirms_only_its_own_commit_and_reports_stale() {
