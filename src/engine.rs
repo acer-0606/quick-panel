@@ -2353,10 +2353,8 @@ impl Actor {
                         self.source_generation += 1;
                     }
                     let paths_changed = self.settings.path_activity != settings.path_activity;
-                    let organizer_changed = self.settings.ai != settings.ai
-                        || self.settings.organizer != settings.organizer
-                        || paths_changed
-                        || self.settings.excluded_apps != settings.excluded_apps;
+                    let organizer_changed =
+                        crate::organizer_ui::organizer_settings_changed(&self.settings, &settings);
                     if organizer_changed {
                         self.organizer_cancel();
                         if self.settings.organizer.enabled

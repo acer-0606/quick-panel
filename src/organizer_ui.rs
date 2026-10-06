@@ -6,6 +6,88 @@ use crate::{
 };
 use std::collections::{HashMap, HashSet};
 
+pub fn organizer_settings_changed(
+    old: &crate::model::Settings,
+    next: &crate::model::Settings,
+) -> bool {
+    old.ai != next.ai
+        || old.organizer != next.organizer
+        || old.path_activity != next.path_activity
+        || old.excluded_apps != next.excluded_apps
+}
+#[derive(Default)]
+pub struct OrganizerSession {
+    active: Option<(u64, u64)>,
+}
+impl OrganizerSession {
+    pub fn begin(&mut self, id: u64, token: u64) {
+        self.active = Some((id, token));
+    }
+    pub fn finish(&mut self, id: u64) -> Option<u64> {
+        if self.active.map(|active| active.0) != Some(id) {
+            return None;
+        }
+        self.active.take().map(|active| active.1)
+    }
+    pub fn cancel(&mut self) -> Option<u64> {
+        self.active.take().map(|active| active.0)
+    }
+    pub fn settings_changed(
+        &mut self,
+        old: &crate::model::Settings,
+        next: &crate::model::Settings,
+    ) -> Option<u64> {
+        if organizer_settings_changed(old, next) {
+            self.cancel()
+        } else {
+            None
+        }
+    }
+}
+#[derive(Default)]
+pub struct EditorRefresh {
+    shown: Option<(Source, String)>,
+    deferred: bool,
+    compositions: u8,
+}
+impl EditorRefresh {
+    pub fn replace(&mut self, candidate: Option<&Candidate>, composing: bool) -> bool {
+        let identity = candidate.map(|c| (c.source.clone(), c.expected_version.clone()));
+        if identity == self.shown {
+            self.deferred = false;
+            return false;
+        }
+        if composing || self.compositions != 0 {
+            self.deferred = true;
+            return false;
+        }
+        self.shown = identity;
+        self.deferred = false;
+        true
+    }
+    pub fn deferred(&self) -> bool {
+        self.deferred
+    }
+    pub fn shown(&self) -> Option<&(Source, String)> {
+        self.shown.as_ref()
+    }
+    pub fn composition(&mut self, editor: usize, active: bool) {
+        let bit = match editor {
+            0 => 1,
+            1 => 2,
+            _ => 0,
+        };
+        if active {
+            self.compositions |= bit;
+        } else {
+            self.compositions &= !bit;
+        }
+    }
+    pub fn composing(&self) -> bool {
+        self.compositions != 0
+    }
+}
+
 pub fn request_worker<Request: Send + 'static, Value: Send + 'static>(
     run: impl Fn(Request) -> Result<Value, String> + Send + Sync + 'static,
     notify: std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -134,6 +216,11 @@ pub enum ReviewDecision {
     Dismiss(Vec<Source>),
     SavePending,
 }
+struct Draft {
+    version: String,
+    alias: String,
+    tags: String,
+}
 #[derive(Default)]
 pub struct ReviewState {
     pub config_warning: Option<String>,
@@ -144,8 +231,10 @@ pub struct ReviewState {
     snapshot_request: Option<u64>,
     selected_source: Option<Source>,
     checked: HashSet<Source>,
-    drafts: HashMap<Source, (String, Option<String>, Vec<String>)>,
+    drafts: HashMap<Source, Draft>,
+    editor_source: Option<Source>,
     decision: Option<u64>,
+    submitted_sources: HashSet<Source>,
     needs_save: bool,
     detail_request: Option<(u64, Source, String, u64)>,
     detail: Option<(Source, String, Result<String, String>)>,
@@ -186,6 +275,7 @@ impl ReviewState {
                 .iter()
                 .any(|p| &p.candidate.source == source)
                 || self.selected_source.as_ref() == Some(source)
+                || self.editor_source.as_ref() == Some(source)
         });
         self.snapshot = snapshot;
         self.revision += 1;
@@ -267,36 +357,59 @@ impl ReviewState {
     }
     pub fn selected(&self) -> Option<Proposal> {
         self.selected_index()
-            .map(|i| self.edited(&self.snapshot.proposals[i]))
+            .map(|i| self.snapshot.proposals[i].clone())
     }
-    fn edited(&self, p: &Proposal) -> Proposal {
+    pub fn editor_text(&self) -> Option<(String, String)> {
+        let index = self.selected_index()?;
+        let p = &self.snapshot.proposals[index];
+        Some(if let Some(draft) = self.drafts.get(&p.candidate.source) {
+            (draft.alias.clone(), draft.tags.clone())
+        } else {
+            (p.alias.clone().unwrap_or_default(), p.tags.join(", "))
+        })
+    }
+    pub fn editor_source(&mut self, source: Option<Source>) {
+        self.editor_source = source;
+    }
+    fn submission(&self, p: &Proposal) -> Proposal {
         let mut p = p.clone();
-        if let Some((_, alias, tags)) = self.drafts.get(&p.candidate.source) {
-            p.alias = alias.clone();
-            p.tags = tags.clone();
+        if let Some(draft) = self.drafts.get(&p.candidate.source) {
+            p.alias = if draft.alias.trim().is_empty() {
+                None
+            } else {
+                Some(draft.alias.trim().into())
+            };
+            p.tags = draft
+                .tags
+                .split([',', '，', '、'])
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(str::to_owned)
+                .collect();
         }
         p
     }
     pub fn edit(&mut self, alias: String, tags: String) {
         if let Some(index) = self.selected_index() {
             let candidate = &self.snapshot.proposals[index].candidate;
-            self.drafts.insert(
+            self.edit_for(
                 candidate.source.clone(),
-                (
-                    candidate.expected_version.clone(),
-                    if alias.trim().is_empty() {
-                        None
-                    } else {
-                        Some(alias.trim().into())
-                    },
-                    tags.split([',', '，', '、'])
-                        .map(str::trim)
-                        .filter(|t| !t.is_empty())
-                        .map(str::to_owned)
-                        .collect(),
-                ),
+                candidate.expected_version.clone(),
+                alias,
+                tags,
             );
         }
+    }
+    pub fn edit_for(&mut self, source: Source, version: String, alias: String, tags: String) {
+        self.editor_source = Some(source.clone());
+        self.drafts.insert(
+            source,
+            Draft {
+                version,
+                alias,
+                tags,
+            },
+        );
     }
     pub fn check(&mut self, index: usize, checked: bool) {
         if let Some(p) = self.snapshot.proposals.get(index) {
@@ -334,7 +447,7 @@ impl ReviewState {
                     && self
                         .drafts
                         .get(&p.candidate.source)
-                        .is_some_and(|(version, _, _)| version != &p.candidate.expected_version)
+                        .is_some_and(|draft| draft.version != p.candidate.expected_version)
             }) {
                 return Err("来源已变化，编辑内容已保留；请核对当前上下文后修改再应用".into());
             }
@@ -343,17 +456,23 @@ impl ReviewState {
                 .proposals
                 .iter()
                 .filter(|p| self.checked.contains(&p.candidate.source))
-                .map(|p| self.edited(p))
+                .map(|p| self.submission(p))
                 .collect();
             if proposals.is_empty() {
                 return Err("请先勾选要处理的建议".into());
             }
+            let sources = proposals
+                .iter()
+                .map(|p| p.candidate.source.clone())
+                .collect();
             if dismiss {
+                self.submitted_sources = sources;
                 ReviewDecision::Dismiss(proposals.into_iter().map(|p| p.candidate.source).collect())
             } else {
                 for p in &proposals {
                     p.validate()?;
                 }
+                self.submitted_sources = sources;
                 ReviewDecision::Apply(proposals)
             }
         };
@@ -372,8 +491,11 @@ impl ReviewState {
         self.preserve_failed_drafts = result.is_err();
         self.message = match result {
             Ok(()) => {
-                self.checked.clear();
-                self.drafts.clear();
+                self.checked
+                    .retain(|source| !self.submitted_sources.contains(source));
+                self.drafts
+                    .retain(|source, _| !self.submitted_sources.contains(source));
+                self.submitted_sources.clear();
                 "所选建议已保存".into()
             }
             Err(error) => format!(
@@ -385,6 +507,9 @@ impl ReviewState {
                 }
             ),
         };
+        if !pending_save {
+            self.submitted_sources.clear();
+        }
         self.revision += 1;
         true
     }

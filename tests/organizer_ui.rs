@@ -101,8 +101,10 @@ fn snapshot_gate_keeps_one_request_and_preserves_selected_edits() {
             ..Default::default()
         },
     );
-    assert_eq!(ui.selected().unwrap().alias.as_deref(), Some("人工名称"));
-    assert_eq!(ui.selected().unwrap().tags, ["人工", "标签"]);
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        ("人工名称".into(), "人工, 标签".into())
+    );
     ui.close();
     assert!(!ui.adopt_snapshot(id, Snapshot::default()));
 }
@@ -174,7 +176,7 @@ fn changed_source_snapshot_preserves_draft_and_original_version_for_stale_reject
         },
     );
     assert!(ui.begin_decision(false).unwrap_err().contains("变化"));
-    assert_eq!(ui.selected().unwrap().alias.as_deref(), Some("编辑"));
+    assert_eq!(ui.editor_text().unwrap().0, "编辑");
 }
 
 // Empty metadata or a blank endpoint must be reported locally when organizer opt-in is enabled.
@@ -254,9 +256,201 @@ fn stale_receipt_keeps_edits_until_an_explicit_local_refresh() {
     ui.receipt(id, Err("来源已变化".into()), false);
     let id = ui.request_snapshot().unwrap();
     assert!(!ui.adopt_snapshot(id, Snapshot::default()));
-    assert_eq!(ui.selected().unwrap().alias.as_deref(), Some("保留编辑"));
+    assert_eq!(ui.editor_text().unwrap().0, "保留编辑");
     ui.refresh();
     let id = ui.request_snapshot().unwrap();
     assert!(ui.adopt_snapshot(id, Snapshot::default()));
     assert!(ui.snapshot.proposals.is_empty());
+}
+
+fn unselected_draft_survives(dismiss: bool, retry: bool) {
+    let a = proposal();
+    let mut b = proposal();
+    b.candidate.source = Source::SavedItem { id: "two".into() };
+    let mut ui = ReviewState::default();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![a.clone(), b],
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    ui.edit("人工 A".into(), "草稿标签".into());
+    ui.select(Some(1));
+    ui.check(1, true);
+    let (id, _) = ui.begin_decision(dismiss).unwrap();
+    if retry {
+        ui.receipt(id, Err("磁盘失败".into()), true);
+        ui.select(Some(0));
+        ui.check(0, true);
+        let (id, decision) = ui.begin_decision(dismiss).unwrap();
+        assert!(matches!(decision, ReviewDecision::SavePending));
+        ui.receipt(id, Ok(()), false);
+    } else {
+        ui.receipt(id, Ok(()), false);
+    }
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![a.clone()],
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    if retry {
+        assert!(
+            ui.checked(0),
+            "SavePending discarded an unrelated checkbox selection"
+        );
+    }
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        ("人工 A".into(), "草稿标签".into())
+    );
+    let mut changed = a;
+    changed.candidate.expected_version = "v2".into();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![changed],
+            ..Default::default()
+        },
+    );
+    ui.check(0, true);
+    assert!(
+        ui.begin_decision(false).unwrap_err().contains("变化"),
+        "unsubmitted draft lost its version guard"
+    );
+}
+// Saving/ignoring B must not erase A's draft or its source version.
+#[test]
+fn successful_selected_receipt_keeps_unselected_draft_and_version() {
+    for dismiss in [false, true] {
+        unselected_draft_survives(dismiss, false);
+    }
+}
+// A SavePending barrier must use the original submission set, not the current selection or all drafts.
+#[test]
+fn failed_selected_receipt_and_save_pending_keep_unselected_draft_and_version() {
+    for dismiss in [false, true] {
+        unselected_draft_survives(dismiss, true);
+    }
+}
+
+// Local snapshot/detail refresh must preserve the raw delimiter/whitespace; normalization belongs only to a submitted proposal.
+#[test]
+fn editor_preserves_raw_tail_delimiter_and_whitespace_until_submission() {
+    let mut p = proposal();
+    p.candidate.kind = ItemKind::Folder;
+    let mut ui = ReviewState::default();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p.clone()],
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    ui.edit(" 名称  ".into(), " 项目, ".into());
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        (" 名称  ".into(), " 项目, ".into())
+    );
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p],
+            queued: 4,
+            ..Default::default()
+        },
+    );
+    let (id, _, _) = ui.request_detail().unwrap();
+    assert!(ui.adopt_detail(id, Ok("C:/原路径".into())));
+    assert_eq!(
+        ui.editor_text().unwrap(),
+        (" 名称  ".into(), " 项目, ".into())
+    );
+    ui.check(0, true);
+    let (_, decision) = ui.begin_decision(false).unwrap();
+    let ReviewDecision::Apply(proposals) = decision else {
+        panic!("wrong decision")
+    };
+    assert_eq!(proposals[0].alias.as_deref(), Some("名称"));
+    assert_eq!(proposals[0].tags, vec!["项目"]);
+    assert_eq!(ui.editor_text().unwrap().1, " 项目, ");
+}
+
+// The native editor's production gate must skip same-source refreshes and postpone necessary replacements until IME composition ends.
+#[test]
+fn editor_refresh_gate_preserves_same_identity_and_defers_ime_replacement() {
+    let a = proposal().candidate;
+    let mut b = a.clone();
+    b.source = Source::SavedItem { id: "two".into() };
+    let mut gate = EditorRefresh::default();
+    assert!(gate.replace(Some(&a), false));
+    assert!(!gate.replace(Some(&a), false));
+    assert!(!gate.replace(Some(&a), true));
+    assert!(!gate.replace(Some(&b), true));
+    assert!(gate.deferred());
+    assert!(gate.replace(Some(&b), false));
+    assert!(!gate.deferred());
+    assert!(!gate.replace(Some(&b), false));
+    b.expected_version = "v2".into();
+    assert!(!gate.replace(Some(&b), true));
+    assert!(gate.replace(Some(&b), false));
+    assert!(!gate.replace(None, true));
+    assert!(gate.replace(None, false));
+}
+
+// Composition finishing after a source-version refresh still belongs to the editor's displayed version.
+#[test]
+fn deferred_editor_input_does_not_rebind_an_old_draft_to_a_new_version() {
+    let mut p = proposal();
+    let mut ui = ReviewState::default();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p.clone()],
+            ..Default::default()
+        },
+    );
+    ui.select(Some(0));
+    let source = p.candidate.source.clone();
+    p.candidate.expected_version = "v2".into();
+    let id = ui.request_snapshot().unwrap();
+    ui.adopt_snapshot(
+        id,
+        Snapshot {
+            proposals: vec![p],
+            ..Default::default()
+        },
+    );
+    ui.edit_for(source, "v1".into(), " 组合输入 ".into(), "项目,".into());
+    assert_eq!(ui.editor_text().unwrap().1, "项目,");
+    ui.check(0, true);
+    assert!(ui.begin_decision(false).unwrap_err().contains("变化"));
+}
+
+// IME is active between Start/End even before GCS_COMPSTR contains its first character.
+#[test]
+fn editor_refresh_defers_empty_ime_composition_until_all_editors_end() {
+    let a = proposal().candidate;
+    let mut b = a.clone();
+    b.expected_version = "v2".into();
+    let mut gate = EditorRefresh::default();
+    assert!(gate.replace(Some(&a), false));
+    gate.composition(0, true);
+    assert!(!gate.replace(Some(&b), false));
+    gate.composition(1, true);
+    gate.composition(0, false);
+    assert!(!gate.replace(Some(&b), false));
+    gate.composition(1, false);
+    assert!(gate.replace(Some(&b), false));
 }

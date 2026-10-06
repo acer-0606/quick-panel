@@ -18,6 +18,7 @@ use windows::{
             Controls::*,
             HiDpi::GetDpiForWindow,
             Input::KeyboardAndMouse::{EnableWindow, SetFocus},
+            Shell::{DefSubclassProc, SetWindowSubclass},
             WindowsAndMessaging::*,
         },
     },
@@ -27,6 +28,7 @@ const LIST: usize = 10;
 const ALIAS: usize = 11;
 const TAGS: usize = 12;
 struct View {
+    editor_refresh: crate::organizer_ui::EditorRefresh,
     state: Rc<RefCell<ReviewState>>,
     submit: Rc<dyn Fn(Command)>,
     controls: Vec<HWND>,
@@ -60,6 +62,43 @@ unsafe fn set(hwnd: HWND, value: &str) {
     }
     let value = wide(value);
     let _ = SetWindowTextW(hwnd, PCWSTR(value.as_ptr()));
+}
+unsafe fn composing(hwnd: HWND) -> bool {
+    let context = windows::Win32::UI::Input::Ime::ImmGetContext(hwnd);
+    if context.is_invalid() {
+        return false;
+    }
+    let active = windows::Win32::UI::Input::Ime::ImmGetCompositionStringW(
+        context,
+        windows::Win32::UI::Input::Ime::GCS_COMPSTR,
+        None,
+        0,
+    ) > 0;
+    let _ = windows::Win32::UI::Input::Ime::ImmReleaseContext(hwnd, context);
+    active
+}
+unsafe extern "system" fn editor_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    _id: usize,
+    data: usize,
+) -> LRESULT {
+    let ptr = data as *const RefCell<View>;
+    if msg == WM_IME_STARTCOMPOSITION {
+        let mut view = (*ptr).borrow_mut();
+        let index = usize::from(hwnd == view.tags);
+        view.editor_refresh.composition(index, true);
+    }
+    let result = DefSubclassProc(hwnd, msg, wp, lp);
+    if msg == WM_IME_ENDCOMPOSITION {
+        let index = usize::from(hwnd == (*ptr).borrow().tags);
+        (*ptr).borrow_mut().editor_refresh.composition(index, false);
+        let owner = GetParent(hwnd).unwrap_or_default();
+        let _ = PostMessageW(Some(owner), WM_TIMER, WPARAM(1), LPARAM(0));
+    }
+    result
 }
 unsafe fn list_theme(ptr: *const RefCell<View>) {
     let (list, palette) = {
@@ -101,6 +140,12 @@ unsafe fn selected(ptr: *const RefCell<View>) {
         .borrow_mut()
         .select((index >= 0).then_some(index as usize));
     let proposal = state.borrow().selected();
+    let tracked = (*ptr).borrow().editor_refresh.composing();
+    let composing = tracked || composing(alias) || composing(tags);
+    let replace = (*ptr)
+        .borrow_mut()
+        .editor_refresh
+        .replace(proposal.as_ref().map(|p| &p.candidate), composing);
     let request = state.borrow_mut().request_detail();
     if let Some((request_id, source, expected_version)) = request {
         let submit = (*ptr).borrow().submit.clone();
@@ -133,18 +178,25 @@ unsafe fn selected(ptr: *const RefCell<View>) {
                 p.reason
             ),
         );
-        set(alias, p.alias.as_deref().unwrap_or_default());
-        set(tags, &p.tags.join(", "));
     } else {
         set(detail, "选择一条建议查看原始名称、完整路径或文本摘要");
-        set(alias, "");
-        set(tags, "");
+    }
+    if replace {
+        let identity = (*ptr).borrow().editor_refresh.shown().cloned();
+        state
+            .borrow_mut()
+            .editor_source(identity.map(|(source, _)| source));
+        let (alias_text, tags_text) = state.borrow().editor_text().unwrap_or_default();
+        set(alias, &alias_text);
+        set(tags, &tags_text);
     }
     let editable = state.borrow().selected_index().is_some()
         && !state.borrow().pending()
         && !state.borrow().needs_save();
-    let _ = EnableWindow(alias, editable);
-    let _ = EnableWindow(tags, editable);
+    if !composing {
+        let _ = EnableWindow(alias, editable);
+        let _ = EnableWindow(tags, editable);
+    }
     (*ptr).borrow_mut().rendering = false;
 }
 unsafe fn render(ptr: *const RefCell<View>) {
@@ -187,6 +239,10 @@ unsafe fn render(ptr: *const RefCell<View>) {
         )
     };
     if revision == current {
+        let deferred = (*ptr).borrow().editor_refresh.deferred();
+        if deferred {
+            selected(ptr);
+        }
         return;
     }
     (*ptr).borrow_mut().rendering = true;
@@ -340,13 +396,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     && notification == EN_CHANGE
                     && !(*ptr).borrow().rendering
                 {
-                    let (state, alias, tags) = {
+                    let (state, alias, tags, identity) = {
                         let v = (*ptr).borrow();
-                        (v.state.clone(), v.alias, v.tags)
+                        (
+                            v.state.clone(),
+                            v.alias,
+                            v.tags,
+                            v.editor_refresh.shown().cloned(),
+                        )
                     };
                     let a = text(alias);
                     let t = text(tags);
-                    state.borrow_mut().edit(a, t);
+                    if let Some((source, version)) = identity {
+                        state.borrow_mut().edit_for(source, version, a, t);
+                    }
                 }
                 if [1, 2, 3, 4].contains(&id) {
                     if id == 4 {
@@ -538,6 +601,7 @@ pub unsafe fn show(
     let width = scale(800).min(work.right - work.left - 24);
     let height = scale(640).min(work.bottom - work.top - 24);
     let view = Box::new(RefCell::new(View {
+        editor_refresh: crate::organizer_ui::EditorRefresh::default(),
         state: state.clone(),
         submit,
         controls: vec![],
@@ -677,6 +741,18 @@ pub unsafe fn show(
         v.retry = retry;
         v.rendering = false;
     }
+    let _ = SetWindowSubclass(
+        alias,
+        Some(editor_proc),
+        1,
+        (&*view as *const RefCell<View>) as usize,
+    );
+    let _ = SetWindowSubclass(
+        tags,
+        Some(editor_proc),
+        1,
+        (&*view as *const RefCell<View>) as usize,
+    );
     list_theme(&*view);
     layout(hwnd, &*view);
     render(&*view);

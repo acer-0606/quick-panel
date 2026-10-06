@@ -444,7 +444,7 @@ type OrganizerWorker = crate::connection_test::ConnectionTestWorker<
 >;
 struct App {
     organizer_worker: Option<OrganizerWorker>,
-    organizer_active: Option<(u64, u64)>,
+    organizer_session: crate::organizer_ui::OrganizerSession,
     organizer_tick_pending: bool,
     organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
@@ -567,7 +567,7 @@ pub fn run() -> Result<(), String> {
         let (done_tx, rx) = mpsc::channel();
         let app_data = App {
             organizer_worker: None,
-            organizer_active: None,
+            organizer_session: crate::organizer_ui::OrganizerSession::default(),
             organizer_tick_pending: false,
             organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
             organizer_outbox: Rc::new(RefCell::new((None, None))),
@@ -754,11 +754,6 @@ impl App {
             review.revision += 1;
         }
         self.organizer_tick_pending = false;
-        if let Some((id, _)) = self.organizer_active.take()
-            && let Some(worker) = &self.organizer_worker
-        {
-            worker.cancel(id);
-        }
         let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
         if self.settings.organizer.enabled
             && warning.is_none()
@@ -773,6 +768,15 @@ impl App {
         }
         if self.organizer_page_open {
             self.organizer_snapshot();
+        }
+    }
+    fn cancel_organizer_for_settings(&mut self, next: &Settings) {
+        if let Some(id) = self
+            .organizer_session
+            .settings_changed(&self.settings, next)
+            && let Some(worker) = &self.organizer_worker
+        {
+            worker.cancel(id);
         }
     }
     fn organizer_snapshot(&self) {
@@ -831,7 +835,7 @@ impl App {
         }
         let token = work.token;
         match self.organizer_worker.as_ref().unwrap().submit(work) {
-            Ok(id) => self.organizer_active = Some((id, token)),
+            Ok(id) => self.organizer_session.begin(id, token),
             Err(_) => self.send(Command::OrganizerComplete {
                 token,
                 result: Err("上一次后台请求仍未结束".into()),
@@ -2080,12 +2084,9 @@ impl App {
             .organizer_worker
             .as_ref()
             .and_then(|worker| worker.try_result())
-            && self
-                .organizer_active
-                .is_some_and(|(id, _)| id == completion.id)
             && self.state.lifecycle == Lifecycle::Running
+            && let Some(token) = self.organizer_session.finish(completion.id)
         {
-            let (_, token) = self.organizer_active.take().unwrap();
             match completion.result {
                 Ok((token, result)) => self.send(Command::OrganizerComplete { token, result }),
                 Err(message) => {
@@ -3099,7 +3100,10 @@ impl App {
         }
         self.cancel_ai();
         self.cancel_preflight();
-        self.settings.ai = next;
+        let mut settings = self.settings.clone();
+        settings.ai = next;
+        self.cancel_organizer_for_settings(&settings);
+        self.settings = settings;
         self.update_organizer_timer();
         self.send(Command::SaveSettings(self.settings.clone()));
         self.retheme();
@@ -3352,7 +3356,7 @@ impl App {
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
                 let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
-                if let Some((id, _)) = self.organizer_active.take()
+                if let Some(id) = self.organizer_session.cancel()
                     && let Some(worker) = &self.organizer_worker
                 {
                     worker.cancel(id);
@@ -4127,7 +4131,10 @@ impl Host {
                     {
                         match crate::organizer_ui::parse_organizer_fields(&values) {
                             Ok(settings) => {
-                                app.settings.organizer = settings;
+                                let mut next = app.settings.clone();
+                                next.organizer = settings;
+                                app.cancel_organizer_for_settings(&next);
+                                app.settings = next;
                                 app.update_organizer_timer();
                                 app.send(Command::SaveSettings(app.settings.clone()));
                             }

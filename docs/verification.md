@@ -29,6 +29,10 @@
 
 所有 Cargo 在 `/Volumes/QPPathNamesBuild/workspace/quick-panel` RAM 副本串行执行，环境统一为 `TMPDIR=/Volumes/QPPathNamesBuild/tmp CARGO_TARGET_DIR=/Volumes/QPPathNamesBuild/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。日志保留 `/Volumes/QPPathNamesBuild/tmp/task3-*.log`。共享 SQLite/线程用例是功能证据，不证明 SSD 耐久性、Windows 性能或模型语义效果。未访问用户真实密钥、API、剪贴板、屏幕或文件正文；未派子代理。本轮没有修改 SSD 旧 WIP，最终同步和临时卷管理由主控负责。
 
+Task 3 定点修复第 1 轮（基于 `a9aa6d2`）：原样保存 AI/管家设置不再取消实际在途结果；UI session 与 actor 使用同一相关配置比较，真正变更仍撤销且不提前释放网络占用。保存回执记录本批来源，只清本次提交的草稿和勾选，SavePending 延续同一来源集合。编辑框保存原始别名/标签文本，仅提交时规范化；同 source/version 的后台刷新不替换输入，必要替换等待 IME 结束，输入仍绑定实际显示的来源版本。
+
+本轮 focused 为 **25 passed / 0 failed**（organizer_ui 17、connection_test 6、真实 worker/actor coordinator 2）；先观察原样保存丢回执、未选中 A 草稿丢失、raw 尾逗号/空白消失等真实 RED，再修至 GREEN。IME 同时使用 Edit 子类的 Start/End 状态与 GCS_COMPSTR，尚未产生首个组合字符时也不替换或禁用编辑框。macOS/Windows all-target strict Clippy 和 Windows all-target cross-check 通过，最终 source 后更新 Windows Release。未重复 363 项整套；日志为 `task3-fix1-*.log`。ListView 阅读滚动与持续成功消息遮挡状态两条 Minor 仍按主控决定 deferred。Windows 实机 IME/光标/选择验收仍未执行，门控共享测试与交叉编译不能替代它。
+
 ## 外部常用路径与区域截图（当前版本）
 
 [本轮设计与边界](superpowers/specs/2026-10-05-external-paths-and-screenshots-design.md)；[实施计划](superpowers/plans/2026-10-05-external-paths-and-screenshots.md)。
