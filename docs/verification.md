@@ -1,8 +1,19 @@
 # 验证记录
 
-当前 AI 管家集成验证日期：2026-10-06；此前外部路径与截图基线为 `fb9d8b1`，对应旧记录保留在后文。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
+当前 AI 管家集成验证日期：2026-10-06；产品源码为 `1bb5874f95424e094676f95b276cb1d45b8b858f`，此后只更新验证和实施记录。此前外部路径与截图基线为 `fb9d8b1`，对应旧记录保留在后文。验证宿主为 macOS aarch64，Windows 包通过 `x86_64-pc-windows-gnu` 交叉构建。SQLite 为随程序编译的 3.53.2，sqlite-vec 固定为 0.1.9（运行时 `vec_version()` 为 `v0.1.9`）。
 
-已实现并生成 Windows x64 便携包。共享核心、Windows 源码编译与静态审查通过；Windows 原生界面的实际运行尚未在本机验证。
+共享核心和 Windows 源码编译通过；Windows 原生界面的实际运行尚未在本机验证。最终源码的验证结果如下，后文较早阶段的测试数量不代表当前版本：
+
+| 最终检查 | 结果 |
+|---|---|
+| 完整共享测试 | **379 项通过、0 失败、2 项既有重型测试忽略**；34 个 suite summaries |
+| macOS / Windows all-target strict Clippy | 两者通过，`-D warnings`；Windows all-target check 通过 |
+| fmt / diff check | 通过 |
+| Windows GNU Release | PE32+ GUI x64，4,692,480 字节；只导入 Windows 系统 DLL / CRT |
+| 共享 `--core-check` | `pending_visible`、`disk_empty_before_flush`、`exit_restored` 均为 true |
+| Windows-only fixtures | **38 项仅交叉编译、0 项执行**：AI 22、Embedding 8、images 8 |
+
+最终 EXE 的 SHA-256 为 `464e0d95fab8c3aebc002c419c2a48affb3c0854d021bff2acf03535b07880cd`。ZIP 与 EXE 的交付校验值位于 `dist/SHA256SUMS.txt`，使用新建归档避免旧文件残留。
 
 ## AI 管家、模型与原生审阅（2026-10-06）
 
@@ -16,7 +27,7 @@
 
 视觉沿用 theme::Colors、Segoe UI 和实际 DPI 字体。长设置表单使用原生滚动 viewport、固定保存/取消按钮及焦点滚动，高 DPI 不通过缩小字体隐藏字段。审阅窗口采用顶部状态、中部真实列表、下部可选择详情与编辑区、底部明确动作；复用明暗主题和窗口工作区边界。界面截图、100/150/200% DPI 鼠标与键盘/IME、焦点、窗口实际关闭/重开仍需 Windows 实机验收。
 
-| 本轮检查 | 结果 |
+| Task 3 初版阶段检查（历史记录，`a9aa6d2`） | 结果 |
 |---|---|
 | 最终 focused（跳过两项此前已验证的大容量用例） | **75 passed / 0 failed**：lib 8、连接生命周期 6、organizer actor 21、UI 11、palette 22、path_names 7 |
 | 一次完整共享 suite | **363 passed / 0 failed / 2 项既有 ignored**，33 个 suite summaries；organizer actor 23 项含两项容量测试 |
@@ -27,7 +38,7 @@
 
 真实 RED 包括：缺便携解析/生命周期模块；取消/关闭状态槽过早释放；新版本错误接收旧编辑；worker panic 无终态；回执接口缺失；混合 stale Dismiss 被当作成功；容量释放后 saturated 粘滞；完整原路径接口/详情 gate 缺失；关闭 AI 时管家入口不可查的目录回归。SQLite 回执测试构造真实 UPDATE 失败触发器，验证磁盘别名/Ready 同时保持旧值、RAM Ready 已移除仍明确失败、后续关联 SavePending 确认实际提交。详情测试验证超出 1024 摘要的原大小写 target、PRAGMA data_version 不变和改源版本拒绝。
 
-所有 Cargo 在 `/Volumes/QPPathNamesBuild/workspace/quick-panel` RAM 副本串行执行，环境统一为 `TMPDIR=/Volumes/QPPathNamesBuild/tmp CARGO_TARGET_DIR=/Volumes/QPPathNamesBuild/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。日志保留 `/Volumes/QPPathNamesBuild/tmp/task3-*.log`。共享 SQLite/线程用例是功能证据，不证明 SSD 耐久性、Windows 性能或模型语义效果。未访问用户真实密钥、API、剪贴板、屏幕或文件正文；未派子代理。本轮没有修改 SSD 旧 WIP，最终同步和临时卷管理由主控负责。
+构建在 `/Volumes/QPPathNamesBuild/workspace/quick-panel` RAM 副本执行，环境统一为 `TMPDIR=/Volumes/QPPathNamesBuild/tmp CARGO_TARGET_DIR=/Volumes/QPPathNamesBuild/target CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。原则上串行 Cargo，后文保留一次短暂重叠记录。最终日志与审查记录另存回原项目 `target/verification-2026-10-06-ai-organizer/`，RAM 路径仅描述构建时环境。共享 SQLite/线程用例是功能证据，不证明 SSD 耐久性、Windows 性能或模型语义效果。未访问用户真实密钥、API、剪贴板、屏幕或文件正文；实施代理未继续派生代理，主控组织了独立审查。
 
 Task 3 定点修复第 1 轮（基于 `a9aa6d2`）：原样保存 AI/管家设置不再取消实际在途结果；UI session 与 actor 使用同一相关配置比较，真正变更仍撤销且不提前释放网络占用。保存回执记录本批来源，只清本次提交的草稿和勾选，SavePending 延续同一来源集合。编辑框保存原始别名/标签文本，仅提交时规范化；同 source/version 的后台刷新不替换输入，必要替换等待 IME 结束，输入仍绑定实际显示的来源版本。
 
@@ -41,9 +52,19 @@ Task 3 定点修复第 1 轮（基于 `a9aa6d2`）：原样保存 AI/管家设�
 
 唯一一次最终 `cargo test --locked`：**379 passed / 0 failed / 2 既有 ignored**，34 个 suite summaries；全部 26 个 organizer actor 用例通过（45.04s），含两项既有缓存/Ready 大容量用例，最后代码下的 2 MiB 内存与未来结果预留仍成立。日志 `final-fix-full.log`。Windows all-target 编译涵盖现有 38 个 native fixtures，它们在 macOS 上执行 0 项。
 
-最后源码后的唯一一次 Windows GNU Release 构建通过（30.02s，`final-fix-release.log`）；`cargo fmt --all -- --check` 与 `git diff --check` 最终通过。最终 EXE 留在 RAM target，由主控统一同步。
+最后源码后的唯一一次 Windows GNU Release 构建通过（30.02s，`final-fix-release.log`）；`cargo fmt --all -- --check` 与 `git diff --check` 最终通过。主控读取完整日志，独立汇总为 379/0/2，并检查 EXE 类型、系统 DLL 导入及哈希。随后在相同源码运行 `cargo run --locked -- --core-check`，三个内存优先/退出恢复断言均为 true；使用合成临时 SQLite，无用户数据。最终 EXE 复制到原项目的 `target/x86_64-pc-windows-gnu/release/quick-panel.exe` 和 `dist/QuickPanel-Windows-x64/QuickPanel.exe`。
 
-## 外部常用路径与区域截图（当前版本）
+三个任务的独立审查及必要定点修复均完成。最终全范围审查发现的请求尺寸预算、列表滚动、成功消息遮挡状态三项问题，在唯一修复波 `0d695d6..1bb5874` 中全部处理；定点复审逐项确认 ADDRESSED，修复 diff 新问题与范围外观察均为 None，未解决发现为 0。没有重复执行不变代码的完整 suite，也没有将交叉编译或协议 fixture 当作真实接口/Windows GUI 验收。
+
+## AI 管家实施决定
+
+以下按本轮 `Ruling:` 的记录顺序保留全部三项决定与代价：
+
+1. **AI 检索与管家独立启用，共用接口、密钥、模型和推理强度。** 用户可以只开后台整理，界面继续使用“启用 AI 按意思查找”的精确名称，并在管家页说明独立关系。代价是关闭检索不等于关闭全部 AI；若希望停止全部 AI，需同时关闭管家。
+2. **磁盘耗尽时只迁移本项目可重建产物与可下载 Cargo 缓存。** 本项目 target、94 个下载归档及后续 5 个已解压依赖目录经字节核对后暂存 RAM 并原位链接；空间恢复后均已还原为普通目录/文件，恢复义务已履行。另清理 673 个已有解压源码的公共 crates.io 下载归档（113,966,305 字节），保留解压源码、其他注册表和用户数据。代价是未恢复链接会造成断链，已核查移除；删除的公共下载归档未来可能需重新下载。相关清单保存在本轮验证记录目录。
+3. **磁盘仍满时使用完整 RAM Git 开发副本，保留原目录中的已有改动。** 以原 HEAD 和文件哈希为基线，将新提交历史与提交中的文件安全同步回 `/Users/chuwujie/workspace/quick-panel`，碰到未预期的本地变更即停止覆盖。代价是同步前 RAM 工作不可视为持久交付；源码、提交、验证证据和产物必须全部回存并校验后才卸载临时卷。最终保留原 `codex/quick-panel` 分支。
+
+## 外部常用路径与区域截图（历史验证 `fb9d8b1`）
 
 [本轮设计与边界](superpowers/specs/2026-10-05-external-paths-and-screenshots-design.md)；[实施计划](superpowers/plans/2026-10-05-external-paths-and-screenshots.md)。
 
