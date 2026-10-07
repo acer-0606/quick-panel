@@ -88,7 +88,7 @@ unsafe fn selected(ptr: *const RefCell<View>) {
             Some(WPARAM(usize::from(record.confirmed))),
             None,
         );
-        state.borrow_mut().navigation_draft = None;
+        state.borrow_mut().clear_current_navigation_draft();
         (*ptr).borrow_mut().shown = Some(record);
     }
 }

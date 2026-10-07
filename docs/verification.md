@@ -8,6 +8,16 @@
 - 原生中心在窄屏使用顶部六组选项，详情可键盘滚动，打开/返回动作固定；生产 geometry 在 96/144/192 DPI 和 360×480、800×600 客户区验证可达。叶子固定动作复用相同几何，长标签换行，连接状态可滚动阅读。
 - 设置提交只说明“更改已接收”，不把不关联的旧 Saved 当作本次落盘。后台错误在中心显示；正常退出的保存失败重试合同保持。
 
+## 最终复审修复（I1、I2、M1、M2，当前增量）
+
+本波从 `d09ea4a` 修复跨管理页的未提交草稿所有权：真实 Navigation push/pop 同步暂停/恢复当前帧的 MemoryNavigationDraft，切组或重显不创建新帧；Memory 页选择只清当前草稿，成功回执只清提交所属帧。pending command、request ID、semantic admission 和提交 raw 仍唯一共享，已接纳操作优先原请求重试。反馈仍按精确来源/所见版本/别名恢复；嵌套 Memory 页保留原记录、raw、scope 与开关，不增加 I/O。
+
+所有叶子的错误区改成固定 footer 内的原生只读多行 EDIT，支持 Tab、选取/复制及垂直滚动；创建和 DPI 重排共用错误区几何。保留原输入控件、焦点与 IME，重复状态更新不重置相同错误的阅读位置。360px/192DPI 下真实保留天数错误超过固定高度的回归核对完整滚读样式及保存/取消位置。结果区、测试连接/获取模型按钮与字段一同参与焦点滚入。README 同步“忽略建议”和“启用整理记忆（使用规则并记录反馈）”及实际停用含义。
+
+本波定点 RED 后，最终 `cargo test --locked --test organizer_ui --test settings_ui --test form_validation` **65 passed / 0 failed / 0 ignored**（43 + 13 + 9）；覆盖 A→Hub→B→A、嵌套草稿原记录、暂停帧迟到回执、原请求重试和导航清理，以及错误阅读与跨 DPI 非字段焦点。host/Windows all-targets strict Clippy/check 全部 exit0，无 warning；Windows Release exit0（43.278s）。完整命令日志、每次失败及独立 metadata 见本轮 `final-fix-report.md` 引用的 scratch 证据；fresh ZIP 的准确成员、字节、CRC、SHA 与 source/stage 校验见外置 `dist/package-manifest.json`、`dist/SHA256SUMS` 和 `final-fix-artifact-audit.json`。
+
+历史 **499/0/2** 全套属于 `94a6e5a` 阶段；`d09ea4a` 另有 42 + 1 增量覆盖，本波仅记录上述 65 项，不冒称最终源码重跑完整套件。未变的 Node suite、core-check 不重跑。Windows GUI/中文 IME/多屏 DPI 实机执行数仍为 **0**；原生接线及 Win32 样式核对与交叉编译不能替代实机验收。无真实 API、密钥、用户数据库、剪贴板或屏幕访问。
+
 ## Task 4 gate 修复 round 1
 
 本轮修复路径叶子及其异步保存/清理通知提前发起面板检索、跨管理页丢失原设置来源，以及宽96DPI→窄192DPI叶子说明裁切三项。路径提交命令策略只返回实际 SaveSettings / 明确 ClearPathActivity；导航栈同时保存各层分组与记忆/建议来源，后台 Changed / PathActivityChanged / Saved 经同一门禁延迟面板检索。已启动索引的终态刷新许可不扩张也不移除。

@@ -702,6 +702,11 @@ pub struct MemoryUiState {
     pub pending_save: bool,
     pub raw_input: String,
     pub navigation_draft: Option<MemoryNavigationDraft>,
+    // Draft ownership follows actual navigation frames; actor state remains singular.
+    suspended_navigation: Vec<(u64, Option<MemoryNavigationDraft>)>,
+    navigation_frame: u64,
+    next_navigation_frame: u64,
+    pending_navigation_frame: u64,
     snapshot_request: Option<u64>,
     semantic_admitted: bool,
     pending_work: Option<u64>,
@@ -726,6 +731,32 @@ pub fn memory_request_id() -> u64 {
     h.finish().max(1)
 }
 impl MemoryUiState {
+    pub fn clear_current_navigation_draft(&mut self) {
+        self.navigation_draft = None;
+    }
+    pub(crate) fn enter_navigation_frame(&mut self) {
+        self.suspended_navigation
+            .push((self.navigation_frame, self.navigation_draft.take()));
+        self.next_navigation_frame += 1;
+        self.navigation_frame = self.next_navigation_frame;
+    }
+    pub(crate) fn leave_navigation_frame(&mut self) {
+        if let Some((frame, draft)) = self.suspended_navigation.pop() {
+            self.navigation_frame = frame;
+            self.navigation_draft = draft;
+        }
+    }
+    fn clear_submitted_navigation_draft(&mut self) {
+        if self.navigation_frame == self.pending_navigation_frame {
+            self.clear_current_navigation_draft();
+        } else if let Some((_, draft)) = self
+            .suspended_navigation
+            .iter_mut()
+            .find(|(frame, _)| *frame == self.pending_navigation_frame)
+        {
+            *draft = None;
+        }
+    }
     pub fn footer_buttons(&self, feedback: bool) -> [MemoryFooterButton; 4] {
         use MemoryFooterAction::*;
         let idle = !self.saving;
@@ -845,6 +876,7 @@ impl MemoryUiState {
         }
         self.semantic_admitted = false;
         self.pending_work = None;
+        self.pending_navigation_frame = self.navigation_frame;
         self.pending = Some(command.clone());
         self.saving = true;
         self.message = "正在保存…".into();
@@ -878,7 +910,7 @@ impl MemoryUiState {
             Ok(()) if !pending_save => {
                 self.pending = None;
                 self.raw_input.clear();
-                self.navigation_draft = None;
+                self.clear_submitted_navigation_draft();
                 "已保存".into()
             }
             Ok(()) => "尚未落盘，请重试保存".into(),

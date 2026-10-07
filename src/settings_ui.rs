@@ -319,6 +319,29 @@ pub struct Navigation {
     frames: Vec<Page>,
 }
 impl Navigation {
+    pub fn open_with_memory(
+        &mut self,
+        page: Page,
+        memory: &mut crate::organizer_ui::MemoryUiState,
+    ) {
+        if self.open(page) {
+            memory.enter_navigation_frame();
+        }
+    }
+    pub fn close_with_memory(
+        &mut self,
+        memory: &mut crate::organizer_ui::MemoryUiState,
+    ) -> Option<Page> {
+        if self.current().is_some() {
+            memory.leave_navigation_frame();
+        }
+        self.close()
+    }
+    pub fn clear_with_memory(&mut self, memory: &mut crate::organizer_ui::MemoryUiState) {
+        while self.current().is_some() {
+            self.close_with_memory(memory);
+        }
+    }
     pub fn clear(&mut self) {
         self.frames.clear();
     }
@@ -329,11 +352,12 @@ impl Navigation {
     pub fn current(&self) -> Option<Page> {
         self.frames.last().copied()
     }
-    pub fn open(&mut self, page: Page) {
+    pub fn open(&mut self, page: Page) -> bool {
         if self.current() == Some(page) {
-            return;
+            return false;
         }
         self.frames.push(page);
+        true
     }
     pub fn select_group(&mut self, group: Group) {
         if let Some(Page::Hub(selected)) = self.frames.last_mut() {
@@ -483,7 +507,8 @@ impl EditorSpec {
 }
 
 impl EditorLayout {
-    /// Preserve scaled scroll, clamp to new extent, and reveal the focused Edit.
+    /// Focus indices are fields, then test button, model button, and result reader.
+    /// Preserve scaled scroll, clamp to new extent, and reveal any focused content.
     pub fn scroll_after_reflow(
         &self,
         scroll: i32,
@@ -497,8 +522,17 @@ impl EditorLayout {
             self.content_height,
             viewport_height,
         );
-        if let Some(field) = focus.and_then(|i| self.fields.get(i)).filter(|f| !f.hidden) {
-            let r = field.control;
+        let focused_rect = focus.and_then(|i| {
+            if let Some(field) = self.fields.get(i) {
+                (!field.hidden).then_some(field.control)
+            } else {
+                [self.test_button, self.model_button, self.test_result]
+                    .get(i - self.fields.len())
+                    .copied()
+                    .flatten()
+            }
+        });
+        if let Some(r) = focused_rect {
             if r.y < result {
                 result = r.y;
             } else if r.y + r.height > result + viewport_height {
@@ -506,5 +540,16 @@ impl EditorLayout {
             }
         }
         crate::organizer_ui::clamp_scroll(result, self.content_height, viewport_height)
+    }
+}
+
+/// Fixed native error reader stays outside the scrolling input viewport.
+pub fn editor_error_rect(width: i32, height: i32, dpi: u32) -> Rect {
+    let scale = |n: i32| n * dpi.max(96) as i32 / 96;
+    Rect {
+        x: scale(18),
+        y: height - scale(102),
+        width: (width - scale(36)).max(1),
+        height: scale(50),
     }
 }

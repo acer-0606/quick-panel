@@ -247,7 +247,18 @@ unsafe fn position_content(ptr: *const RefCell<Form>, scroll: i32) {
 }
 unsafe fn relayout_form(ptr: *const RefCell<Form>, hwnd: HWND, dpi: u32) {
     unsafe {
-        let (spec, old_dpi, scroll, viewport, controls, edits, error, save, cancel) = {
+        let (
+            spec,
+            old_dpi,
+            scroll,
+            viewport,
+            controls,
+            edits,
+            content_actions,
+            error,
+            save,
+            cancel,
+        ) = {
             let f = (*ptr).borrow();
             (
                 f.layout_spec.clone(),
@@ -256,6 +267,7 @@ unsafe fn relayout_form(ptr: *const RefCell<Form>, hwnd: HWND, dpi: u32) {
                 f.viewport,
                 f.controls.clone(),
                 f.edits.clone(),
+                [f.test_button, f.model_button, f.test_result],
                 f.error_result,
                 f.save_button,
                 f.cancel_button,
@@ -278,7 +290,17 @@ unsafe fn relayout_form(ptr: *const RefCell<Form>, hwnd: HWND, dpi: u32) {
         let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
         let focused = edits
             .iter()
-            .position(|edit| *edit == focus || IsChild(*edit, focus).as_bool());
+            .position(|edit| *edit == focus || IsChild(*edit, focus).as_bool())
+            .or_else(|| {
+                content_actions
+                    .iter()
+                    .position(|control| {
+                        control.is_some_and(|control| {
+                            control == focus || IsChild(control, focus).as_bool()
+                        })
+                    })
+                    .map(|i| edits.len() + i)
+            });
         let scroll = layout.scroll_after_reflow(scroll, old_dpi, dpi, viewport_height, focused);
         let changed_font = (dpi != old_dpi).then(|| theme::font(dpi));
         let old_font = {
@@ -309,14 +331,8 @@ unsafe fn relayout_form(ptr: *const RefCell<Form>, hwnd: HWND, dpi: u32) {
             }
         }
         if let Some(error) = error {
-            let _ = MoveWindow(
-                error,
-                scale(18),
-                client.bottom - scale(102),
-                (client.right - scale(36)).max(1),
-                scale(50),
-                true,
-            );
+            let r = crate::settings_ui::editor_error_rect(client.right, client.bottom, dpi);
+            let _ = MoveWindow(error, r.x, r.y, r.width, r.height, true);
         }
         scroll_form(ptr, scroll);
     }
@@ -434,9 +450,12 @@ unsafe fn render_status(ptr: *const RefCell<Form>) {
         )
     };
     if let Some(output) = error_output {
-        let error = wide(&error);
         unsafe {
-            let _ = SetWindowTextW(output, PCWSTR(error.as_ptr()));
+            // Status polling must not reset the error reader's selection/scroll.
+            if text(output) != error {
+                let error = wide(&error);
+                let _ = SetWindowTextW(output, PCWSTR(error.as_ptr()));
+            }
         }
     }
     if let Some(output) = output {
@@ -1796,15 +1815,20 @@ unsafe fn form_fields_with_test_theme(
                 test_status(&*state, "无法启动连接测试状态更新，请重新打开设置");
             }
         }
+        let error_rect = crate::settings_ui::editor_error_rect(client.right, client.bottom, dpi);
         let error_output = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
+            w!("EDIT"),
             w!(""),
-            WS_CHILD | WS_VISIBLE,
-            scale(18),
-            client.bottom - scale(102),
-            (client.right - scale(36)).max(1),
-            scale(50),
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | WINDOW_STYLE(ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32),
+            error_rect.x,
+            error_rect.y,
+            error_rect.width,
+            error_rect.height,
             Some(hwnd),
             None,
             None,

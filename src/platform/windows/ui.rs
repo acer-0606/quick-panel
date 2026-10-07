@@ -1009,8 +1009,7 @@ impl App {
         }
     }
     unsafe fn show_harness_memory(&mut self) {
-        self.settings_navigation
-            .open(crate::settings_ui::Page::Memory);
+        self.open_settings_page(crate::settings_ui::Page::Memory);
         self.memory_snapshot();
         self.effects.push_back(UiEffect::HarnessMemory {
             owner: self.hwnd,
@@ -1026,8 +1025,7 @@ impl App {
         if self.organizer_page_open {
             return;
         }
-        self.settings_navigation
-            .open(crate::settings_ui::Page::Review);
+        self.open_settings_page(crate::settings_ui::Page::Review);
         self.organizer_page_open = true;
         self.organizer_review.borrow_mut().open();
         self.organizer_snapshot();
@@ -3268,9 +3266,21 @@ impl App {
         }
         Ok(())
     }
+    fn open_settings_page(&mut self, page: crate::settings_ui::Page) {
+        self.settings_navigation
+            .open_with_memory(page, &mut self.harness_memory.borrow_mut());
+    }
+    fn close_settings_page(&mut self) {
+        self.settings_navigation
+            .close_with_memory(&mut self.harness_memory.borrow_mut());
+    }
+    fn clear_settings_pages(&mut self) {
+        self.settings_navigation
+            .clear_with_memory(&mut self.harness_memory.borrow_mut());
+    }
     unsafe fn resume_settings_navigation(&mut self) {
         if self.state.lifecycle != Lifecycle::Running {
-            self.settings_navigation.clear();
+            self.clear_settings_pages();
             return;
         }
         match self.settings_navigation.current() {
@@ -3289,8 +3299,7 @@ impl App {
         ));
     }
     unsafe fn settings_group(&mut self, group: crate::settings_ui::Group) {
-        self.settings_navigation
-            .open(crate::settings_ui::Page::Hub(group));
+        self.open_settings_page(crate::settings_ui::Page::Hub(group));
         self.effects.push_back(UiEffect::Settings {
             owner: self.hwnd,
             group,
@@ -4580,7 +4589,7 @@ impl Host {
                     if settings_requested {
                         app.organizer_settings();
                     } else {
-                        app.settings_navigation.close();
+                        app.close_settings_page();
                         app.resume_settings_navigation();
                     }
                     semantic_revoked = false;
@@ -4630,7 +4639,7 @@ impl Host {
                     if settings_requested {
                         app.organizer_settings();
                     } else {
-                        app.settings_navigation.close();
+                        app.close_settings_page();
                         app.resume_settings_navigation();
                     }
                     semantic_revoked = false;
@@ -4813,12 +4822,12 @@ impl Host {
                             Some(crate::settings_ui::Action::Review) => app.review_organizer(),
                             Some(crate::settings_ui::Action::Memory) => app.show_harness_memory(),
                             _ => {
-                                app.settings_navigation.close();
+                                app.close_settings_page();
                                 app.resume_settings_navigation();
                             }
                         }
                     } else {
-                        app.settings_navigation.clear();
+                        app.clear_settings_pages();
                     }
                     semantic_revoked = false;
                 }

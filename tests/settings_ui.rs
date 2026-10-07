@@ -349,3 +349,106 @@ fn editor_dpi_scroll_keeps_focused_control_reachable_and_can_reveal_last_note() 
         assert!(bottom > 0);
     }
 }
+
+#[test]
+fn editor_reflow_reveals_result_and_both_action_buttons() {
+    use settings_ui::{EditorField, EditorFieldKind, EditorSpec};
+    let spec = EditorSpec {
+        fields: (0..5)
+            .map(|_| EditorField {
+                label: "跨屏缩窄后需要完整折行的中文字段标签".into(),
+                kind: EditorFieldKind::Line,
+            })
+            .collect(),
+        note: None,
+        test_label: Some("测试连接".into()),
+        models: true,
+    };
+    for (width, dpi, height) in [(360, 192, 300), (640, 144, 400), (800, 96, 400)] {
+        let layout = spec.layout(width, dpi);
+        for (offset, rect) in [layout.test_button, layout.model_button, layout.test_result]
+            .into_iter()
+            .enumerate()
+        {
+            let rect = rect.unwrap();
+            let scroll =
+                layout.scroll_after_reflow(0, 96, dpi, height, Some(layout.fields.len() + offset));
+            assert!(
+                rect.y >= scroll && rect.y + rect.height <= scroll + height,
+                "focused content {offset} must remain visible at {width}/{dpi}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_error_reader_is_keyboard_reachable_multiline_scrollable_and_not_recreated_on_error() {
+    // Verify the actual Win32 consumer, including non-test leaves, rather than a text copy.
+    let native = include_str!("../src/platform/windows/dialogs.rs");
+    let creation = native
+        .split("let error_output = CreateWindowExW(")
+        .nth(1)
+        .unwrap()
+        .split(".ok()?;")
+        .next()
+        .unwrap();
+    assert!(
+        creation.contains("w!(\"EDIT\")"),
+        "long errors need a native selectable reader"
+    );
+    for style in [
+        "WS_TABSTOP",
+        "WS_VSCROLL",
+        "ES_MULTILINE",
+        "ES_READONLY",
+        "ES_AUTOVSCROLL",
+    ] {
+        assert!(
+            creation.contains(style),
+            "missing native reader style {style}"
+        );
+    }
+    assert!(!creation.contains("ES_AUTOHSCROLL"));
+    let error = native
+        .split("unsafe fn form_error(")
+        .nth(1)
+        .unwrap()
+        .split("unsafe fn ")
+        .next()
+        .unwrap();
+    assert!(!error.contains("CreateWindow"));
+    assert!(error.contains("SetFocus"));
+    let relayout = native
+        .split("unsafe fn relayout_form(")
+        .nth(1)
+        .unwrap()
+        .split("unsafe extern")
+        .next()
+        .unwrap();
+    assert!(!relayout.contains("CreateWindow"));
+    assert!(!relayout.contains("SetWindowText"));
+    for handle in ["f.test_button", "f.model_button", "f.test_result"] {
+        assert!(relayout.contains(handle));
+    }
+    let long_error = settings_ui::edit(
+        &Settings::default(),
+        Action::Data,
+        &["0", "", "0", "10000"].map(str::to_owned),
+    )
+    .unwrap_err();
+    let full_error = format!(
+        "未保存：未固定历史：多少天未使用后清理（1–36500）：{}",
+        long_error.message
+    );
+    let reader = settings_ui::editor_error_rect(360, 480, 192);
+    assert_eq!(reader.width, 288);
+    assert!(
+        settings_ui::wrapped_height(&full_error, reader.width, 192) > reader.height,
+        "the real retention error exceeds the fixed reader and must scroll"
+    );
+    let footer = settings_ui::layout(360, 480, 192);
+    assert!(reader.y >= 260); // input viewport ends at 480 - 110*2
+    assert!(reader.y + reader.height <= footer.open.y);
+    assert!(footer.open.y + footer.open.height <= 480);
+    assert!(footer.close.y + footer.close.height <= 480);
+}

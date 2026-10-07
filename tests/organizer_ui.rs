@@ -1324,3 +1324,197 @@ fn settings_return_restores_only_unaccepted_feedback_edits_without_changing_retr
         }
     }
 }
+
+fn navigation_record(id: u64) -> quick_panel::harness_tools::MemoryRecord {
+    use quick_panel::harness_tools::*;
+    MemoryRecord {
+        id,
+        scope: MemoryScope::Global,
+        kind: MemoryKind::Rule,
+        origin: MemoryOrigin::Human,
+        proposed_by_ai: false,
+        text: format!("原记录 {id}"),
+        alias: None,
+        tags: vec![],
+        evidence_ids: vec![],
+        confirmed: true,
+        enabled: true,
+        created_at_ms: 0,
+    }
+}
+
+#[test]
+fn navigation_frames_preserve_feedback_and_nested_memory_drafts() {
+    use quick_panel::settings_ui::{Group, Navigation, Page};
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    for page in [Page::Review, Page::Memory] {
+        let mut nav = Navigation::default();
+        let mut state = MemoryUiState::default();
+        nav.open_with_memory(page, &mut state);
+        state.navigation_draft = Some(MemoryNavigationDraft {
+            target: (page == Page::Review).then(|| target.clone()),
+            record: (page == Page::Memory).then(|| navigation_record(101)),
+            raw_input: "  来源 A\r\n未提交  ".into(),
+            scope_choice: 2,
+            enabled: true,
+            confirmed: false,
+        });
+        nav.open_with_memory(Page::Hub(Group::Organizer), &mut state);
+        nav.open_with_memory(Page::Memory, &mut state);
+        // Exactly the production selected() transition, before editing record B.
+        state.clear_current_navigation_draft();
+        state.navigation_draft = Some(MemoryNavigationDraft {
+            target: None,
+            record: Some(navigation_record(202)),
+            raw_input: "  B\r\n草稿  ".into(),
+            scope_choice: 1,
+            enabled: false,
+            confirmed: true,
+        });
+        nav.open_with_memory(Page::Hub(Group::Services), &mut state);
+        nav.close_with_memory(&mut state);
+        let b = state.navigation_draft_for(None).unwrap();
+        assert_eq!(b.raw_input, "  B\r\n草稿  ");
+        assert_eq!(b.scope_choice, 1);
+        assert_eq!(b.record, Some(navigation_record(202)));
+        nav.close_with_memory(&mut state);
+        nav.close_with_memory(&mut state);
+        assert_eq!(nav.current(), Some(page));
+        let a = state
+            .navigation_draft_for((page == Page::Review).then_some(&target))
+            .expect("来源帧 A 的草稿不能被 B 的选择或设置覆盖");
+        assert_eq!(a.raw_input, "  来源 A\r\n未提交  ");
+        assert_eq!(a.scope_choice, 2);
+        assert!(a.enabled && !a.confirmed);
+        assert_eq!(
+            a.record,
+            (page == Page::Memory).then(|| navigation_record(101))
+        );
+        let mut changed = target.clone();
+        changed.expected_version = "不同版本".into();
+        assert!(state.navigation_draft_for(Some(&changed)).is_none());
+    }
+}
+
+#[test]
+fn late_memory_receipt_clears_only_its_origin_frame_and_keeps_retry_immutable() {
+    use quick_panel::{
+        harness_tools::FeedbackScope,
+        model::Command,
+        settings_ui::{Group, Navigation, Page},
+    };
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    for admitted in [false, true] {
+        let mut nav = Navigation::default();
+        let mut state = MemoryUiState::default();
+        nav.open_with_memory(Page::Review, &mut state);
+        state.raw_input = "  已发送原文  ".into();
+        state.navigation_draft = Some(MemoryNavigationDraft {
+            target: Some(target.clone()),
+            record: None,
+            raw_input: "A 未提交编辑".into(),
+            scope_choice: 2,
+            enabled: true,
+            confirmed: true,
+        });
+        state
+            .submit(Command::HarnessFeedback {
+                request_id: 770,
+                sources: vec![target.clone()],
+                reason: "已发送原文".into(),
+                scope: FeedbackScope::Directory,
+            })
+            .unwrap();
+        assert!(state.receipt(770, Err("失败".into()), admitted));
+        nav.open_with_memory(Page::Hub(Group::Organizer), &mut state);
+        nav.select_group(Group::Services);
+        nav.open_with_memory(Page::Hub(Group::Services), &mut state); // re-show, no extra frame
+        nav.open_with_memory(Page::Memory, &mut state);
+        state.navigation_draft = Some(MemoryNavigationDraft {
+            target: None,
+            record: None,
+            raw_input: "B 的独立草稿".into(),
+            scope_choice: 1,
+            enabled: false,
+            confirmed: false,
+        });
+        let Command::HarnessFeedback {
+            request_id,
+            sources,
+            reason,
+            scope,
+        } = state.retry().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request_id, 770);
+        assert_eq!(sources, vec![target.clone()]);
+        assert_eq!(reason, "已发送原文");
+        assert_eq!(scope, FeedbackScope::Directory);
+        assert!(state.receipt(770, Err("重试失败".into()), false));
+        assert!(state.navigation_draft_for(None).is_none());
+        assert_eq!(state.raw_input, "  已发送原文  ");
+        assert!(state.receipt(770, Ok(()), false));
+        assert_eq!(
+            state.navigation_draft_for(None).unwrap().raw_input,
+            "B 的独立草稿"
+        );
+        nav.close_with_memory(&mut state);
+        nav.close_with_memory(&mut state);
+        assert_eq!(nav.current(), Some(Page::Review));
+        assert!(
+            state.navigation_draft_for(Some(&target)).is_none(),
+            "已保存的暂停帧草稿不能复活"
+        );
+        assert!(state.pending.is_none());
+    }
+}
+
+#[test]
+fn nested_memory_save_and_navigation_teardown_never_consume_another_frame_draft() {
+    use quick_panel::{
+        model::Command,
+        settings_ui::{Group, Navigation, Page},
+    };
+    let mut nav = Navigation::default();
+    let mut state = MemoryUiState::default();
+    nav.open_with_memory(Page::Memory, &mut state);
+    state.navigation_draft = Some(MemoryNavigationDraft {
+        target: None,
+        record: Some(navigation_record(101)),
+        raw_input: "A 原始草稿".into(),
+        scope_choice: 2,
+        enabled: true,
+        confirmed: false,
+    });
+    nav.open_with_memory(Page::Hub(Group::Organizer), &mut state);
+    nav.open_with_memory(Page::Memory, &mut state);
+    state.clear_current_navigation_draft();
+    state
+        .submit(Command::HarnessMemoryDelete {
+            request_id: 771,
+            ids: vec![202],
+        })
+        .unwrap();
+    assert!(state.receipt(771, Ok(()), false));
+    nav.close_with_memory(&mut state);
+    nav.close_with_memory(&mut state);
+    let restored = state.navigation_draft_for(None).unwrap();
+    assert_eq!(restored.record, Some(navigation_record(101)));
+    assert_eq!(restored.raw_input, "A 原始草稿");
+    nav.clear_with_memory(&mut state);
+    assert!(nav.allows_panel_query());
+    nav.open_with_memory(Page::Memory, &mut state);
+    assert!(state.navigation_draft_for(None).is_none());
+    assert!(!state.receipt(771, Ok(()), false));
+}
