@@ -18,6 +18,12 @@
 
 修后最终host/Windows all-targets strict Clippy/check、fmt/diff均exit0。Windows Release exit0（44.466s）；共享Release core-check exit0（34.494s），内存可见、保存前磁盘为空、退出恢复三项true。所有Cargo串行、固定环境和本机Node路径不变。fresh ZIP采用本轮最终源码/文档及原已核验Node/bundle，准确字节/SHA/CRC和成员以外置manifest/SHA256SUMS及修后实施报告为准。
 
+### 同轮 I1 自审补修（当前源码增量）
+
+进一步修复stale SemanticStatus回包绕过导航门禁的竞态：所有native状态请求进入StatusCache::request_for_view；普通旧回包只留dirty。真实索引终态按当前profile保留一次许可，在旧slot释放后可补发一次；实际发出、完成、匹配失败、配置失效或profile改变都会消费/撤销许可，补发自身失效不无限重试。导航退出只恢复普通Search，不附加索引状态扫描；dirty由之后已有显式路径处理。
+
+补修RED两项失败后，smart_search/semantic_ui/settings_ui共42项及相关真实actor/SQLite回归1项通过。499项全套是补修前基线，本次按要求只做匹配增量覆盖，不重跑全套或无存储变化的core-check；当前最终host/Windows all-target strict Clippy/check、fmt/diff全部exit0，Windows Release exit0（43.096s）；fresh产物和逐成员校验在补修报告及外置清单记录。
+
 ## Gate 前验证证据（历史）
 
 最终共享全套 `cargo test --locked -- --test-threads=1`：**493 passed / 0 failed / 2 既有 ignored，40 个 suite summaries，exit0**。全套后仅缩短三个 Windows 原生按钮标签，未更改共享行为；最终 Windows 检查与 Release 覆盖这些标签。完整逐 suite 结果见本轮 Task 4 实施报告及保留的验证日志。Windows GUI、中文 IME、多屏 DPI、WinHTTP/DPAPI/通知实际执行数 **0**；macOS 共享/合成进程测试和 Windows 交叉编译不能替代实机视觉验收。未使用真实 API、用户密钥、数据库、剪贴板或屏幕。

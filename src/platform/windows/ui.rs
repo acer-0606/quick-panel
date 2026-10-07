@@ -1139,7 +1139,10 @@ impl App {
             return;
         }
         let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
-        if let Some(command) = self.semantic_status.request(&profile) {
+        if let Some(command) = self
+            .semantic_status
+            .request_for_view(&profile, self.settings_navigation.allows_panel_query())
+        {
             let Command::SemanticStatus { request_id } = command else {
                 unreachable!()
             };
@@ -1615,7 +1618,8 @@ impl App {
     unsafe fn index_status(&mut self) {
         let refresh = self.semantic_index.take_status_refresh();
         if refresh {
-            self.semantic_status.mark_dirty();
+            let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+            self.semantic_status.index_terminal(&profile);
         }
         self.update_index_label();
         self.rebuild_results();
@@ -1674,7 +1678,7 @@ impl App {
         self.cancel_semantic();
         self.cancel_index();
         self.cancel_preflight();
-        self.semantic_status.mark_dirty();
+        self.semantic_status.invalidate_settings();
         self.settings.embedding = next;
         self.semantic_index.clear_display();
         self.query_activity.cancel();
@@ -3392,7 +3396,7 @@ impl App {
             self.cancel_semantic();
             self.cancel_index();
             self.semantic_index.clear_display();
-            self.semantic_status.mark_dirty();
+            self.semantic_status.invalidate_settings();
         }
         self.cancel_ai();
         self.cancel_preflight();

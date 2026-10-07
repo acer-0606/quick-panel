@@ -229,3 +229,92 @@ fn explicit_claude_does_not_wait_for_embedding_status() {
         Some(SmartAction::ConfigureClaude)
     );
 }
+
+#[test]
+fn hub_save_rejects_old_status_without_admitting_a_new_scan() {
+    use quick_panel::settings_ui::{Group, Navigation, Page};
+    let mut cache = StatusCache::default();
+    let mut nav = Navigation::default();
+    let old = request_id(
+        cache
+            .request_for_view("p", nav.allows_panel_query())
+            .unwrap(),
+    );
+    nav.open(Page::Hub(Group::Paths));
+    cache.mark_dirty();
+    assert!(!cache.complete(old, status(7), "p"));
+    assert!(
+        cache
+            .request_for_view("p", nav.allows_panel_query())
+            .is_none()
+    );
+    assert!(cache.ready("p").is_none());
+    nav.close();
+    // Hub close emits no status command; this is a later existing explicit request.
+    let next = request_id(
+        cache
+            .request_for_view("p", nav.allows_panel_query())
+            .unwrap(),
+    );
+    assert!(cache.complete(next, status(4), "p"));
+    assert!(cache.request_for_view("p", true).is_none());
+}
+#[test]
+fn index_terminal_allows_one_profile_bound_followup_then_revokes_permission() {
+    for ending in [
+        "complete",
+        "fail",
+        "stale",
+        "profile",
+        "settings",
+        "old_failure",
+    ] {
+        let mut cache = StatusCache::default();
+        let old = request_id(cache.request_for_view("p", true).unwrap());
+        cache.index_terminal("p");
+        assert!(!cache.fail(old + 999)); // unrelated failure cannot consume its permit
+        assert!(
+            cache.request_for_view("p", false).is_none(),
+            "old scan owns slot"
+        );
+        if ending == "old_failure" {
+            assert!(cache.fail(old));
+            assert!(cache.request_for_view("p", false).is_none());
+            continue;
+        }
+        if ending == "profile" {
+            assert!(!cache.complete(old, status(0), "new"));
+            assert!(cache.request_for_view("new", false).is_none());
+            assert!(cache.request_for_view("p", false).is_none());
+            continue;
+        }
+        if ending == "settings" {
+            cache.invalidate_settings();
+        }
+        assert!(!cache.complete(old, status(0), "p"));
+        if ending == "settings" {
+            assert!(cache.request_for_view("p", false).is_none());
+            continue;
+        }
+        let terminal = request_id(
+            cache
+                .request_for_view("p", false)
+                .expect("real terminal gets one followup"),
+        );
+        assert!(cache.request_for_view("p", false).is_none());
+        match ending {
+            "complete" => assert!(cache.complete(terminal, status(3), "p")),
+            "fail" => assert!(cache.fail(terminal)),
+            "stale" => {
+                cache.mark_dirty();
+                assert!(!cache.complete(terminal, status(2), "p"));
+            }
+            _ => unreachable!(),
+        }
+        cache.mark_dirty();
+        assert!(
+            cache.request_for_view("p", false).is_none(),
+            "{ending} cannot leave an unlimited permit"
+        );
+    }
+}

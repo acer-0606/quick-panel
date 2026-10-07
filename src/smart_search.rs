@@ -51,6 +51,7 @@ pub struct StatusCache {
     in_flight: Option<(u64, String, u64)>,
     cached: Option<SemanticIndexStatus>,
     dirty: bool,
+    terminal_refresh: Option<String>,
 }
 impl StatusCache {
     pub fn mark_dirty(&mut self) {
@@ -58,6 +59,7 @@ impl StatusCache {
         self.dirty = true;
     }
     pub fn request(&mut self, profile: &str) -> Option<Command> {
+        self.discard_terminal_for_other_profile(profile);
         if self.profile != profile {
             self.profile = profile.into();
             self.cached = None;
@@ -74,6 +76,35 @@ impl StatusCache {
             request_id: self.serial,
         })
     }
+    /// All native callers use this gate. Only a real index terminal can reserve
+    /// one scan while settings owns navigation; a busy slot does not consume it.
+    pub fn request_for_view(&mut self, profile: &str, panel_allowed: bool) -> Option<Command> {
+        self.discard_terminal_for_other_profile(profile);
+        if !panel_allowed && self.terminal_refresh.is_none() {
+            return None;
+        }
+        let command = self.request(profile)?;
+        self.terminal_refresh = None;
+        Some(command)
+    }
+    /// Called only after IndexSession::take_status_refresh reports a terminal.
+    pub fn index_terminal(&mut self, profile: &str) {
+        self.mark_dirty();
+        self.terminal_refresh = (!profile.is_empty()).then(|| profile.to_owned());
+    }
+    pub fn invalidate_settings(&mut self) {
+        self.terminal_refresh = None;
+        self.mark_dirty();
+    }
+    fn discard_terminal_for_other_profile(&mut self, profile: &str) {
+        if self
+            .terminal_refresh
+            .as_deref()
+            .is_some_and(|p| p != profile)
+        {
+            self.terminal_refresh = None;
+        }
+    }
     pub fn ready(&self, profile: &str) -> Option<&SemanticIndexStatus> {
         if self.dirty || self.in_flight.is_some() {
             return None;
@@ -81,6 +112,7 @@ impl StatusCache {
         self.cached.as_ref().filter(|s| s.profile == profile)
     }
     pub fn complete(&mut self, id: u64, status: SemanticIndexStatus, profile: &str) -> bool {
+        self.discard_terminal_for_other_profile(profile);
         if self.in_flight.as_ref().is_none_or(|p| p.0 != id) {
             return false;
         }
@@ -92,6 +124,7 @@ impl StatusCache {
             self.dirty = true;
             return false;
         }
+        self.terminal_refresh = None;
         self.cached = Some(status);
         true
     }
@@ -100,6 +133,7 @@ impl StatusCache {
             return false;
         }
         self.in_flight = None;
+        self.terminal_refresh = None;
         self.cached = None;
         self.dirty = true;
         true
