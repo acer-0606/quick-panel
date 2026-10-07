@@ -55,11 +55,12 @@ pub unsafe fn path_settings_form(
     owner: HWND,
     settings: &crate::path_activity::PathActivitySettings,
     appearance: Theme,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "常用推荐设置",
+            "常用路径 · 保存或取消返回当前分组",
             &[
                 (
                     "外部资源管理器的常用路径（本机排名）",
@@ -81,30 +82,13 @@ pub unsafe fn path_settings_form(
             None,
             appearance,
             Validation::Paths,
-            None,
-        )
-    }
-}
-
-pub unsafe fn screenshot_settings_form(
-    owner: HWND,
-    hotkey: String,
-    appearance: Theme,
-    submit: Submit<'_>,
-) -> Option<Vec<String>> {
-    unsafe {
-        form_fields_with_test_theme(
-            owner,
-            "截图快捷键设置",
-            &[("区域截图快捷键（默认关闭；留空关闭）", Field::Text(hotkey))],
-            None,
-            appearance,
-            Validation::Screenshot,
             submit,
         )
     }
 }
+
 enum Field {
+    Hidden(String),
     Model(String),
     EffortChoice(usize),
     OrganizerModeChoice(usize),
@@ -866,20 +850,36 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     if let Some(save) = save {
                         let _ = MoveWindow(
                             save,
-                            client.right - scale(218),
-                            client.bottom - scale(46),
-                            scale(90),
-                            scale(30),
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .open
+                                .x,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .open
+                                .y,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .open
+                                .width,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .open
+                                .height,
                             true,
                         );
                     }
                     if let Some(cancel) = all.last() {
                         let _ = MoveWindow(
                             *cancel,
-                            client.right - scale(120),
-                            client.bottom - scale(46),
-                            scale(90),
-                            scale(30),
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .close
+                                .x,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .close
+                                .y,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .close
+                                .width,
+                            crate::settings_ui::layout(client.right, client.bottom, dpi)
+                                .close
+                                .height,
                             true,
                         );
                     }
@@ -946,46 +946,97 @@ pub unsafe fn favorite_form(
         )
     }
 }
-#[allow(clippy::too_many_arguments)]
 pub unsafe fn settings_form(
     owner: HWND,
-    theme: usize,
-    hotkey: String,
-    clipboard_hotkey: String,
-    paused: bool,
-    excluded: String,
-    preferred: SmartSearchMode,
+    settings: &crate::model::Settings,
+    action: crate::settings_ui::Action,
     submit: Submit<'_>,
 ) -> Option<Vec<String>> {
+    use crate::{hotkeys::format_hotkey, settings_ui::Action};
+    let fields = match action {
+        Action::General => vec![
+            (
+                "外观主题",
+                Field::Choice(match settings.theme {
+                    Theme::System => 0,
+                    Theme::Light => 1,
+                    Theme::Dark => 2,
+                }),
+            ),
+            (
+                "面板快捷键（留空关闭）",
+                Field::Text(format_hotkey(
+                    settings.hotkey_modifiers,
+                    settings.hotkey_key,
+                )),
+            ),
+            (
+                "剪贴板快捷键（留空关闭）",
+                Field::Text(format_hotkey(
+                    settings.clipboard_hotkey_modifiers,
+                    settings.clipboard_hotkey_key,
+                )),
+            ),
+            (
+                "区域截图快捷键（留空关闭）",
+                Field::Text(format_hotkey(
+                    settings.screenshot_hotkey_modifiers,
+                    settings.screenshot_hotkey_key,
+                )),
+            ),
+        ],
+        Action::Data => vec![
+            (
+                "已有历史与截图复制仍可使用",
+                Field::Toggle(settings.capture_paused),
+            ),
+            (
+                "排除应用（exe 名称，逗号分隔）",
+                Field::Text(settings.excluded_apps.join(", ")),
+            ),
+            (
+                "未固定历史：多少天未使用后清理（1–36500）",
+                Field::Text(settings.retention_days.to_string()),
+            ),
+            (
+                "未固定历史：最多条数（1–1000000）",
+                Field::Text(settings.max_history.to_string()),
+            ),
+        ],
+        Action::Smart => vec![
+            (
+                "服务配置请返回设置中心 → 服务连接",
+                Field::Switch(settings.ai.enabled, "启用 Claude 按意思查找"),
+            ),
+            (
+                "查询与选定保存文本会发往独立服务",
+                Field::Switch(settings.embedding.enabled, "启用语义查找"),
+            ),
+            (
+                "智能查找首选能力",
+                Field::SmartChoice(match settings.smart_search {
+                    SmartSearchMode::Auto => 0,
+                    SmartSearchMode::Claude => 1,
+                    SmartSearchMode::Semantic => 2,
+                }),
+            ),
+            (
+                "索引范围；文件仅发元数据，不解析正文",
+                Field::IndexChoice(usize::from(
+                    settings.embedding.index_scope == crate::semantic::IndexScope::AllText,
+                )),
+            ),
+        ],
+        _ => return None,
+    };
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "设置",
-            &[
-                ("外观主题", Field::Choice(theme)),
-                ("呼出快捷键（留空关闭）", Field::Text(hotkey)),
-                (
-                    "剪贴板专用快捷键（留空关闭）",
-                    Field::Text(clipboard_hotkey),
-                ),
-                ("剪贴板记录状态", Field::Toggle(paused)),
-                ("排除应用（exe 名称，逗号分隔）", Field::Text(excluded)),
-                (
-                    "智能查找首选能力",
-                    Field::SmartChoice(match preferred {
-                        SmartSearchMode::Auto => 0,
-                        SmartSearchMode::Claude => 1,
-                        SmartSearchMode::Semantic => 2,
-                    }),
-                ),
-            ],
+            &format!("{} · 保存或取消返回当前分组", action.title()),
+            &fields,
             None,
-            match theme {
-                1 => Theme::Light,
-                2 => Theme::Dark,
-                _ => Theme::System,
-            },
-            Validation::General,
+            settings.theme,
+            crate::form_validation::Validation::Settings(Box::new(settings.clone()), action),
             submit,
         )
     }
@@ -1024,11 +1075,11 @@ pub unsafe fn ai_settings_form(
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "AI 设置 · 共用于检索与管家",
+            "共用 Claude 连接 · 保存或取消返回服务连接",
             &[
                 (
                     "可选功能",
-                    Field::Switch(settings.enabled, "启用 AI 按意思查找（默认关闭）"),
+                    Field::Hidden(usize::from(settings.enabled).to_string()),
                 ),
                 (
                     "Claude 格式 API 地址（根地址、/v1 或完整接口）",
@@ -1067,6 +1118,7 @@ pub unsafe fn ai_settings_form(
         )
     }
 }
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn organizer_settings_form(
     owner: HWND,
     settings: &crate::organizer::OrganizerSettings,
@@ -1074,65 +1126,94 @@ pub unsafe fn organizer_settings_form(
     path_enabled: bool,
     appearance: Theme,
     health: Arc<std::sync::Mutex<String>>,
+    advanced: bool,
+    runtime_owner: HWND,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     use crate::organizer::{OrganizerMode, OrganizerScope};
+    let mut fields = [
+        (
+            "发送摘要、路径与元数据；不读取文件正文或图片",
+            Field::Switch(settings.enabled, "启用 AI 管家（默认关闭）"),
+        ),
+        (
+            "整理模式",
+            Field::OrganizerModeChoice(usize::from(settings.mode == OrganizerMode::Automatic)),
+        ),
+        (
+            "发送范围（只处理启用后的新内容和观察）",
+            Field::OrganizerScopeChoice(match settings.scope {
+                OrganizerScope::SavedAndPaths => 0,
+                OrganizerScope::SavedOnly => 1,
+                OrganizerScope::PathsOnly => 2,
+                OrganizerScope::AllTextAndPaths => 3,
+            }),
+        ),
+        (
+            "整理间隔（30–3600 秒）",
+            Field::Text(settings.interval_seconds.to_string()),
+        ),
+        (
+            "每批数量（1–8 条）",
+            Field::Text(settings.batch_size.to_string()),
+        ),
+        (
+            "整理说明（最多 512 字符）",
+            Field::Multiline(settings.instructions.clone()),
+        ),
+        (
+            "整理记忆",
+            Field::Switch(
+                settings.memory_enabled,
+                "启用整理记忆（使用规则并记录反馈）",
+            ),
+        ),
+        (
+            "Pi 最大模型轮次（2–8）",
+            Field::Text(settings.max_rounds.to_string()),
+        ),
+    ]
+    .into_iter()
+    .collect::<Vec<_>>();
+    let raw = [
+        usize::from(settings.enabled).to_string(),
+        usize::from(settings.mode == OrganizerMode::Automatic).to_string(),
+        match settings.scope {
+            OrganizerScope::SavedAndPaths => 0,
+            OrganizerScope::SavedOnly => 1,
+            OrganizerScope::PathsOnly => 2,
+            OrganizerScope::AllTextAndPaths => 3,
+        }
+        .to_string(),
+        settings.interval_seconds.to_string(),
+        settings.batch_size.to_string(),
+        settings.instructions.clone(),
+        usize::from(settings.memory_enabled).to_string(),
+        settings.max_rounds.to_string(),
+    ];
+    for (i, field) in fields.iter_mut().enumerate() {
+        if [3, 4, 7].contains(&i) != advanced {
+            field.1 = Field::Hidden(raw[i].clone());
+        }
+    }
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "AI 管家设置",
-            &[
-                (
-                    "发送摘要、路径与元数据；不读取文件正文或图片",
-                    Field::Switch(settings.enabled, "启用 AI 管家（默认关闭）"),
-                ),
-                (
-                    "整理模式",
-                    Field::OrganizerModeChoice(usize::from(
-                        settings.mode == OrganizerMode::Automatic,
-                    )),
-                ),
-                (
-                    "发送范围（只处理启用后的新内容和观察）",
-                    Field::OrganizerScopeChoice(match settings.scope {
-                        OrganizerScope::SavedAndPaths => 0,
-                        OrganizerScope::SavedOnly => 1,
-                        OrganizerScope::PathsOnly => 2,
-                        OrganizerScope::AllTextAndPaths => 3,
-                    }),
-                ),
-                (
-                    "整理间隔（30–3600 秒）",
-                    Field::Text(settings.interval_seconds.to_string()),
-                ),
-                (
-                    "每批数量（1–8 条）",
-                    Field::Text(settings.batch_size.to_string()),
-                ),
-                (
-                    "整理说明（最多 512 字符）",
-                    Field::Multiline(settings.instructions.clone()),
-                ),
-                (
-                    "整理记忆",
-                    Field::Switch(
-                        settings.memory_enabled,
-                        "启用整理记忆（使用规则并记录反馈）",
-                    ),
-                ),
-                (
-                    "Pi 最大模型轮次（2–8）",
-                    Field::Text(settings.max_rounds.to_string()),
-                ),
-            ],
+            if advanced {
+                "管家高级参数 · 保存或取消返回 AI 管家"
+            } else {
+                "管家核心设置 · 保存或取消返回 AI 管家"
+            },
+            &fields,
             Some(TestForm::Organizer {
                 ai: ai.clone(),
                 path_enabled,
-                owner: owner.0 as usize,
+                owner: runtime_owner.0 as usize,
                 health,
             }),
             appearance,
             Validation::Organizer(ai.clone()),
-            None,
+            submit,
         )
     }
 }
@@ -1145,11 +1226,11 @@ pub unsafe fn embedding_settings_form(
     unsafe {
         form_fields_with_test_theme(
             owner,
-            "语义检索设置 · 独立 Embedding 服务",
+            "独立 Embedding 连接 · 保存或取消返回服务连接",
             &[
                 (
                     "查询与选定保存文本会发往独立服务",
-                    Field::Switch(settings.enabled, "启用语义检索（默认关闭）"),
+                    Field::Hidden(usize::from(settings.enabled).to_string()),
                 ),
                 (
                     "OpenAI 兼容 API 地址（根地址、/v1 或完整接口）",
@@ -1169,9 +1250,10 @@ pub unsafe fn embedding_settings_form(
                 ),
                 (
                     "文档/目录仅发名称、路径、别名、标签，不解析正文",
-                    Field::IndexChoice(usize::from(
-                        settings.index_scope == crate::semantic::IndexScope::AllText,
-                    )),
+                    Field::Hidden(
+                        usize::from(settings.index_scope == crate::semantic::IndexScope::AllText)
+                            .to_string(),
+                    ),
                 ),
             ],
             Some(TestForm::Embedding(settings.clone())),
@@ -1222,8 +1304,16 @@ unsafe fn form_fields_with_test_theme(
             done: false,
             accepted: false,
             test,
-            validation,
+            validation: validation.clone(),
             status: FormStatus {
+                config: if matches!(
+                    &validation,
+                    Validation::Settings(_, crate::settings_ui::Action::Data)
+                ) {
+                    crate::settings_ui::RETENTION_NOTE.into()
+                } else {
+                    String::new()
+                },
                 test: initial_test_note.into(),
                 ..Default::default()
             },
@@ -1283,8 +1373,19 @@ unsafe fn form_fields_with_test_theme(
             .filter(|(_, field)| matches!(field, Field::Multiline(_)))
             .count() as i32
             * 92;
-        let logical_height =
-            156 + fields.len() as i32 * 62 + multiline_extra + if validating { 180 } else { 0 };
+        let retention = matches!(
+            &state.borrow().validation,
+            Validation::Settings(_, crate::settings_ui::Action::Data)
+        );
+        let logical_height = 156
+            + fields
+                .iter()
+                .filter(|(_, f)| !matches!(f, Field::Hidden(_)))
+                .count() as i32
+                * 62
+            + multiline_extra
+            + if validating { 180 } else { 0 }
+            + if retention { 160 } else { 0 };
         let dpi = owner_dpi;
         let fit = crate::organizer_ui::fit_form(
             work.right - work.left,
@@ -1354,7 +1455,11 @@ unsafe fn form_fields_with_test_theme(
         for (i, (label, value)) in fields.iter().enumerate() {
             let label = wide(label);
             let value = wide(match value {
-                Field::Text(t) | Field::Password(t) | Field::Multiline(t) | Field::Model(t) => t,
+                Field::Hidden(t)
+                | Field::Text(t)
+                | Field::Password(t)
+                | Field::Multiline(t)
+                | Field::Model(t) => t,
                 Field::Choice(_)
                 | Field::AuthChoice(_)
                 | Field::IndexChoice(_)
@@ -1365,13 +1470,20 @@ unsafe fn form_fields_with_test_theme(
                 Field::Toggle(_) => "暂停剪贴板记录",
                 Field::Switch(_, label) => label,
             });
+            let logical_width = ((client.right - scale(48)) * 96 / dpi as i32).max(30);
+            let wrap = |text: &str| {
+                ((text.chars().count() as i32 * 15 + logical_width - 1) / logical_width).max(1) * 22
+            };
+            let label_height = wrap(fields[i].0);
+            let control_height = match &fields[i].1 {
+                Field::Multiline(_) => 120,
+                Field::Switch(_, text) => wrap(text).max(28),
+                _ => 28,
+            };
             let y = scale(field_y);
-            field_y += 62
-                + if matches!(fields[i].1, Field::Multiline(_)) {
-                    92
-                } else {
-                    0
-                };
+            if !matches!(fields[i].1, Field::Hidden(_)) {
+                field_y += label_height + control_height + 12;
+            }
             let l = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
@@ -1380,7 +1492,7 @@ unsafe fn form_fields_with_test_theme(
                 scale(18),
                 y,
                 (client.right - scale(48)).max(1),
-                scale(22),
+                scale(label_height),
                 Some(viewport),
                 None,
                 None,
@@ -1390,7 +1502,10 @@ unsafe fn form_fields_with_test_theme(
             let e = CreateWindowExW(
                 WS_EX_CLIENTEDGE,
                 match fields[i].1 {
-                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) => w!("EDIT"),
+                    Field::Hidden(_)
+                    | Field::Text(_)
+                    | Field::Password(_)
+                    | Field::Multiline(_) => w!("EDIT"),
                     Field::Choice(_)
                     | Field::AuthChoice(_)
                     | Field::IndexChoice(_)
@@ -1408,7 +1523,7 @@ unsafe fn form_fields_with_test_theme(
                     | WS_VISIBLE
                     | WS_TABSTOP
                     | WINDOW_STYLE(match fields[i].1 {
-                        Field::Text(_) => ES_AUTOHSCROLL as u32,
+                        Field::Hidden(_) | Field::Text(_) => ES_AUTOHSCROLL as u32,
                         Field::Model(_) => (CBS_DROPDOWN | CBS_AUTOHSCROLL) as u32,
                         Field::EffortChoice(_)
                         | Field::OrganizerModeChoice(_)
@@ -1421,10 +1536,12 @@ unsafe fn form_fields_with_test_theme(
                         | Field::AuthChoice(_)
                         | Field::IndexChoice(_)
                         | Field::SmartChoice(_) => CBS_DROPDOWNLIST as u32,
-                        Field::Toggle(_) | Field::Switch(_, _) => BS_AUTOCHECKBOX as u32,
+                        Field::Toggle(_) | Field::Switch(_, _) => {
+                            (BS_AUTOCHECKBOX | BS_MULTILINE) as u32
+                        }
                     }),
                 scale(18),
-                y + scale(24),
+                y + scale(label_height + 4),
                 (client.right - scale(48)).max(1),
                 scale(
                     if matches!(
@@ -1439,10 +1556,8 @@ unsafe fn form_fields_with_test_theme(
                             | Field::OrganizerScopeChoice(_)
                     ) {
                         150
-                    } else if matches!(fields[i].1, Field::Multiline(_)) {
-                        120
                     } else {
-                        28
+                        control_height
                     },
                 ),
                 Some(viewport),
@@ -1451,6 +1566,10 @@ unsafe fn form_fields_with_test_theme(
                 None,
             )
             .ok()?;
+            if matches!(fields[i].1, Field::Hidden(_)) {
+                let _ = ShowWindow(l, SW_HIDE);
+                let _ = ShowWindow(e, SW_HIDE);
+            }
             SendMessageW(l, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             SendMessageW(e, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             match fields[i].1 {
@@ -1524,13 +1643,35 @@ unsafe fn form_fields_with_test_theme(
                 Field::Multiline(_) => {
                     SendMessageW(e, EM_SETLIMITTEXT, Some(WPARAM(128 * 2050)), None);
                 }
-                Field::Text(_) | Field::Password(_) => {}
+                Field::Hidden(_) | Field::Text(_) | Field::Password(_) => {}
             }
             {
                 let mut form = state.borrow_mut();
                 form.edits.push(e);
                 form.controls.extend([l, e]);
             }
+        }
+        state.borrow_mut().content_height =
+            scale(field_y + if validating { 180 } else { 0 } + if retention { 160 } else { 0 });
+        if retention {
+            let note = wide(crate::settings_ui::RETENTION_NOTE);
+            let label = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                PCWSTR(note.as_ptr()),
+                WS_CHILD | WS_VISIBLE,
+                scale(18),
+                scale(field_y),
+                (client.right - scale(48)).max(1),
+                scale(160),
+                Some(viewport),
+                None,
+                None,
+                None,
+            )
+            .ok()?;
+            SendMessageW(label, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+            state.borrow_mut().controls.push(label);
         }
         if validating {
             let y = scale(field_y);
@@ -1541,7 +1682,11 @@ unsafe fn form_fields_with_test_theme(
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                 scale(18),
                 y,
-                scale(136),
+                if model_listing {
+                    (client.right - scale(44)) / 2
+                } else {
+                    (client.right - scale(36)).max(1)
+                },
                 scale(30),
                 Some(viewport),
                 Some(HMENU(TEST_BUTTON as *mut _)),
@@ -1562,9 +1707,9 @@ unsafe fn form_fields_with_test_theme(
                     w!("BUTTON"),
                     w!("获取模型"),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                    scale(166),
+                    scale(26) + (client.right - scale(44)) / 2,
                     y,
-                    scale(116),
+                    (client.right - scale(44)) / 2,
                     scale(30),
                     Some(viewport),
                     Some(HMENU(MODEL_BUTTON as *mut _)),
@@ -1578,13 +1723,19 @@ unsafe fn form_fields_with_test_theme(
             }
             let output = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                w!("STATIC"),
+                w!("EDIT"),
                 if testing {
                     w!("获取模型不发推理请求；测试只发送内置文本")
                 } else {
-                    w!("管家复用 AI 设置；保存配置后立即生效")
+                    w!("管家复用 Claude 服务连接；保存提交更改")
                 },
-                WS_CHILD | WS_VISIBLE,
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_TABSTOP
+                    | WS_VSCROLL
+                    | WINDOW_STYLE(
+                        ES_MULTILINE as u32 | ES_READONLY as u32 | ES_AUTOVSCROLL as u32,
+                    ),
                 scale(18),
                 y + scale(36),
                 (client.right - scale(48)).max(1),
@@ -1610,12 +1761,13 @@ unsafe fn form_fields_with_test_theme(
                         ai, path_enabled, ..
                     }) => Some(format!(
                         "{}{}",
-                        crate::organizer_ui::organizer_config_warning(ai)
-                            .unwrap_or_else(|| "复用 AI 设置；检索开关可保持关闭".into()),
+                        crate::organizer_ui::organizer_config_warning(ai).unwrap_or_else(|| {
+                            "复用服务连接中的 Claude 配置；检索开关可保持关闭".into()
+                        }),
                         if *path_enabled {
                             ""
                         } else {
-                            "\r\n路径范围需在“常用推荐设置”中启用观察"
+                            "\r\n路径范围需在“设置中心 → 常用路径”中启用观察"
                         }
                     )),
                     _ => None,
@@ -1659,20 +1811,18 @@ unsafe fn form_fields_with_test_theme(
             form.error_result = Some(error_output);
             form.controls.push(error_output);
         }
-        for (id, label, x) in [
-            (1, "保存", client.right - scale(218)),
-            (2, "取消", client.right - scale(120)),
-        ] {
+        let footer = crate::settings_ui::layout(client.right, client.bottom, dpi);
+        for (id, label, r) in [(1, "保存", footer.open), (2, "取消", footer.close)] {
             let s = wide(label);
             let b = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("BUTTON"),
                 PCWSTR(s.as_ptr()),
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                x,
-                client.bottom - scale(46),
-                scale(90),
-                scale(30),
+                r.x,
+                r.y,
+                r.width,
+                r.height,
                 Some(hwnd),
                 Some(HMENU(id as *mut _)),
                 None,
@@ -1688,7 +1838,13 @@ unsafe fn form_fields_with_test_theme(
         scroll_form(&*state, 0);
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let first_edit = state.borrow().edits.first().copied();
+        let first_edit = state
+            .borrow()
+            .edits
+            .iter()
+            .enumerate()
+            .find(|(i, _)| !matches!(fields[*i].1, Field::Hidden(_)))
+            .map(|(_, e)| *e);
         if let Some(e) = first_edit {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(e));
         }
@@ -1762,7 +1918,11 @@ unsafe fn form_fields_with_test_theme(
                 .iter()
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
-                    Field::Text(_) | Field::Password(_) | Field::Multiline(_) | Field::Model(_) => {
+                    Field::Hidden(_)
+                    | Field::Text(_)
+                    | Field::Password(_)
+                    | Field::Multiline(_)
+                    | Field::Model(_) => {
                         if submit.is_some() && matches!(fields[i].1, Field::Password(_)) {
                             String::new()
                         } else {

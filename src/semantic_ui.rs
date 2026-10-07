@@ -157,7 +157,7 @@ impl IndexSession {
         if let Some(status) = status {
             if status.indexed == 0 && outcome == IndexOutcome::Completed {
                 return if status.needs_update {
-                    "本次未生成可用索引 · 内容待更新 · 点击检查语义检索设置"
+                    "本次未生成可用索引 · 内容待更新 · 设置中心 → 智能查找 / 服务连接"
                 } else {
                     "当前范围没有可索引内容 · 固定文本/添加收藏，或点击调整索引范围"
                 }
@@ -168,7 +168,7 @@ impl IndexSession {
                     "{prefix} · 保留可用 {} 条 · {}",
                     status.indexed,
                     if outcome == IndexOutcome::Failed {
-                        "点击检查语义检索设置"
+                        "设置中心 → 智能查找 / 服务连接"
                     } else {
                         "继续更新索引"
                     },

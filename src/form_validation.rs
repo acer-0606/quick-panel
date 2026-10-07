@@ -21,6 +21,7 @@ impl FormError {
 pub enum Validation {
     None,
     General,
+    Settings(Box<crate::model::Settings>, crate::settings_ui::Action),
     Screenshot,
     Paths,
     Favorite,
@@ -86,15 +87,15 @@ pub fn validate(
 ) -> Result<(), FormError> {
     match kind {
         Validation::None => (),
+        Validation::Settings(saved, action) => {
+            crate::settings_ui::edit(saved, *action, fields)?;
+        }
         Validation::General => {
-            count(fields, 6)?;
-            let main =
-                crate::hotkeys::parse_hotkey(&fields[1]).map_err(|e| FormError::new(1, e))?;
-            let clipboard =
-                crate::hotkeys::parse_hotkey(&fields[2]).map_err(|e| FormError::new(2, e))?;
-            if main != (0, 0) && main == clipboard {
-                return Err(FormError::new(2, "已启用的快捷键须互不相同"));
-            }
+            crate::settings_ui::edit(
+                &crate::model::Settings::default(),
+                crate::settings_ui::Action::General,
+                fields,
+            )?;
         }
         Validation::Screenshot => {
             count(fields, 1)?;

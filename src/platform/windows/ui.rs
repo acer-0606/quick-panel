@@ -9,18 +9,18 @@ use super::{
 };
 use crate::{
     activity_status::{self, Capability, QueryActivity},
-    ai::{AiPlan, AiSettings},
+    ai::AiPlan,
     ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
     background_job::{ActionLoads, ActionPermit, ActionTicket, BackgroundWorker},
     embedding_jobs::{EmbeddingRequest, EmbeddingWorker},
     engine::Engine,
-    hotkeys::{HotkeyBindings, format_hotkey, parse_hotkey, settings_hotkeys},
+    hotkeys::{HotkeyBindings, format_hotkey, settings_hotkeys},
     model::*,
     palette::{self, Context as PaletteContext, Entry as PaletteEntry, Function},
     preview::{PreviewLoads, bounded_text},
     query_feedback::{IndexReply, QueryReply, claude_reply, embedding_reply, index_reply},
     screenshot::{ScreenshotGate, ScreenshotTicket},
-    semantic::{self, EmbeddingSettings},
+    semantic::{self},
     semantic_ui::{
         IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
         sync_semantic_view,
@@ -306,11 +306,6 @@ enum OrganizerManagement {
     Review,
 }
 enum UiEffect {
-    OrganizerSettings {
-        owner: HWND,
-        settings: crate::organizer::OrganizerSettings,
-        return_to: Option<OrganizerManagement>,
-    },
     HarnessMemory {
         owner: HWND,
         state: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
@@ -334,10 +329,6 @@ enum UiEffect {
         ticket: ScreenshotTicket,
         prepared: clipboard::PreparedScreenshot,
     },
-    ScreenshotSettings {
-        owner: HWND,
-        settings: Settings,
-    },
     Picker {
         owner: HWND,
         folder: bool,
@@ -351,19 +342,8 @@ enum UiEffect {
     },
     Settings {
         owner: HWND,
-        settings: Settings,
-    },
-    PathSettings {
-        owner: HWND,
-        settings: crate::path_activity::PathActivitySettings,
-    },
-    AiSettings {
-        owner: HWND,
-        settings: AiSettings,
-    },
-    EmbeddingSettings {
-        owner: HWND,
-        settings: EmbeddingSettings,
+        group: crate::settings_ui::Group,
+        return_to: Option<OrganizerManagement>,
     },
     SmartPrompt {
         owner: HWND,
@@ -488,6 +468,8 @@ struct App {
     organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
     organizer_page_open: bool,
+    settings_management_return: bool,
+    settings_notice: String,
     harness_memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
     runtime_health: Arc<std::sync::Mutex<String>>,
     host: *const Host,
@@ -617,6 +599,8 @@ pub fn run() -> Result<(), String> {
             organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
             organizer_outbox: Rc::new(RefCell::new((None, None))),
             organizer_page_open: false,
+            settings_management_return: false,
+            settings_notice: String::new(),
             harness_memory: Rc::new(RefCell::new(Default::default())),
             runtime_health: Arc::new(std::sync::Mutex::new("启动测试不调用模型".into())),
             host: std::ptr::null(),
@@ -1039,11 +1023,7 @@ impl App {
         });
     }
     unsafe fn organizer_settings(&mut self) {
-        self.effects.push_back(UiEffect::OrganizerSettings {
-            owner: self.hwnd,
-            settings: self.settings.organizer.clone(),
-            return_to: None,
-        });
+        self.settings_group(crate::settings_ui::Group::Organizer);
     }
     unsafe fn review_organizer(&mut self) {
         if self.organizer_page_open {
@@ -1132,6 +1112,8 @@ impl App {
             self.smart_button,
             if active {
                 w!("取消智能")
+            } else if !self.settings.ai.enabled && !self.settings.embedding.enabled {
+                w!("启用 / 配置智能")
             } else {
                 w!("智能查找")
             },
@@ -1178,7 +1160,7 @@ impl App {
     unsafe fn index_guidance(&self) {
         self.update_index_label();
         self.status(
-            "暂无可用索引；可固定文本/添加收藏后建立，或到“更多 → 语义检索设置”调整索引范围",
+            "暂无可用索引；可固定文本/添加收藏后建立，或到“设置中心 → 智能查找”调整索引范围",
         );
         let _ = SetFocus(Some(self.index_label));
     }
@@ -1279,22 +1261,9 @@ impl App {
             SmartAction::Semantic => self.begin_semantic(),
             SmartAction::Claude => self.begin_ai(),
             SmartAction::BuildIndex => self.index_guidance(),
-            SmartAction::ConfigureClaude => self.ai_settings(),
-            SmartAction::ConfigureSemantic => self.embedding_settings(),
-            SmartAction::Configure => {
-                let mut rect = RECT::default();
-                let _ = GetWindowRect(self.smart_button, &mut rect);
-                self.effects.push_back(UiEffect::Menu {
-                    owner: self.hwnd,
-                    x: rect.left,
-                    y: rect.bottom,
-                    target: None,
-                    entries: vec![
-                        (AI_SETTINGS, "配置按意思查找（Claude）…"),
-                        (EMBEDDING_SETTINGS, "配置相似内容查找（Embedding）…"),
-                    ],
-                });
-            }
+            SmartAction::ConfigureClaude => self.settings_group(crate::settings_ui::Group::Smart),
+            SmartAction::ConfigureSemantic => self.settings_group(crate::settings_ui::Group::Smart),
+            SmartAction::Configure => self.settings_group(crate::settings_ui::Group::Smart),
         }
     }
     unsafe fn stop_ai_request(&mut self) {
@@ -1684,13 +1653,9 @@ impl App {
         }
     }
     unsafe fn embedding_settings(&mut self) {
-        self.cancel_semantic();
-        self.cancel_ai();
-        self.effects.push_back(UiEffect::EmbeddingSettings {
-            owner: self.hwnd,
-            settings: self.settings.embedding.clone(),
-        });
+        self.settings_group(crate::settings_ui::Group::Services);
     }
+
     unsafe fn apply_embedding_settings(&mut self, values: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
@@ -1834,7 +1799,7 @@ impl App {
         for (id, title) in [
             (ADD, "添加 ＋"),
             (PREVIEW, "预览 ›"),
-            (SETTINGS, "设置 ▾"),
+            (SETTINGS, "设置…"),
             (300, "全部"),
             (301, "剪贴板"),
             (302, "文件夹"),
@@ -2816,6 +2781,9 @@ impl App {
                     }
                 }
                 Event::Error { message, exiting } => {
+                    self.settings_notice = format!(
+                        "后台操作未完成：{message}。更改仍保留在当前会话，请检查存储后重试保存。"
+                    );
                     if exiting && self.state.exit_failed() {
                         self.cancel_actions();
                         self.clear_preview();
@@ -3267,11 +3235,9 @@ impl App {
         }
     }
     unsafe fn path_settings(&mut self) {
-        self.effects.push_back(UiEffect::PathSettings {
-            owner: self.hwnd,
-            settings: self.settings.path_activity.clone(),
-        });
+        self.settings_group(crate::settings_ui::Group::Paths);
     }
+
     unsafe fn apply_path_settings(&mut self, values: Vec<String>) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
@@ -3299,9 +3265,15 @@ impl App {
         Ok(())
     }
     unsafe fn settings(&mut self) {
+        self.settings_group(crate::settings_ui::entry_group(
+            crate::settings_ui::Entry::Main,
+        ));
+    }
+    unsafe fn settings_group(&mut self, group: crate::settings_ui::Group) {
         self.effects.push_back(UiEffect::Settings {
             owner: self.hwnd,
-            settings: self.settings.clone(),
+            group,
+            return_to: None,
         });
     }
     unsafe fn begin_screenshot(&mut self) {
@@ -3339,61 +3311,13 @@ impl App {
         });
     }
     unsafe fn screenshot_settings(&mut self) {
-        self.effects.push_back(UiEffect::ScreenshotSettings {
-            owner: self.hwnd,
-            settings: self.settings.clone(),
-        });
+        self.settings_group(crate::settings_ui::Group::General);
     }
-    unsafe fn apply_screenshot_settings(&mut self, values: &[String]) -> Result<(), String> {
-        if self.state.lifecycle != Lifecycle::Running {
-            return Ok(());
-        }
-        let (modifiers, key) = parse_hotkey(values.first().ok_or("截图快捷键设置无效")?)?;
-        let mut next = self.settings.clone();
-        next.screenshot_hotkey_modifiers = modifiers;
-        next.screenshot_hotkey_key = key;
-        self.replace_hotkeys(&next)?;
-        self.settings = next;
-        self.send(Command::SaveSettings(self.settings.clone()));
-        Ok(())
-    }
-    unsafe fn settings_menu(&mut self) {
-        let mut rect = RECT::default();
-        let _ = GetWindowRect(self.buttons[2], &mut rect);
-        self.effects.push_back(UiEffect::Menu {
-            owner: self.hwnd,
-            x: rect.left,
-            y: rect.bottom,
-            entries: vec![
-                (GENERAL_SETTINGS, "常规设置…"),
-                (PATH_SETTINGS, "常用推荐设置…"),
-                (SCREENSHOT, "区域截图"),
-                (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
-                (AI_SETTINGS, "AI 检索设置…"),
-                (ORGANIZER_SETTINGS, "AI 管家设置…"),
-                (ORGANIZER_REVIEW, "整理建议…"),
-                (EMBEDDING_SETTINGS, "语义检索设置…"),
-            ],
-            target: None,
-        });
-        if self.settings.embedding.enabled
-            && let Some(UiEffect::Menu { entries, .. }) = self.effects.back_mut()
-        {
-            entries.push(if self.semantic_index.active() {
-                (INDEX_CANCEL, "取消索引")
-            } else {
-                (INDEX_START, "建立/更新语义索引")
-            });
-        }
-    }
+
     unsafe fn ai_settings(&mut self) {
-        self.cancel_semantic();
-        self.cancel_ai();
-        self.effects.push_back(UiEffect::AiSettings {
-            owner: self.hwnd,
-            settings: self.settings.ai.clone(),
-        });
+        self.settings_group(crate::settings_ui::Group::Services);
     }
+
     unsafe fn apply_ai_settings(&mut self, values: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
@@ -3417,57 +3341,60 @@ impl App {
         self.retheme();
         Ok(())
     }
-    unsafe fn apply_settings(&mut self, v: &[String]) -> Result<(), String> {
+    unsafe fn apply_settings(
+        &mut self,
+        action: crate::settings_ui::Action,
+        values: &[String],
+    ) -> Result<(), crate::form_validation::FormError> {
         if self.state.lifecycle != Lifecycle::Running {
-            return Ok(());
+            return Err(crate::form_validation::FormError::new(
+                0,
+                "应用正在退出，未接收更改",
+            ));
         }
-
-        let mut settings = self.settings.clone();
-        settings.theme = match v[0].as_str() {
-            "1" => Theme::Light,
-            "2" => Theme::Dark,
-            _ => Theme::System,
-        };
-        let keys = parse_hotkey(&v[1])
-            .and_then(|main| parse_hotkey(&v[2]).map(|clipboard| (main, clipboard)));
-        let ((m, k), (cm, ck)) = keys?;
-        settings.hotkey_modifiers = m;
-        settings.hotkey_key = k;
-        settings.clipboard_hotkey_modifiers = cm;
-        settings.clipboard_hotkey_key = ck;
-        settings.smart_search = match v[5].as_str() {
-            "1" => SmartSearchMode::Claude,
-            "2" => SmartSearchMode::Semantic,
-            _ => SmartSearchMode::Auto,
-        };
-        settings.capture_paused = v[3] == "1";
-        settings.excluded_apps = v[4]
-            .split([',', '，'])
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect();
-        self.replace_hotkeys(&settings)?;
+        let next = crate::settings_ui::edit(&self.settings, action, values)?;
+        if action == crate::settings_ui::Action::Smart {
+            if next.ai.enabled {
+                ai_client::validate_settings(&next.ai)
+                    .map_err(|e| crate::form_validation::FormError::new(0, e))?;
+            }
+            if next.embedding.enabled {
+                ai_client::validate_embedding_settings(&next.embedding)
+                    .map_err(|e| crate::form_validation::FormError::new(1, e))?;
+            }
+        }
+        if action == crate::settings_ui::Action::General {
+            self.replace_hotkeys(&next)
+                .map_err(|e| crate::form_validation::FormError::new(1, e))?;
+        }
+        self.accept_settings(next);
+        Ok(())
+    }
+    unsafe fn accept_settings(&mut self, next: Settings) {
+        self.cancel_organizer_for_settings(&next);
+        if self.settings.embedding != next.embedding {
+            self.cancel_semantic();
+            self.cancel_index();
+            self.semantic_index.clear_display();
+            self.semantic_status.mark_dirty();
+        }
+        self.cancel_ai();
         self.cancel_preflight();
         self.query_activity.cancel();
-        self.settings = settings.clone();
+        self.settings = next;
+        self.update_organizer_timer();
         self.retheme();
         self.tray(NIM_MODIFY);
-        self.send(Command::SaveSettings(settings));
-        Ok(())
+        self.settings_notice = "设置更改已接收，正在异步保存；若保存失败将在此显示。".into();
+        self.send(Command::SaveSettings(self.settings.clone()));
     }
     unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
         let entries: Vec<(usize, &str)> = if tray {
             vec![
                 (221, "打开面板"),
-                (GENERAL_SETTINGS, "常规设置…"),
-                (PATH_SETTINGS, "常用推荐设置…"),
+                (GENERAL_SETTINGS, "设置…"),
                 (SCREENSHOT, "区域截图"),
-                (SCREENSHOT_SETTINGS, "截图快捷键设置…"),
-                (AI_SETTINGS, "AI 检索设置…"),
-                (ORGANIZER_SETTINGS, "AI 管家设置…"),
                 (ORGANIZER_REVIEW, "整理建议…"),
-                (EMBEDDING_SETTINGS, "语义检索设置…"),
                 (
                     222,
                     activity_status::capture_action(self.settings.capture_paused),
@@ -3541,6 +3468,10 @@ impl App {
         });
     }
     unsafe fn execute_function(&mut self, function: Function) {
+        if let Some(group) = crate::settings_ui::function_group(function) {
+            self.settings_group(group);
+            return;
+        }
         self.cancel_actions();
         if function != Function::Exit
             && function != Function::AiSearch
@@ -3610,8 +3541,10 @@ impl App {
                     self.request(Action::Preview);
                 }
             }
-            SETTINGS => self.settings_menu(),
-            GENERAL_SETTINGS => self.settings(),
+            SETTINGS => self.settings(),
+            GENERAL_SETTINGS => self.settings_group(crate::settings_ui::entry_group(
+                crate::settings_ui::Entry::Tray,
+            )),
             PATH_SETTINGS => self.path_settings(),
             SCREENSHOT => self.begin_screenshot(),
             SCREENSHOT_SETTINGS => self.screenshot_settings(),
@@ -3632,7 +3565,7 @@ impl App {
                     self.semantic_status.ready(&self.smart_view().profile),
                 ) =>
             {
-                self.embedding_settings()
+                self.settings_group(crate::settings_ui::Group::Smart)
             }
             INDEX_STATUS => self.begin_index(),
             EMBEDDING_SETTINGS => self.embedding_settings(),
@@ -4266,6 +4199,107 @@ unsafe extern "system" fn preview_proc(
 }
 
 impl Host {
+    unsafe fn settings_editor(&self, owner: HWND, action: crate::settings_ui::Action) {
+        use crate::form_validation::FormError;
+        use crate::settings_ui::Action as Edit;
+        let settings = self.app.borrow().settings.clone();
+        match action {
+            Edit::General | Edit::Data | Edit::Smart => {
+                dialogs::settings_form(
+                    owner,
+                    &settings,
+                    action,
+                    Some(&mut |values| self.app.borrow_mut().apply_settings(action, values)),
+                );
+            }
+            Edit::Paths => {
+                dialogs::path_settings_form(
+                    owner,
+                    &settings.path_activity,
+                    settings.theme,
+                    Some(&mut |values| {
+                        let mut app = self.app.borrow_mut();
+                        app.apply_path_settings(values.to_vec())
+                            .map_err(|e| FormError::new(2, e))?;
+                        app.settings_notice = "路径设置更改已接收；如保存失败将在此显示。".into();
+                        Ok(())
+                    }),
+                );
+            }
+            Edit::Claude => {
+                dialogs::ai_settings_form(
+                    owner,
+                    &settings.ai,
+                    settings.theme,
+                    Some(&mut |values| {
+                        let mut app = self.app.borrow_mut();
+                        let mut values = values.to_vec();
+                        values[0] = usize::from(app.settings.ai.enabled).to_string();
+                        app.apply_ai_settings(&values)
+                            .map_err(|e| FormError::new(4, e))?;
+                        app.settings_notice =
+                            "Claude 连接配置更改已接收；保存不会测试连接。".into();
+                        Ok(())
+                    }),
+                );
+            }
+            Edit::Embedding => {
+                dialogs::embedding_settings_form(
+                    owner,
+                    &settings.embedding,
+                    settings.theme,
+                    Some(&mut |values| {
+                        let mut app = self.app.borrow_mut();
+                        let mut values = values.to_vec();
+                        values[0] = usize::from(app.settings.embedding.enabled).to_string();
+                        values[5] = usize::from(
+                            app.settings.embedding.index_scope == semantic::IndexScope::AllText,
+                        )
+                        .to_string();
+                        app.apply_embedding_settings(&values)
+                            .map_err(|e| FormError::new(3, e))?;
+                        app.settings_notice =
+                            "Embedding 连接配置更改已接收；保存不会测试连接。".into();
+                        Ok(())
+                    }),
+                );
+            }
+            Edit::Organizer | Edit::Advanced => {
+                let health = self.app.borrow().runtime_health.clone();
+                dialogs::organizer_settings_form(
+                    owner,
+                    &settings.organizer,
+                    &settings.ai,
+                    settings.path_activity.enabled,
+                    settings.theme,
+                    health,
+                    action == Edit::Advanced,
+                    self.hwnd.get(),
+                    Some(&mut |values| {
+                        let parsed = crate::organizer_ui::parse_organizer_fields(values)
+                            .map_err(|e| FormError::new(5, e))?;
+                        let mut app = self.app.borrow_mut();
+                        let mut next = app.settings.clone();
+                        if action == Edit::Advanced {
+                            next.organizer.interval_seconds = parsed.interval_seconds;
+                            next.organizer.batch_size = parsed.batch_size;
+                            next.organizer.max_rounds = parsed.max_rounds;
+                        } else {
+                            next.organizer.enabled = parsed.enabled;
+                            next.organizer.mode = parsed.mode;
+                            next.organizer.scope = parsed.scope;
+                            next.organizer.instructions = parsed.instructions;
+                            next.organizer.memory_enabled = parsed.memory_enabled;
+                        }
+                        app.accept_settings(next);
+                        Ok(())
+                    }),
+                );
+            }
+            Edit::Review | Edit::Memory => (),
+        }
+    }
+
     unsafe fn is_panel_surface(&self, window: HWND) -> bool {
         window == self.hwnd.get() || IsChild(self.hwnd.get(), window).as_bool()
     }
@@ -4481,7 +4515,9 @@ impl Host {
                     // epoch/selection while suppressing in-flight network publication.
                     semantic_revoked = app.prepare_semantic_effect(matches!(
                         effect,
-                        UiEffect::Menu { .. } | UiEffect::ClipboardMetadata { .. }
+                        UiEffect::Menu { .. }
+                            | UiEffect::ClipboardMetadata { .. }
+                            | UiEffect::Settings { .. }
                     ));
                     app.state.modal_open = !matches!(effect, UiEffect::Destroy(_));
                 }
@@ -4491,57 +4527,6 @@ impl Host {
                 break;
             };
             match effect {
-                UiEffect::OrganizerSettings {
-                    owner,
-                    settings,
-                    return_to,
-                } => {
-                    let (appearance, ai, path_enabled) = {
-                        let app = self.app.borrow();
-                        (
-                            app.settings.theme,
-                            app.settings.ai.clone(),
-                            app.settings.path_activity.enabled,
-                        )
-                    };
-                    let runtime_health = self.app.borrow().runtime_health.clone();
-                    let values = dialogs::organizer_settings_form(
-                        owner,
-                        &settings,
-                        &ai,
-                        path_enabled,
-                        appearance,
-                        runtime_health,
-                    );
-                    let mut app = self.app.borrow_mut();
-                    app.state.modal_open = false;
-                    if app.state.lifecycle == Lifecycle::Running
-                        && let Some(values) = values
-                    {
-                        match crate::organizer_ui::parse_organizer_fields(&values) {
-                            Ok(settings) => {
-                                let mut next = app.settings.clone();
-                                next.organizer = settings;
-                                app.cancel_organizer_for_settings(&next);
-                                app.settings = next;
-                                app.update_organizer_timer();
-                                app.send(Command::SaveSettings(app.settings.clone()));
-                            }
-                            Err(message) => {
-                                let mut review = app.organizer_review.borrow_mut();
-                                review.message = message;
-                                review.revision += 1;
-                            }
-                        }
-                    }
-                    if app.state.lifecycle == Lifecycle::Running {
-                        match return_to {
-                            Some(OrganizerManagement::Memory) => app.show_harness_memory(),
-                            Some(OrganizerManagement::Review) => app.review_organizer(),
-                            None => (),
-                        }
-                    }
-                }
                 UiEffect::HarnessMemory {
                     owner,
                     state,
@@ -4574,11 +4559,12 @@ impl Host {
                     app.state.modal_open = false;
                     if settings_requested {
                         app.organizer_settings();
-                        if let Some(UiEffect::OrganizerSettings { return_to, .. }) =
-                            app.effects.back_mut()
-                        {
+                        if let Some(UiEffect::Settings { return_to, .. }) = app.effects.back_mut() {
                             *return_to = Some(OrganizerManagement::Memory);
                         }
+                    } else if app.settings_management_return {
+                        app.settings_management_return = false;
+                        app.settings_group(crate::settings_ui::Group::Organizer);
                     }
                 }
                 UiEffect::OrganizerReview {
@@ -4625,11 +4611,12 @@ impl Host {
                     app.organizer_page_open = false;
                     if settings_requested {
                         app.organizer_settings();
-                        if let Some(UiEffect::OrganizerSettings { return_to, .. }) =
-                            app.effects.back_mut()
-                        {
+                        if let Some(UiEffect::Settings { return_to, .. }) = app.effects.back_mut() {
                             *return_to = Some(OrganizerManagement::Review);
                         }
+                    } else if app.settings_management_return {
+                        app.settings_management_return = false;
+                        app.settings_group(crate::settings_ui::Group::Organizer);
                     }
                 }
                 UiEffect::ScreenshotSelect {
@@ -4745,26 +4732,6 @@ impl Host {
                         screenshot_notice(owner, message);
                     }
                 }
-                UiEffect::ScreenshotSettings { owner, settings } => {
-                    dialogs::screenshot_settings_form(
-                        owner,
-                        format_hotkey(
-                            settings.screenshot_hotkey_modifiers,
-                            settings.screenshot_hotkey_key,
-                        ),
-                        settings.theme,
-                        Some(&mut |values| {
-                            self.app
-                                .borrow_mut()
-                                .apply_screenshot_settings(values)
-                                .map_err(|e| crate::form_validation::FormError::new(0, e))
-                        }),
-                    );
-                    let mut app = self.app.borrow_mut();
-                    app.state.modal_open = false;
-                    app.restore_after_modal(true);
-                    semantic_revoked = false;
-                }
                 UiEffect::Picker {
                     owner,
                     folder,
@@ -4793,83 +4760,65 @@ impl Host {
                         app.apply_favorite(item, kind, values);
                     }
                 }
-                UiEffect::Settings { owner, settings } => {
-                    dialogs::settings_form(
-                        owner,
-                        match settings.theme {
-                            Theme::System => 0,
-                            Theme::Light => 1,
-                            Theme::Dark => 2,
-                        },
-                        format_hotkey(settings.hotkey_modifiers, settings.hotkey_key),
-                        format_hotkey(
-                            settings.clipboard_hotkey_modifiers,
-                            settings.clipboard_hotkey_key,
-                        ),
-                        settings.capture_paused,
-                        settings.excluded_apps.join(", "),
-                        settings.smart_search,
-                        Some(&mut |values| {
-                            self.app
-                                .borrow_mut()
-                                .apply_settings(values)
-                                .map_err(|e| crate::form_validation::FormError::new(1, e))
-                        }),
-                    );
+                UiEffect::Settings {
+                    owner,
+                    group,
+                    return_to,
+                } => {
+                    let management =
+                        super::settings_ui::show(owner, group, |hub, group, action| {
+                            if let Some(action) = action {
+                                self.settings_editor(hub, action);
+                            }
+                            let app = self.app.borrow();
+                            let profile = app.smart_view().profile;
+                            let index = app
+                                .semantic_index
+                                .label(app.semantic_status.ready(&profile));
+                            let query = app.query_activity.label();
+                            let detail = format!(
+                                "{}\r\n\r\n{}",
+                                crate::settings_ui::description(
+                                    group,
+                                    &app.settings,
+                                    &index,
+                                    query.as_deref()
+                                ),
+                                app.settings_notice
+                            );
+                            super::settings_ui::Snapshot {
+                                appearance: app.settings.theme,
+                                detail,
+                                alive: app.state.lifecycle == Lifecycle::Running,
+                                close_label: match &return_to {
+                                    Some(OrganizerManagement::Memory) => "返回记忆",
+                                    Some(OrganizerManagement::Review) => "返回建议",
+                                    None => "关闭设置",
+                                },
+                            }
+                        });
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    // Cancel and both validation/registration early returns also reload.
+                    // Restore existing ordinary query only after the whole hub exits.
+                    // Group/leaf navigation never calls this gate or SemanticStatus.
+                    app.cancel_semantic();
                     app.restore_after_modal(true);
-                    semantic_revoked = false;
-                }
-                UiEffect::PathSettings { owner, settings } => {
-                    let appearance = self.app.borrow().settings.theme;
-                    let result = dialogs::path_settings_form(owner, &settings, appearance);
-                    let mut app = self.app.borrow_mut();
-                    app.state.modal_open = false;
-                    let error = result.and_then(|values| app.apply_path_settings(values).err());
-                    app.restore_after_modal(true);
-                    semantic_revoked = false;
-                    if let Some(message) = error {
-                        app.status(&message);
+                    if app.state.lifecycle == Lifecycle::Running {
+                        if let Some(action) = management {
+                            app.settings_management_return = true;
+                            match action {
+                                crate::settings_ui::Action::Review => app.review_organizer(),
+                                crate::settings_ui::Action::Memory => app.show_harness_memory(),
+                                _ => (),
+                            }
+                        } else {
+                            match return_to {
+                                Some(OrganizerManagement::Memory) => app.show_harness_memory(),
+                                Some(OrganizerManagement::Review) => app.review_organizer(),
+                                None => (),
+                            }
+                        }
                     }
-                }
-                UiEffect::AiSettings { owner, settings } => {
-                    let appearance = self.app.borrow().settings.theme;
-                    dialogs::ai_settings_form(
-                        owner,
-                        &settings,
-                        appearance,
-                        Some(&mut |values| {
-                            self.app
-                                .borrow_mut()
-                                .apply_ai_settings(values)
-                                .map_err(|e| crate::form_validation::FormError::new(4, e))
-                        }),
-                    );
-                    let mut app = self.app.borrow_mut();
-                    app.state.modal_open = false;
-                    app.refresh_semantic_status();
-                    app.search();
-                    semantic_revoked = false;
-                }
-                UiEffect::EmbeddingSettings { owner, settings } => {
-                    let appearance = self.app.borrow().settings.theme;
-                    dialogs::embedding_settings_form(
-                        owner,
-                        &settings,
-                        appearance,
-                        Some(&mut |values| {
-                            self.app
-                                .borrow_mut()
-                                .apply_embedding_settings(values)
-                                .map_err(|e| crate::form_validation::FormError::new(3, e))
-                        }),
-                    );
-                    let mut app = self.app.borrow_mut();
-                    app.state.modal_open = false;
-                    app.refresh_semantic_status();
-                    app.search();
                     semantic_revoked = false;
                 }
                 UiEffect::SmartPrompt { owner, preferred } => {

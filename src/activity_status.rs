@@ -91,13 +91,13 @@ impl QueryActivity {
     pub fn label(&self) -> Option<String> {
         self.current.as_ref().map(|c| {
             let (name, settings) = match c.capability {
-                Capability::Claude => ("Claude", "AI 检索设置"),
-                Capability::Semantic => ("语义", "语义检索设置"),
+                Capability::Claude => ("Claude", "服务连接 → Claude"),
+                Capability::Semantic => ("语义", "服务连接 → Embedding"),
             };
             match c.phase {
                 Phase::Processing => format!("{name} · 处理中，本地结果仍可用"),
                 Phase::Completed => format!("{name} · 已完成"),
-                Phase::Failed => format!("{name} · 未完成，已保留本地结果 · 更多 → {settings}"),
+                Phase::Failed => format!("{name} · 未完成，已保留本地结果 · 设置中心 → {settings}"),
             }
         })
     }

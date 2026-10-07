@@ -172,7 +172,7 @@ pub fn organizer_config_warning(ai: &AiSettings) -> Option<String> {
         || ai.encrypted_key.is_empty()
         || crate::claude::parse_endpoint(&ai.endpoint).is_err()
     {
-        Some("请先在 AI 设置中填写有效 API 地址、模型 ID 和密钥；管家开关与 AI 检索独立".into())
+        Some("请先在设置中心 → 服务连接 → Claude 中填写有效 API 地址、模型 ID 和密钥；管家开关与 AI 检索独立".into())
     } else {
         None
     }

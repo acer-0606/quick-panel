@@ -669,3 +669,58 @@ fn zero_new_embeddings_with_existing_vectors_reports_up_to_date_not_empty() {
     assert!(!label.contains("没有可索引内容"));
     assert!(!label.contains("固定文本"));
 }
+
+#[test]
+fn settings_hub_browsing_preserves_rows_until_whole_hub_close_restores_local_query() {
+    for (visible, running) in [(true, true), (false, true), (true, false)] {
+        let mut session = QuerySession::default();
+        session.begin(91, "kept", Scope::Clipboard, "profile");
+        assert!(session.finish(
+            91,
+            "kept",
+            Scope::Clipboard,
+            "profile",
+            true,
+            vec![1.0, 0.0]
+        ));
+        let mut state = UiState::default();
+        state.visible = visible;
+        let mut saved = vec!["row"];
+        let mut ready = true;
+        // Actual native hub entry uses the preserving modal gate. Group and leaf
+        // navigation consume no gate and issue no retrieval command.
+        assert!(!prepare_semantic_effect(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            true
+        ));
+        assert_eq!(saved, vec!["row"]);
+        assert!(session.adopted());
+        state.modal_open = true;
+        if !running {
+            state.begin_exit();
+        }
+        // Actual whole-hub exit cancels derived rows then restores through the
+        // existing gate, including its hidden/exiting and final-token safeguards.
+        prepare_semantic_effect(&mut session, &mut state, &mut saved, &mut ready, false);
+        let query = finish_semantic_effect(
+            &mut session,
+            &mut state,
+            &mut saved,
+            &mut ready,
+            "kept",
+            Scope::Clipboard,
+            true,
+        );
+        assert_eq!(query.is_some(), visible && running);
+        if let Some(query) = query {
+            assert_eq!(query.text, "kept");
+            assert_eq!(query.scope, Scope::Clipboard);
+            assert!(state.is_current(query.request_id));
+        }
+        assert!(!session.adopted());
+        assert!(!state.modal_open);
+    }
+}

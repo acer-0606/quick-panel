@@ -8,6 +8,7 @@ pub mod images;
 mod organizer_ui;
 mod path_monitor;
 mod screenshot;
+mod settings_ui;
 mod theme;
 mod ui;
 pub use ui::run;

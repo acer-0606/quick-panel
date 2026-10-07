@@ -1816,3 +1816,58 @@ fn load_sqlite_failure_returns_terminal_id_and_recovery_admits_new_action_load()
     assert!(!loads.busy());
     shutdown(&engine);
 }
+
+#[test]
+fn data_editor_retention_save_cleans_unused_history_only() {
+    use quick_panel::settings_ui::{Action, edit};
+    let (_temp, engine, path) = start(60_000, 16 * 1024 * 1024);
+    engine
+        .send(Command::Capture(snapshot("fixed keeper")))
+        .unwrap();
+    let id = search(&engine, "fixed keeper")[0].id.clone();
+    engine.send(Command::Pin { id, pinned: true }).unwrap();
+    engine
+        .send(Command::Capture(snapshot("unused history")))
+        .unwrap();
+    engine
+        .send(Command::SaveFavorite(FavoriteInput {
+            id: None,
+            kind: ItemKind::Document,
+            title: "favorite keeper".into(),
+            target: "C:\\keep.txt".into(),
+            alias: String::new(),
+            tags: vec![],
+            open_with: None,
+        }))
+        .unwrap();
+    engine.send(Command::Flush).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    let _ = search(&engine, ""); // actor barrier before direct synthetic fixture aging
+    let db = Connection::open(&path).unwrap();
+    db.execute("UPDATE items SET last_used_ms=1", []).unwrap();
+    let original = Settings::default();
+    let before = count(&path);
+    let invalid = edit(
+        &original,
+        Action::Data,
+        &["0", "", "0", "1"].map(str::to_owned),
+    );
+    assert!(invalid.is_err());
+    assert_eq!(
+        count(&path),
+        before,
+        "validation/browsing does not clean SQLite"
+    );
+    let next = edit(
+        &original,
+        Action::Data,
+        &["0", "", "1", "1"].map(str::to_owned),
+    )
+    .unwrap();
+    engine.send(Command::SaveSettings(next)).unwrap();
+    wait(&engine, |e| matches!(e, Event::Saved(_)));
+    assert!(search(&engine, "unused history").is_empty());
+    assert_eq!(search(&engine, "fixed keeper").len(), 1);
+    assert_eq!(search(&engine, "favorite keeper").len(), 1);
+    shutdown(&engine);
+}

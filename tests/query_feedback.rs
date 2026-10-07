@@ -185,7 +185,7 @@ fn activity_failure_is_neutral_and_survives_selection_and_saved_feedback() {
         let displayed = panel_status(true, &activity, message);
         assert!(displayed.contains("记录已暂停"));
         assert!(displayed.contains("Claude · 未完成，已保留本地结果"));
-        assert!(displayed.contains("AI 检索设置"));
+        assert!(displayed.contains("设置中心 → 服务连接 → Claude"));
         assert!(!displayed.contains("secret provider response"));
     }
     assert_eq!(capture_action(true), "恢复剪贴板记录");

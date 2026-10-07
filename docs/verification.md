@@ -1,3 +1,25 @@
+# 2026-10-07 交互清晰化与统一设置中心（当前交付）
+
+本轮集成 UX01–UX22，主面板、托盘、功能搜索“设置”进入同一 Win32 原生中心。六组为常规与快捷键、剪贴板与数据、常用路径、智能查找、AI 管家、服务连接。保留原生主题/Segoe UI、分组返回上下文、提交失败 raw 草稿、记忆精确目标与独立重试；截图/建立索引等立即操作保留在独立功能入口。
+
+- 设置只读显示消费 RAM；未加载不显示为 0，配置完整不代表连接成功。不存在设置导航触发的事务、正文扫描或网络请求。用户原已启动的索引终态保留既有一次分块状态校验。
+- 数据页显示实际未固定历史保留值，默认 30 天未使用 / 最多 10000 条；可输入 1–36500 天、1–1000000 条。减少限额按原 SQLite 策略清理，固定/收藏豁免；未编辑的非常规旧值不被其他设置重写。
+- 三个热键集中且互相冲突会保留旧绑定。Claude/语义开关、首选与索引范围只由智能查找页维护；服务页管理共用 Claude 与独立 Embedding 连接。管家核心与高级调度分别合并当前配置，不覆盖别组设置。
+- 原生中心在窄屏使用顶部六组选项，详情可键盘滚动，打开/返回动作固定；生产 geometry 在 96/144/192 DPI 和 360×480、800×600 客户区验证可达。叶子固定动作复用相同几何，长标签换行，连接状态可滚动阅读。
+- 设置提交只说明“更改已接收”，不把不关联的旧 Saved 当作本次落盘。后台错误在中心显示；正常退出的保存失败重试合同保持。
+
+## 本轮最终证据
+
+最终共享全套 `cargo test --locked -- --test-threads=1`：**493 passed / 0 failed / 2 既有 ignored，40 个 suite summaries，exit0**。全套后仅缩短三个 Windows 原生按钮标签，未更改共享行为；最终 Windows 检查与 Release 覆盖这些标签。完整逐 suite 结果见本轮 Task 4 实施报告及保留的验证日志。Windows GUI、中文 IME、多屏 DPI、WinHTTP/DPAPI/通知实际执行数 **0**；macOS 共享/合成进程测试和 Windows 交叉编译不能替代实机视觉验收。未使用真实 API、用户密钥、数据库、剪贴板或屏幕。
+
+最终串行检查全部 exit0：host/Windows `cargo clippy --locked --all-targets [--target x86_64-pc-windows-gnu] -- -D warnings`、对应 all-targets `cargo check --locked`、`cargo fmt --all -- --check`、`git diff --check`。Windows Release `cargo build --release --locked --target x86_64-pc-windows-gnu` 通过（46.017s）；共享 Release `cargo run --release --locked -- --core-check` 通过（34.505s），`pending_visible`、`disk_empty_before_flush`、`exit_restored` 均为 true，SQLite 3.53.2。固定环境为 `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`，所有 Cargo 严格串行。
+
+Node 协议、生产源码与已构建 Pi bundle 未变；本轮不重跑之前通过的 30 项 Node suite。Rust 子进程测试使用固定本机 Node，最终便携包使用本轮已核验 Node 24.19.0 Windows x64 资产。准确成员、字节与 SHA-256 以 ZIP 外的 `dist/package-manifest.json` / `dist/SHA256SUMS` 为准，打包后逐成员核对 source/stage/ZIP 与 CRC，不把校验清单打入 ZIP 自循环。
+
+## 以下为此前 Pi 运行时版本的验证记录
+
+以下测试数与旧产物只标识此前版本，当前交付以本节及外置清单为准。
+
 # 2026-10-07 Pi 整理运行时验证
 
 当前交付物的精确体积、成员及 SHA-256 以 `dist/package-manifest.json` 与 `dist/SHA256SUMS` 为准；清单位于 ZIP 外，避免自哈希循环。ZIP 包含 QuickPanel.exe、固定 Node 24.19.0、Pi bundle、全部相关许可及本次使用说明。

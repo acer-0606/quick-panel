@@ -397,7 +397,7 @@ const CATALOG: &[Spec] = &[
     Spec {
         action: Function::ScreenshotSettings,
         title: "截图快捷键设置",
-        description: "配置可选截图快捷键；默认关闭，留空可关闭",
+        description: "常规与快捷键组：面板、剪贴板和截图三个快捷键集中编辑",
         alias: "截图设置",
         keywords: &["截图快捷键", "截图热键"],
     },
@@ -423,10 +423,10 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::EmbeddingSettings,
-        title: "语义检索设置",
-        description: "配置独立 Embedding API、密钥和索引范围",
+        title: "Embedding 服务连接设置",
+        description: "服务连接组：配置独立 Embedding API、密钥、模型与测试",
         alias: "向量设置",
-        keywords: &["Embedding配置", "语义配置"],
+        keywords: &["Embedding配置", "语义配置", "语义检索设置"],
     },
     Spec {
         action: Function::SemanticSearch,
@@ -451,10 +451,10 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::AiSettings,
-        title: "AI检索设置",
-        description: "配置可选 Claude 格式 API、模型与密钥",
+        title: "Claude 服务连接设置",
+        description: "服务连接组：检索与管家共用 Claude API、模型、密钥与测试",
         alias: "AI设置",
-        keywords: &["Claude配置", "AI配置", "API配置", "模型配置"],
+        keywords: &["Claude配置", "AI配置", "API配置", "模型配置", "AI检索设置"],
     },
     Spec {
         action: Function::OrganizerSettings,
@@ -487,7 +487,7 @@ const CATALOG: &[Spec] = &[
     Spec {
         action: Function::Settings,
         title: "设置",
-        description: "修改快捷键、外观和记录设置",
+        description: "打开六组设置中心：快捷键、数据、路径、智能查找、管家与服务连接",
         alias: "快捷键",
         keywords: &["打开设置", "热键", "外观", "主题", "settings", "hotkey"],
     },

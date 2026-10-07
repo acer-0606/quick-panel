@@ -40,11 +40,7 @@ use quick_panel::form_validation::{FormError, FormStatus, Submission, Validation
 #[test]
 fn local_errors_identify_fields_without_normalizing_the_draft() {
     for (kind, fields, bad) in [
-        (
-            Validation::General,
-            vec!["0", "  Ctrl+  ", "Alt+C", "0", "", "0"],
-            1,
-        ),
+        (Validation::General, vec!["0", "  Ctrl+  ", "Alt+C", ""], 1),
         (
             Validation::Paths,
             vec!["1", "0", "  relative/path  ", "0"],
