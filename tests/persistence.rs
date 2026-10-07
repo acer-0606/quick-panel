@@ -1871,3 +1871,45 @@ fn data_editor_retention_save_cleans_unused_history_only() {
     assert_eq!(search(&engine, "favorite keeper").len(), 1);
     shutdown(&engine);
 }
+
+#[test]
+fn path_settings_actor_notifications_use_hub_gate_until_return_to_panel() {
+    use quick_panel::settings_ui::{self, Group, Navigation, Page};
+    let (_temp, engine, _path) = start(60_000, 16 * 1024 * 1024);
+    let mut navigation = Navigation::default();
+    navigation.open(Page::Hub(Group::Paths));
+    let submission = settings_ui::submit_paths(
+        &Settings::default(),
+        &["1", "1", "", "0"].map(str::to_owned),
+    )
+    .unwrap();
+    for command in submission.commands {
+        engine.send(command).unwrap();
+    }
+    let mut paths = false;
+    let mut changed = false;
+    let mut saved = false;
+    while !(paths && changed && saved) {
+        let event = wait(&engine, |_| true);
+        match event {
+            Event::PathActivityChanged => paths = true,
+            Event::Changed => changed = true,
+            Event::Saved(_) => saved = true,
+            Event::Error { message, .. } => panic!("synthetic save failed: {message}"),
+            _ => continue,
+        }
+        // Same production gate consumed by native Changed/PathActivityChanged/
+        // Saved and Search: actual actor notifications may dirty RAM but cannot
+        // cause a panel query while the hub/management chain owns navigation.
+        assert!(!navigation.allows_panel_query());
+    }
+    navigation.open(Page::Review);
+    navigation.open(Page::Hub(Group::Services));
+    navigation.close();
+    navigation.close();
+    assert!(!navigation.allows_panel_query());
+    navigation.close();
+    assert!(navigation.allows_panel_query());
+    assert!(search(&engine, "").is_empty());
+    shutdown(&engine);
+}

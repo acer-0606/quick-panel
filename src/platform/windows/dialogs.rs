@@ -139,6 +139,10 @@ struct Form {
     viewport: HWND,
     scroll_y: i32,
     content_height: i32,
+    layout_spec: crate::settings_ui::EditorSpec,
+    layout: Option<crate::settings_ui::EditorLayout>,
+    note: Option<HWND>,
+    cancel_button: Option<HWND>,
 }
 
 #[derive(Clone)]
@@ -177,9 +181,9 @@ const TEST_TIMER: usize = 1;
 const MODEL_BUTTON: usize = 4;
 unsafe fn scroll_form(ptr: *const RefCell<Form>, position: i32) {
     unsafe {
-        let (viewport, old, content) = {
+        let (viewport, content) = {
             let form = (*ptr).borrow();
-            (form.viewport, form.scroll_y, form.content_height)
+            (form.viewport, form.content_height)
         };
         let mut rect = RECT::default();
         let _ = GetClientRect(viewport, &mut rect);
@@ -195,16 +199,126 @@ unsafe fn scroll_form(ptr: *const RefCell<Form>, position: i32) {
             ..Default::default()
         };
         windows::Win32::UI::Controls::SetScrollInfo(viewport, SB_VERT, &info, true);
-        ScrollWindowEx(
-            viewport,
-            0,
-            old - position,
-            None,
-            None,
-            None,
-            None,
-            SW_SCROLLCHILDREN | SW_INVALIDATE,
-        );
+        position_content(ptr, position);
+    }
+}
+unsafe fn position_content(ptr: *const RefCell<Form>, scroll: i32) {
+    unsafe {
+        let (layout, controls, note, test, models, result, dpi) = {
+            let form = (*ptr).borrow();
+            (
+                form.layout.clone(),
+                form.controls.clone(),
+                form.note,
+                form.test_button,
+                form.model_button,
+                form.test_result,
+                form.dpi,
+            )
+        };
+        let Some(layout) = layout else {
+            return;
+        };
+        let move_to = |hwnd: HWND, r: crate::settings_ui::Rect, dropdown: bool| {
+            let _ = MoveWindow(
+                hwnd,
+                r.x,
+                r.y - scroll,
+                r.width,
+                r.height + if dropdown { 160 * dpi as i32 / 96 } else { 0 },
+                true,
+            );
+        };
+        for (i, field) in layout.fields.iter().enumerate() {
+            move_to(controls[i * 2], field.label, false);
+            move_to(controls[i * 2 + 1], field.control, field.dropdown);
+        }
+        for (control, r) in [
+            (note, layout.note),
+            (test, layout.test_button),
+            (models, layout.model_button),
+            (result, layout.test_result),
+        ] {
+            if let (Some(control), Some(r)) = (control, r) {
+                move_to(control, r, false);
+            }
+        }
+    }
+}
+unsafe fn relayout_form(ptr: *const RefCell<Form>, hwnd: HWND, dpi: u32) {
+    unsafe {
+        let (spec, old_dpi, scroll, viewport, controls, edits, error, save, cancel) = {
+            let f = (*ptr).borrow();
+            (
+                f.layout_spec.clone(),
+                f.dpi,
+                f.scroll_y,
+                f.viewport,
+                f.controls.clone(),
+                f.edits.clone(),
+                f.error_result,
+                f.save_button,
+                f.cancel_button,
+            )
+        };
+        // DPI messages can arrive synchronously during native construction.
+        // Final creation calls this again after every control exists.
+        if viewport.is_invalid()
+            || save.is_none()
+            || cancel.is_none()
+            || controls.len() < spec.fields.len() * 2
+        {
+            return;
+        }
+        let mut client = RECT::default();
+        let _ = GetClientRect(hwnd, &mut client);
+        let scale = |n: i32| n * dpi as i32 / 96;
+        let layout = spec.layout(client.right, dpi);
+        let viewport_height = (client.bottom - scale(110)).max(1);
+        let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
+        let focused = edits
+            .iter()
+            .position(|edit| *edit == focus || IsChild(*edit, focus).as_bool());
+        let scroll = layout.scroll_after_reflow(scroll, old_dpi, dpi, viewport_height, focused);
+        let changed_font = (dpi != old_dpi).then(|| theme::font(dpi));
+        let old_font = {
+            let mut f = (*ptr).borrow_mut();
+            f.layout = Some(layout.clone());
+            f.content_height = layout.content_height;
+            f.dpi = dpi;
+            changed_font.map(|font| std::mem::replace(&mut f.font, font))
+        };
+        if let Some(font) = changed_font {
+            for control in &controls {
+                SendMessageW(
+                    *control,
+                    WM_SETFONT,
+                    Some(WPARAM(font.0 as usize)),
+                    Some(LPARAM(1)),
+                );
+            }
+        }
+        if let Some(old) = old_font {
+            let _ = DeleteObject(old.into());
+        }
+        let _ = MoveWindow(viewport, 0, 0, client.right, viewport_height, true);
+        let footer = crate::settings_ui::layout(client.right, client.bottom, dpi);
+        for (control, r) in [(save, footer.open), (cancel, footer.close)] {
+            if let Some(control) = control {
+                let _ = MoveWindow(control, r.x, r.y, r.width, r.height, true);
+            }
+        }
+        if let Some(error) = error {
+            let _ = MoveWindow(
+                error,
+                scale(18),
+                client.bottom - scale(102),
+                (client.right - scale(36)).max(1),
+                scale(50),
+                true,
+            );
+        }
+        scroll_form(ptr, scroll);
     }
 }
 unsafe extern "system" fn viewport_proc(
@@ -723,56 +837,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 WM_DPICHANGED => {
                     let dpi = (wp.0 & 0xffff) as u32;
-                    let (old_dpi, controls) = {
-                        let form = (*ptr).borrow();
-                        (form.dpi, form.controls.clone())
-                    };
-                    let new_font = theme::font(dpi);
-                    for control in controls {
-                        let mut rect = RECT::default();
-                        let _ = GetWindowRect(control, &mut rect);
-                        let mut points = [
-                            POINT {
-                                x: rect.left,
-                                y: rect.top,
-                            },
-                            POINT {
-                                x: rect.right,
-                                y: rect.bottom,
-                            },
-                        ];
-                        windows::Win32::Graphics::Gdi::MapWindowPoints(
-                            None,
-                            GetParent(control).ok(),
-                            &mut points,
-                        );
-                        let scale = |n: i32| n * dpi as i32 / old_dpi.max(1) as i32;
-                        let _ = MoveWindow(
-                            control,
-                            scale(points[0].x),
-                            scale(points[0].y),
-                            scale(points[1].x - points[0].x),
-                            scale(points[1].y - points[0].y),
-                            true,
-                        );
-                        SendMessageW(
-                            control,
-                            WM_SETFONT,
-                            Some(WPARAM(new_font.0 as usize)),
-                            Some(LPARAM(1)),
-                        );
-                    }
-                    let old_font = {
-                        let mut form = (*ptr).borrow_mut();
-                        form.dpi = dpi;
-                        form.content_height =
-                            form.content_height * dpi as i32 / old_dpi.max(1) as i32;
-                        form.scroll_y = form.scroll_y * dpi as i32 / old_dpi.max(1) as i32;
-                        std::mem::replace(&mut form.font, new_font)
-                    };
-                    if !old_font.is_invalid() {
-                        let _ = DeleteObject(old_font.into());
-                    }
                     let rect = &*(lp.0 as *const RECT);
                     let mut monitor = MONITORINFO {
                         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -794,96 +858,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         height,
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
-                    let (viewport, scroll, edits, all, save) = {
-                        let form = (*ptr).borrow();
-                        (
-                            form.viewport,
-                            form.scroll_y,
-                            form.edits.len(),
-                            form.controls.clone(),
-                            form.save_button,
-                        )
-                    };
-                    let scale = |n: i32| n * dpi as i32 / 96;
-                    let mut client = RECT::default();
-                    let _ = GetClientRect(hwnd, &mut client);
-                    let _ = MoveWindow(
-                        viewport,
-                        0,
-                        0,
-                        client.right,
-                        (client.bottom - scale(110)).max(1),
-                        true,
-                    );
-                    for control in all.iter().take(edits * 2) {
-                        let mut r = RECT::default();
-                        let _ = GetWindowRect(*control, &mut r);
-                        let mut points = [POINT {
-                            x: r.left,
-                            y: r.top,
-                        }];
-                        windows::Win32::Graphics::Gdi::MapWindowPoints(
-                            None,
-                            Some(viewport),
-                            &mut points,
-                        );
-                        let _ = MoveWindow(
-                            *control,
-                            points[0].x,
-                            points[0].y,
-                            (client.right - scale(48)).max(1),
-                            r.bottom - r.top,
-                            true,
-                        );
-                    }
-                    let error_result = (*ptr).borrow().error_result;
-                    if let Some(output) = error_result {
-                        let _ = MoveWindow(
-                            output,
-                            scale(18),
-                            client.bottom - scale(102),
-                            (client.right - scale(36)).max(1),
-                            scale(50),
-                            true,
-                        );
-                    }
-                    if let Some(save) = save {
-                        let _ = MoveWindow(
-                            save,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .open
-                                .x,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .open
-                                .y,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .open
-                                .width,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .open
-                                .height,
-                            true,
-                        );
-                    }
-                    if let Some(cancel) = all.last() {
-                        let _ = MoveWindow(
-                            *cancel,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .close
-                                .x,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .close
-                                .y,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .close
-                                .width,
-                            crate::settings_ui::layout(client.right, client.bottom, dpi)
-                                .close
-                                .height,
-                            true,
-                        );
-                    }
-                    scroll_form(ptr, scroll);
+                    relayout_form(ptr, hwnd, dpi);
                     return LRESULT(0);
                 }
                 WM_CLOSE => {
@@ -1294,6 +1269,37 @@ unsafe fn form_fields_with_test_theme(
         } else {
             ""
         };
+        use crate::settings_ui::{EditorField, EditorFieldKind, EditorSpec};
+        let layout_spec = EditorSpec {
+            fields: fields
+                .iter()
+                .map(|(label, field)| EditorField {
+                    label: (*label).into(),
+                    kind: match field {
+                        Field::Hidden(_) => EditorFieldKind::Hidden,
+                        Field::Multiline(_) => EditorFieldKind::Multiline,
+                        Field::Toggle(_) => EditorFieldKind::Switch("暂停剪贴板记录".into()),
+                        Field::Switch(_, text) => EditorFieldKind::Switch((*text).into()),
+                        Field::Text(_) | Field::Password(_) => EditorFieldKind::Line,
+                        _ => EditorFieldKind::Choice,
+                    },
+                })
+                .collect(),
+            note: matches!(
+                &validation,
+                Validation::Settings(_, crate::settings_ui::Action::Data)
+            )
+            .then(|| crate::settings_ui::RETENTION_NOTE.into()),
+            test_label: testing.then(|| {
+                if matches!(&test, Some(TestForm::Organizer { .. })) {
+                    "测试 Pi 运行时"
+                } else {
+                    "测试连接"
+                }
+                .into()
+            }),
+            models: model_listing,
+        };
         let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
             controls: Vec::new(),
@@ -1356,6 +1362,10 @@ unsafe fn form_fields_with_test_theme(
             viewport: HWND::default(),
             scroll_y: 0,
             content_height: 0,
+            layout_spec,
+            layout: None,
+            note: None,
+            cancel_button: None,
         }));
         let title = wide(title);
         let owner_dpi = windows::Win32::UI::HiDpi::GetDpiForWindow(owner).max(96);
@@ -1672,6 +1682,7 @@ unsafe fn form_fields_with_test_theme(
             .ok()?;
             SendMessageW(label, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
             state.borrow_mut().controls.push(label);
+            state.borrow_mut().note = Some(label);
         }
         if validating {
             let y = scale(field_y);
@@ -1833,9 +1844,15 @@ unsafe fn form_fields_with_test_theme(
             state.borrow_mut().controls.push(b);
             if id == 1 {
                 state.borrow_mut().save_button = Some(b);
+            } else {
+                state.borrow_mut().cancel_button = Some(b);
             }
         }
-        scroll_form(&*state, 0);
+        relayout_form(
+            &*state,
+            hwnd,
+            windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96),
+        );
         let _ = EnableWindow(owner, false);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let first_edit = state

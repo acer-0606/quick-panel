@@ -301,10 +301,6 @@ impl RenderState {
         n * self.dpi as i32 / 96
     }
 }
-enum OrganizerManagement {
-    Memory,
-    Review,
-}
 enum UiEffect {
     HarnessMemory {
         owner: HWND,
@@ -343,7 +339,6 @@ enum UiEffect {
     Settings {
         owner: HWND,
         group: crate::settings_ui::Group,
-        return_to: Option<OrganizerManagement>,
     },
     SmartPrompt {
         owner: HWND,
@@ -468,7 +463,7 @@ struct App {
     organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
     organizer_page_open: bool,
-    settings_management_return: bool,
+    settings_navigation: crate::settings_ui::Navigation,
     settings_notice: String,
     harness_memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
     runtime_health: Arc<std::sync::Mutex<String>>,
@@ -599,7 +594,7 @@ pub fn run() -> Result<(), String> {
             organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
             organizer_outbox: Rc::new(RefCell::new((None, None))),
             organizer_page_open: false,
-            settings_management_return: false,
+            settings_navigation: Default::default(),
             settings_notice: String::new(),
             harness_memory: Rc::new(RefCell::new(Default::default())),
             runtime_health: Arc::new(std::sync::Mutex::new("启动测试不调用模型".into())),
@@ -1014,6 +1009,8 @@ impl App {
         }
     }
     unsafe fn show_harness_memory(&mut self) {
+        self.settings_navigation
+            .open(crate::settings_ui::Page::Memory);
         self.memory_snapshot();
         self.effects.push_back(UiEffect::HarnessMemory {
             owner: self.hwnd,
@@ -1029,6 +1026,8 @@ impl App {
         if self.organizer_page_open {
             return;
         }
+        self.settings_navigation
+            .open(crate::settings_ui::Page::Review);
         self.organizer_page_open = true;
         self.organizer_review.borrow_mut().open();
         self.organizer_snapshot();
@@ -1422,6 +1421,9 @@ impl App {
         revoked
     }
     unsafe fn restore_after_modal(&mut self, revoked: bool) {
+        if !self.settings_navigation.allows_panel_query() {
+            return;
+        }
         let text = dialogs::text(self.edit);
         if let Some(query) = finish_semantic_effect_with_revoke(
             &mut self.semantic_query,
@@ -2101,7 +2103,9 @@ impl App {
         let _ = ShowWindow(self.hwnd, SW_HIDE);
     }
     unsafe fn search(&mut self) {
-        if self.state.lifecycle != Lifecycle::Running {
+        if self.state.lifecycle != Lifecycle::Running
+            || !self.settings_navigation.allows_panel_query()
+        {
             return;
         }
         self.organizer_preserve_order = false;
@@ -2590,7 +2594,10 @@ impl App {
                 Event::PathActivityChanged => {
                     self.organizer_progress.mark_dirty();
                     self.request_organizer_progress();
-                    if self.state.visible && self.state.lifecycle == Lifecycle::Running {
+                    if self.state.visible
+                        && self.state.lifecycle == Lifecycle::Running
+                        && self.settings_navigation.allows_panel_query()
+                    {
                         self.search();
                     }
                 }
@@ -2762,7 +2769,7 @@ impl App {
                     self.request_organizer_progress();
                     self.semantic_status.mark_dirty();
                     self.update_index_label();
-                    if self.state.visible {
+                    if self.state.visible && self.settings_navigation.allows_panel_query() {
                         self.refresh_semantic_status();
                         self.search();
                     }
@@ -2770,7 +2777,7 @@ impl App {
                 Event::Saved(stats) => {
                     if stats.semantic_status_changed {
                         self.semantic_status.mark_dirty();
-                        if self.state.visible {
+                        if self.state.visible && self.settings_navigation.allows_panel_query() {
                             self.refresh_semantic_status();
                         }
                     }
@@ -3242,27 +3249,35 @@ impl App {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        let exclusions = crate::path_observer::parse_exclusions(&values[2])?;
-        let next = crate::path_activity::PathActivitySettings {
-            enabled: values[0] == "1",
-            recent_documents: values[1] == "1",
-            excluded_paths: exclusions,
-        };
-        let changed = self.settings.path_activity != next;
-        self.settings.path_activity = next;
+        let submission =
+            crate::settings_ui::submit_paths(&self.settings, &values).map_err(|e| e.message)?;
+        self.settings.path_activity = submission.next;
         self.update_path_monitor();
-        if changed {
-            self.send(Command::SaveSettings(self.settings.clone()));
-        }
-        if values[3] == "1" {
+        if submission.clear {
             if let Some(monitor) = &mut self.path_monitor {
                 monitor.clear();
             }
             self.suggested_items.clear();
-            self.send(Command::ClearPathActivity);
         }
-        self.search();
+        for command in submission.commands {
+            self.send(command);
+        }
         Ok(())
+    }
+    unsafe fn resume_settings_navigation(&mut self) {
+        if self.state.lifecycle != Lifecycle::Running {
+            self.settings_navigation.clear();
+            return;
+        }
+        match self.settings_navigation.current() {
+            Some(crate::settings_ui::Page::Hub(group)) => self.settings_group(group),
+            Some(crate::settings_ui::Page::Memory) => self.show_harness_memory(),
+            Some(crate::settings_ui::Page::Review) => self.review_organizer(),
+            None => {
+                self.cancel_semantic();
+                self.restore_after_modal(true);
+            }
+        }
     }
     unsafe fn settings(&mut self) {
         self.settings_group(crate::settings_ui::entry_group(
@@ -3270,10 +3285,11 @@ impl App {
         ));
     }
     unsafe fn settings_group(&mut self, group: crate::settings_ui::Group) {
+        self.settings_navigation
+            .open(crate::settings_ui::Page::Hub(group));
         self.effects.push_back(UiEffect::Settings {
             owner: self.hwnd,
             group,
-            return_to: None,
         });
     }
     unsafe fn begin_screenshot(&mut self) {
@@ -4559,13 +4575,11 @@ impl Host {
                     app.state.modal_open = false;
                     if settings_requested {
                         app.organizer_settings();
-                        if let Some(UiEffect::Settings { return_to, .. }) = app.effects.back_mut() {
-                            *return_to = Some(OrganizerManagement::Memory);
-                        }
-                    } else if app.settings_management_return {
-                        app.settings_management_return = false;
-                        app.settings_group(crate::settings_ui::Group::Organizer);
+                    } else {
+                        app.settings_navigation.close();
+                        app.resume_settings_navigation();
                     }
+                    semantic_revoked = false;
                 }
                 UiEffect::OrganizerReview {
                     owner,
@@ -4611,13 +4625,11 @@ impl Host {
                     app.organizer_page_open = false;
                     if settings_requested {
                         app.organizer_settings();
-                        if let Some(UiEffect::Settings { return_to, .. }) = app.effects.back_mut() {
-                            *return_to = Some(OrganizerManagement::Review);
-                        }
-                    } else if app.settings_management_return {
-                        app.settings_management_return = false;
-                        app.settings_group(crate::settings_ui::Group::Organizer);
+                    } else {
+                        app.settings_navigation.close();
+                        app.resume_settings_navigation();
                     }
+                    semantic_revoked = false;
                 }
                 UiEffect::ScreenshotSelect {
                     owner,
@@ -4760,17 +4772,14 @@ impl Host {
                         app.apply_favorite(item, kind, values);
                     }
                 }
-                UiEffect::Settings {
-                    owner,
-                    group,
-                    return_to,
-                } => {
+                UiEffect::Settings { owner, group } => {
                     let management =
                         super::settings_ui::show(owner, group, |hub, group, action| {
                             if let Some(action) = action {
                                 self.settings_editor(hub, action);
                             }
-                            let app = self.app.borrow();
+                            let mut app = self.app.borrow_mut();
+                            app.settings_navigation.select_group(group);
                             let profile = app.smart_view().profile;
                             let index = app
                                 .semantic_index
@@ -4790,34 +4799,22 @@ impl Host {
                                 appearance: app.settings.theme,
                                 detail,
                                 alive: app.state.lifecycle == Lifecycle::Running,
-                                close_label: match &return_to {
-                                    Some(OrganizerManagement::Memory) => "返回记忆",
-                                    Some(OrganizerManagement::Review) => "返回建议",
-                                    None => "关闭设置",
-                                },
+                                close_label: app.settings_navigation.back_label(),
                             }
                         });
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    // Restore existing ordinary query only after the whole hub exits.
-                    // Group/leaf navigation never calls this gate or SemanticStatus.
-                    app.cancel_semantic();
-                    app.restore_after_modal(true);
                     if app.state.lifecycle == Lifecycle::Running {
-                        if let Some(action) = management {
-                            app.settings_management_return = true;
-                            match action {
-                                crate::settings_ui::Action::Review => app.review_organizer(),
-                                crate::settings_ui::Action::Memory => app.show_harness_memory(),
-                                _ => (),
-                            }
-                        } else {
-                            match return_to {
-                                Some(OrganizerManagement::Memory) => app.show_harness_memory(),
-                                Some(OrganizerManagement::Review) => app.review_organizer(),
-                                None => (),
+                        match management {
+                            Some(crate::settings_ui::Action::Review) => app.review_organizer(),
+                            Some(crate::settings_ui::Action::Memory) => app.show_harness_memory(),
+                            _ => {
+                                app.settings_navigation.close();
+                                app.resume_settings_navigation();
                             }
                         }
+                    } else {
+                        app.settings_navigation.clear();
                     }
                     semantic_revoked = false;
                 }

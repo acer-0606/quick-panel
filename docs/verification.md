@@ -8,7 +8,17 @@
 - 原生中心在窄屏使用顶部六组选项，详情可键盘滚动，打开/返回动作固定；生产 geometry 在 96/144/192 DPI 和 360×480、800×600 客户区验证可达。叶子固定动作复用相同几何，长标签换行，连接状态可滚动阅读。
 - 设置提交只说明“更改已接收”，不把不关联的旧 Saved 当作本次落盘。后台错误在中心显示；正常退出的保存失败重试合同保持。
 
-## 本轮最终证据
+## Task 4 gate 修复 round 1
+
+本轮修复路径叶子及其异步保存/清理通知提前发起面板检索、跨管理页丢失原设置来源，以及宽96DPI→窄192DPI叶子说明裁切三项。路径提交命令策略只返回实际 SaveSettings / 明确 ClearPathActivity；导航栈同时保存各层分组与记忆/建议来源，后台 Changed / PathActivityChanged / Saved 经同一门禁延迟面板检索。已启动索引的终态刷新许可不扩张也不移除。
+
+原生创建与 WM_DPICHANGED 共用 EditorSpec 客户区布局，所有字段/checkbox/保留说明/测试状态重新计算宽高与纵向位置；滚动用完整内容坐标定位，保留原 Edit、raw、IME 和焦点，并按新范围约束滚动。宽→窄及焦点/末尾说明回归消费同一生产策略。Windows 实际 GUI 验证仍为0。
+
+修后完整共享测试 `cargo test --locked -- --test-threads=1`：**499 passed / 0 failed / 2 既有 ignored，40 summaries，exit0，无 warning**（151.591s）。集中回归81项及真实actor通知回归1项通过。全套后仅补Win-only初始化期间DPI重排守卫，最终Windows检查/Release覆盖；共享策略与测试未再变化。下方493项和旧产物为 gate 前历史证据。
+
+修后最终host/Windows all-targets strict Clippy/check、fmt/diff均exit0。Windows Release exit0（44.466s）；共享Release core-check exit0（34.494s），内存可见、保存前磁盘为空、退出恢复三项true。所有Cargo串行、固定环境和本机Node路径不变。fresh ZIP采用本轮最终源码/文档及原已核验Node/bundle，准确字节/SHA/CRC和成员以外置manifest/SHA256SUMS及修后实施报告为准。
+
+## Gate 前验证证据（历史）
 
 最终共享全套 `cargo test --locked -- --test-threads=1`：**493 passed / 0 failed / 2 既有 ignored，40 个 suite summaries，exit0**。全套后仅缩短三个 Windows 原生按钮标签，未更改共享行为；最终 Windows 检查与 Release 覆盖这些标签。完整逐 suite 结果见本轮 Task 4 实施报告及保留的验证日志。Windows GUI、中文 IME、多屏 DPI、WinHTTP/DPAPI/通知实际执行数 **0**；macOS 共享/合成进程测试和 Windows 交叉编译不能替代实机视觉验收。未使用真实 API、用户密钥、数据库、剪贴板或屏幕。
 

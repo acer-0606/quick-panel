@@ -276,3 +276,235 @@ pub fn layout(width: i32, height: i32, dpi: u32) -> Layout {
         },
     }
 }
+
+/// Entire path submission command policy, also consumed by the native leaf.
+pub struct PathSubmission {
+    pub next: crate::path_activity::PathActivitySettings,
+    pub clear: bool,
+    pub commands: Vec<crate::model::Command>,
+}
+pub fn submit_paths(current: &Settings, values: &[String]) -> Result<PathSubmission, FormError> {
+    count(values, 4)?;
+    let next = crate::path_activity::PathActivitySettings {
+        enabled: values[0] == "1",
+        recent_documents: values[1] == "1",
+        excluded_paths: crate::path_observer::parse_exclusions(&values[2])
+            .map_err(|e| FormError::new(2, e))?,
+    };
+    let clear = values[3] == "1";
+    let mut commands = Vec::new();
+    if next != current.path_activity {
+        let mut settings = current.clone();
+        settings.path_activity = next.clone();
+        commands.push(crate::model::Command::SaveSettings(settings));
+    }
+    if clear {
+        commands.push(crate::model::Command::ClearPathActivity);
+    }
+    Ok(PathSubmission {
+        next,
+        clear,
+        commands,
+    })
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Page {
+    Hub(Group),
+    Memory,
+    Review,
+}
+/// A navigation frame carries its selected group and the entire source chain.
+#[derive(Default)]
+pub struct Navigation {
+    frames: Vec<Page>,
+}
+impl Navigation {
+    pub fn clear(&mut self) {
+        self.frames.clear();
+    }
+    pub fn allows_panel_query(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub fn current(&self) -> Option<Page> {
+        self.frames.last().copied()
+    }
+    pub fn open(&mut self, page: Page) {
+        if self.current() == Some(page) {
+            return;
+        }
+        self.frames.push(page);
+    }
+    pub fn select_group(&mut self, group: Group) {
+        if let Some(Page::Hub(selected)) = self.frames.last_mut() {
+            *selected = group;
+        }
+    }
+    pub fn close(&mut self) -> Option<Page> {
+        self.frames.pop();
+        self.current()
+    }
+    pub fn back_label(&self) -> &'static str {
+        match self.frames.iter().rev().nth(1) {
+            Some(Page::Memory) => "返回记忆",
+            Some(Page::Review) => "返回建议",
+            Some(Page::Hub(_)) => "返回设置",
+            None => "关闭设置",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum EditorFieldKind {
+    Hidden,
+    Line,
+    Multiline,
+    Choice,
+    Switch(String),
+}
+#[derive(Clone, Debug)]
+pub struct EditorField {
+    pub label: String,
+    pub kind: EditorFieldKind,
+}
+#[derive(Clone, Debug)]
+pub struct EditorSpec {
+    pub fields: Vec<EditorField>,
+    pub note: Option<String>,
+    pub test_label: Option<String>,
+    pub models: bool,
+}
+#[derive(Clone, Debug)]
+pub struct EditorFieldLayout {
+    pub label: Rect,
+    pub control: Rect,
+    pub hidden: bool,
+    pub dropdown: bool,
+}
+#[derive(Clone, Debug)]
+pub struct EditorLayout {
+    pub fields: Vec<EditorFieldLayout>,
+    pub note: Option<Rect>,
+    pub test_button: Option<Rect>,
+    pub model_button: Option<Rect>,
+    pub test_result: Option<Rect>,
+    pub content_height: i32,
+}
+/// Conservative native Segoe UI 15px wrapping, in physical client coordinates.
+pub fn wrapped_height(text: &str, width: i32, dpi: u32) -> i32 {
+    let s = |v: i32| v * dpi.max(96) as i32 / 96;
+    ((text.chars().count() as i32 * s(15) + width.max(1) - 1) / width.max(1)).max(1) * s(22)
+}
+impl EditorSpec {
+    pub fn layout(&self, width: i32, dpi: u32) -> EditorLayout {
+        let s = |v: i32| v * dpi.max(96) as i32 / 96;
+        let x = s(18);
+        let w = (width - s(48)).max(1);
+        let mut y = s(12);
+        let mut fields = Vec::new();
+        for field in &self.fields {
+            let hidden = matches!(field.kind, EditorFieldKind::Hidden);
+            let label_height = wrapped_height(&field.label, w, dpi);
+            let control_height = match &field.kind {
+                EditorFieldKind::Multiline => s(120),
+                EditorFieldKind::Switch(text) => {
+                    wrapped_height(text, (w - s(24)).max(1), dpi).max(s(28))
+                }
+                _ => s(28),
+            };
+            fields.push(EditorFieldLayout {
+                label: Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: label_height,
+                },
+                control: Rect {
+                    x,
+                    y: y + label_height + s(4),
+                    width: w,
+                    height: control_height,
+                },
+                hidden,
+                dropdown: matches!(field.kind, EditorFieldKind::Choice),
+            });
+            if !hidden {
+                y += label_height + control_height + s(12);
+            }
+        }
+        let note = self.note.as_ref().map(|text| {
+            let r = Rect {
+                x,
+                y,
+                width: w,
+                height: wrapped_height(text, w, dpi),
+            };
+            y += r.height + s(12);
+            r
+        });
+        let mut test_button = None;
+        let mut model_button = None;
+        let mut test_result = None;
+        if let Some(label) = &self.test_label {
+            let bw = if self.models { (w - s(8)) / 2 } else { w };
+            let bh = wrapped_height(label, bw, dpi).max(s(32));
+            test_button = Some(Rect {
+                x,
+                y,
+                width: bw,
+                height: bh,
+            });
+            if self.models {
+                model_button = Some(Rect {
+                    x: x + bw + s(8),
+                    y,
+                    width: bw,
+                    height: bh,
+                });
+            }
+            y += bh + s(8);
+            test_result = Some(Rect {
+                x,
+                y,
+                width: w,
+                height: s(128),
+            });
+            y += s(140);
+        }
+        EditorLayout {
+            fields,
+            note,
+            test_button,
+            model_button,
+            test_result,
+            content_height: y + s(12),
+        }
+    }
+}
+
+impl EditorLayout {
+    /// Preserve scaled scroll, clamp to new extent, and reveal the focused Edit.
+    pub fn scroll_after_reflow(
+        &self,
+        scroll: i32,
+        old_dpi: u32,
+        dpi: u32,
+        viewport_height: i32,
+        focus: Option<usize>,
+    ) -> i32 {
+        let mut result = crate::organizer_ui::clamp_scroll(
+            scroll.saturating_mul(dpi as i32) / old_dpi.max(1) as i32,
+            self.content_height,
+            viewport_height,
+        );
+        if let Some(field) = focus.and_then(|i| self.fields.get(i)).filter(|f| !f.hidden) {
+            let r = field.control;
+            if r.y < result {
+                result = r.y;
+            } else if r.y + r.height > result + viewport_height {
+                result = (r.y + r.height - viewport_height).max(0);
+            }
+        }
+        crate::organizer_ui::clamp_scroll(result, self.content_height, viewport_height)
+    }
+}

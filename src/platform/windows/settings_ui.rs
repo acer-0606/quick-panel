@@ -414,6 +414,8 @@ pub unsafe fn show(
                 })
                 .flatten();
             if selected.is_some_and(|a| matches!(a, Action::Review | Action::Memory)) {
+                // Commit the current group to the RAM navigation frame before suspension.
+                let _ = update(hwnd, group, None);
                 result = selected;
                 break;
             }
