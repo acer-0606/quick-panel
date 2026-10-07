@@ -108,7 +108,7 @@ assert_eq!(preflight.finish(&view, true, None), Some(SmartAction::Claude));
 
 **Files:** 新增 `src/settings_ui.rs`（共享分组/可见状态/保留解析/布局策略）、`src/platform/windows/settings_ui.rs`（原生设置中心）；修改 `src/lib.rs`、`src/platform/windows/mod.rs`、`ui.rs`、`dialogs.rs`、`src/palette.rs`、必要`src/model.rs`（只保留已有存储字段）；测试 `tests/settings_ui.rs`、`palette.rs`、`hotkeys.rs`、`persistence.rs`、`form_validation.rs`及受接口影响fixtures；更新README/docs验证。打包只使用现有scripts，不改协议或供应链。
 
-**Interfaces:** 消费前三任务复审后的表单校验/状态/设置跳转API，root提供最新context报告。保留Settings已有retention_days/max_history/三个热键/AI/Embedding/organizer字段和serde兼容。设置入口改变为统一原生hub，叶子表单可复用；必须让当前返回路径保持分组上下文，App消息/回执继续泵送，无阻塞join/重复注册。
+**Interfaces:** 消费前三任务复审后的表单校验/状态/设置跳转API，root提供最新context报告。保留Settings已有retention_days/max_history/三个热键/AI/Embedding/organizer字段和serde兼容。设置入口改变为统一原生hub，叶子保存/取消留在当前组；return_to由整个hub持有，hub返回/关闭才恢复来源管理页及精确草稿。整个hub关闭可按既有合同恢复必要普通Search；切组和leaf返回不扫描。App消息/回执继续泵送，无阻塞join/重复注册。
 
 **Requirements:** 完成UX07/22并集成所有22项。主按钮、托盘、搜索“设置”目标一致；6组严格按spec，设置列表不混区域截图等立即操作。全部三组快捷键同组，数据页包含暂停/排除/保留，智能查找同组包含功能启用/首选/索引范围与状态，服务连接清楚是Claude共用连接和独立Embedding。已有管理入口显示停用，配置入口保留；双智能关闭按钮表示启用/配置。高级管家调度参数集中高级入口，核心模式/范围与开关易见。不能出现两个页面有互相覆盖的重复开关或旧叶子提交覆盖别组新配置。
 
