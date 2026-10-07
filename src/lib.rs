@@ -9,6 +9,7 @@ pub mod connection_test;
 pub mod embedding;
 pub mod embedding_jobs;
 pub mod engine;
+pub mod form_validation;
 mod harness_store;
 pub mod harness_tools;
 pub mod harness_worker;

@@ -8,7 +8,7 @@ use super::{
     screenshot, theme,
 };
 use crate::{
-    ai::{AiPlan, AiSettings, AuthMethod},
+    ai::{AiPlan, AiSettings},
     ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
     background_job::{ActionLoads, ActionPermit, ActionTicket, BackgroundWorker},
     embedding_jobs::{EmbeddingRequest, EmbeddingWorker},
@@ -19,7 +19,7 @@ use crate::{
     preview::{PreviewLoads, bounded_text},
     query_feedback::{IndexReply, QueryReply, claude_reply, embedding_reply, index_reply},
     screenshot::{ScreenshotGate, ScreenshotTicket},
-    semantic::{self, EmbeddingSettings, IndexScope},
+    semantic::{self, EmbeddingSettings},
     semantic_ui::{
         IndexSession, QuerySession, finish_semantic_effect_with_revoke, prepare_semantic_effect,
         sync_semantic_view,
@@ -1629,40 +1629,18 @@ impl App {
             settings: self.settings.embedding.clone(),
         });
     }
-    unsafe fn apply_embedding_settings(&mut self, mut values: Vec<String>) -> Result<(), String> {
-        let password = ai_client::SecretString(std::mem::take(&mut values[3]));
+    unsafe fn apply_embedding_settings(&mut self, values: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        let mut next = self.settings.embedding.clone();
-        next.enabled = values[0] == "1";
-        next.endpoint = values[1].trim().into();
-        next.model = values[2].trim().into();
-        next.index_scope = if values[5] == "1" {
-            IndexScope::AllText
-        } else {
-            IndexScope::PinnedAndFavorites
-        };
-        if values[4] == "1" {
-            if !password.0.is_empty() {
-                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
-            }
-            next.encrypted_key.clear();
-            next.enabled = false;
-        } else if !password.0.is_empty() {
-            if password.0.len() > 4096 || !password.0.bytes().all(|byte| (33..=126).contains(&byte))
-            {
-                return Err("Embedding API Key 格式无效，配置未保存".into());
-            }
-            next.encrypted_key = ai_client::protect_key(&password.0)?;
+        let mut next =
+            crate::form_validation::parse_embedding_fields(&self.settings.embedding, values)
+                .map_err(|e| e.message)?;
+        if !values[3].is_empty() {
+            next.encrypted_key = ai_client::protect_key(&values[3])?;
         }
         if next.enabled {
-            ai_client::validate_embedding_settings(&next)
-                .map_err(|message| format!("{message}，语义配置未保存"))?;
-        } else if !next.endpoint.is_empty()
-            && crate::embedding::parse_endpoint(&next.endpoint).is_err()
-        {
-            return Err("Embedding API 地址无效，配置未保存".into());
+            ai_client::validate_embedding_settings(&next)?;
         }
         self.cancel_semantic();
         self.cancel_index();
@@ -3267,7 +3245,7 @@ impl App {
             settings: self.settings.clone(),
         });
     }
-    unsafe fn apply_screenshot_settings(&mut self, values: Vec<String>) -> Result<(), String> {
+    unsafe fn apply_screenshot_settings(&mut self, values: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
@@ -3317,44 +3295,16 @@ impl App {
             settings: self.settings.ai.clone(),
         });
     }
-    unsafe fn apply_ai_settings(&mut self, mut values: Vec<String>) -> Result<(), String> {
-        let parsed = crate::organizer_ui::parse_ai_fields(&self.settings.ai, &values);
-        let password = ai_client::SecretString(std::mem::take(&mut values[4]));
+    unsafe fn apply_ai_settings(&mut self, values: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
             return Ok(());
         }
-        let mut next = parsed?;
-        next.enabled = values[0] == "1";
-        next.endpoint = values[1].trim().into();
-        next.model = values[2].trim().into();
-        next.auth = if values[3] == "1" {
-            AuthMethod::Bearer
-        } else {
-            AuthMethod::ApiKey
-        };
-        if values[5] == "1" {
-            if !password.0.is_empty() {
-                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
-            }
-            next.encrypted_key.clear();
-            next.enabled = false;
-        } else if !password.0.is_empty() {
-            if password.0.len() > 4096 || !password.0.bytes().all(|byte| (33..=126).contains(&byte))
-            {
-                return Err("API Key 格式无效".into());
-            }
-            match ai_client::protect_key(&password.0) {
-                Ok(cipher) => next.encrypted_key = cipher,
-                Err(message) => return Err(message),
-            }
+        let mut next = crate::organizer_ui::validate_ai_form(&self.settings.ai, values, &[])?;
+        if !values[4].is_empty() {
+            next.encrypted_key = ai_client::protect_key(&values[4])?;
         }
         if next.enabled {
-            ai_client::validate_settings(&next)
-                .map_err(|message| format!("{message}，AI 配置未保存"))?;
-        } else if !next.endpoint.is_empty()
-            && crate::claude::parse_endpoint(&next.endpoint).is_err()
-        {
-            return Err("API 地址无效，配置未保存".into());
+            ai_client::validate_settings(&next)?;
         }
         self.cancel_ai();
         self.cancel_preflight();
@@ -3367,9 +3317,9 @@ impl App {
         self.retheme();
         Ok(())
     }
-    unsafe fn apply_settings(&mut self, v: Vec<String>) {
+    unsafe fn apply_settings(&mut self, v: &[String]) -> Result<(), String> {
         if self.state.lifecycle != Lifecycle::Running {
-            return;
+            return Ok(());
         }
 
         let mut settings = self.settings.clone();
@@ -3380,13 +3330,7 @@ impl App {
         };
         let keys = parse_hotkey(&v[1])
             .and_then(|main| parse_hotkey(&v[2]).map(|clipboard| (main, clipboard)));
-        let ((m, k), (cm, ck)) = match keys {
-            Ok(keys) => keys,
-            Err(message) => {
-                self.status(&message);
-                return;
-            }
-        };
+        let ((m, k), (cm, ck)) = keys?;
         settings.hotkey_modifiers = m;
         settings.hotkey_key = k;
         settings.clipboard_hotkey_modifiers = cm;
@@ -3403,18 +3347,13 @@ impl App {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
-        if let Err(message) = self.replace_hotkeys(&settings) {
-            self.effects.push_back(UiEffect::Message {
-                owner: self.hwnd,
-                message,
-            });
-            return;
-        }
+        self.replace_hotkeys(&settings)?;
         self.cancel_preflight();
         self.settings = settings.clone();
         self.retheme();
         self.tray(NIM_MODIFY);
         self.send(Command::SaveSettings(settings));
+        Ok(())
     }
     unsafe fn context(&mut self, x: i32, y: i32, tray: bool, add: bool) {
         let entries: Vec<(usize, &str)> = if tray {
@@ -4630,23 +4569,24 @@ impl Host {
                     }
                 }
                 UiEffect::ScreenshotSettings { owner, settings } => {
-                    let result = dialogs::screenshot_settings_form(
+                    dialogs::screenshot_settings_form(
                         owner,
                         format_hotkey(
                             settings.screenshot_hotkey_modifiers,
                             settings.screenshot_hotkey_key,
                         ),
                         settings.theme,
+                        Some(&mut |values| {
+                            self.app
+                                .borrow_mut()
+                                .apply_screenshot_settings(values)
+                                .map_err(|e| crate::form_validation::FormError::new(0, e))
+                        }),
                     );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    let error =
-                        result.and_then(|values| app.apply_screenshot_settings(values).err());
                     app.restore_after_modal(true);
                     semantic_revoked = false;
-                    if let Some(message) = error {
-                        app.effects.push_back(UiEffect::Message { owner, message });
-                    }
                 }
                 UiEffect::Picker {
                     owner,
@@ -4669,7 +4609,7 @@ impl Host {
                     fields,
                 } => {
                     let appearance = self.app.borrow().settings.theme;
-                    let result = dialogs::form(owner, "编辑收藏", &fields, appearance);
+                    let result = dialogs::favorite_form(owner, &fields, appearance);
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     if let Some(values) = result {
@@ -4677,7 +4617,7 @@ impl Host {
                     }
                 }
                 UiEffect::Settings { owner, settings } => {
-                    let result = dialogs::settings_form(
+                    dialogs::settings_form(
                         owner,
                         match settings.theme {
                             Theme::System => 0,
@@ -4692,12 +4632,15 @@ impl Host {
                         settings.capture_paused,
                         settings.excluded_apps.join(", "),
                         settings.smart_search,
+                        Some(&mut |values| {
+                            self.app
+                                .borrow_mut()
+                                .apply_settings(values)
+                                .map_err(|e| crate::form_validation::FormError::new(1, e))
+                        }),
                     );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    if let Some(values) = result {
-                        app.apply_settings(values);
-                    }
                     // Cancel and both validation/registration early returns also reload.
                     app.restore_after_modal(true);
                     semantic_revoked = false;
@@ -4716,32 +4659,41 @@ impl Host {
                 }
                 UiEffect::AiSettings { owner, settings } => {
                     let appearance = self.app.borrow().settings.theme;
-                    let result = dialogs::ai_settings_form(owner, &settings, appearance);
+                    dialogs::ai_settings_form(
+                        owner,
+                        &settings,
+                        appearance,
+                        Some(&mut |values| {
+                            self.app
+                                .borrow_mut()
+                                .apply_ai_settings(values)
+                                .map_err(|e| crate::form_validation::FormError::new(4, e))
+                        }),
+                    );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    let error = result.and_then(|values| app.apply_ai_settings(values).err());
-                    // Opening this form revoked its adopted plan. Cancel and validation
-                    // failure also need a fresh ordinary query rather than derived rows.
                     app.refresh_semantic_status();
                     app.search();
                     semantic_revoked = false;
-                    if let Some(message) = error {
-                        app.effects.push_back(UiEffect::Message { owner, message });
-                    }
                 }
                 UiEffect::EmbeddingSettings { owner, settings } => {
                     let appearance = self.app.borrow().settings.theme;
-                    let result = dialogs::embedding_settings_form(owner, &settings, appearance);
+                    dialogs::embedding_settings_form(
+                        owner,
+                        &settings,
+                        appearance,
+                        Some(&mut |values| {
+                            self.app
+                                .borrow_mut()
+                                .apply_embedding_settings(values)
+                                .map_err(|e| crate::form_validation::FormError::new(3, e))
+                        }),
+                    );
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
-                    let error =
-                        result.and_then(|values| app.apply_embedding_settings(values).err());
                     app.refresh_semantic_status();
                     app.search();
                     semantic_revoked = false;
-                    if let Some(message) = error {
-                        app.effects.push_back(UiEffect::Message { owner, message });
-                    }
                 }
                 UiEffect::SmartPrompt { owner, preferred } => {
                     let appearance = self.app.borrow().settings.theme;

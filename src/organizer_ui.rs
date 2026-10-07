@@ -147,6 +147,20 @@ pub fn parse_ai_fields(saved: &AiSettings, values: &[String]) -> Result<AiSettin
     }
     Ok(next)
 }
+/// Local save validation shared by the native AI form.
+pub fn validate_ai_form(
+    saved: &AiSettings,
+    values: &[String],
+    models: &[ModelInfo],
+) -> Result<AiSettings, String> {
+    let next = parse_ai_fields(saved, values)?;
+    if next.enabled
+        && let Some(error) = effort_warning(models, &next.model, next.effort)
+    {
+        return Err(error);
+    }
+    Ok(next)
+}
 pub fn effort_warning(models: &[ModelInfo], model: &str, effort: Effort) -> Option<String> {
     models.iter().find(|m| m.id == model).and_then(|m| {
         (m.supports_effort(effort) == Some(false))

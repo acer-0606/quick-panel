@@ -1,6 +1,7 @@
 //! Small native dialogs keep every editable field in a real Win32 Edit control.
 use super::{ai_client, theme};
 use crate::connection_test::{ConnectionTestGate, ConnectionTestWorker};
+use crate::form_validation::{FormError, FormStatus, Submission, Validation};
 use crate::model::{ItemSummary, SmartSearchMode, Theme};
 use std::{cell::RefCell, sync::Arc};
 use windows::{
@@ -14,6 +15,10 @@ use windows::{
     },
     core::{PCWSTR, w},
 };
+/// Called before teardown, with no Form borrow held. Errors retain the native draft.
+/// Successful callback callers must not apply the returned values again; password slots
+/// in that acknowledgement are blank, while a callback-free form retains the legacy result.
+type Submit<'a> = Option<&'a mut dyn FnMut(&[String]) -> Result<(), FormError>>;
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -69,12 +74,14 @@ pub unsafe fn path_settings_form(
                     Field::Multiline(settings.excluded_paths.join("\r\n")),
                 ),
                 (
-                    "统计清空后，后续的新访问可重新记录",
-                    Field::Switch(false, "保存时清空常用路径统计"),
+                    "清空后，后续的新访问可重新记录并推荐",
+                    Field::Switch(false, "清空访问统计及不再推荐名单"),
                 ),
             ],
             None,
             appearance,
+            Validation::Paths,
+            None,
         )
     }
 }
@@ -83,6 +90,7 @@ pub unsafe fn screenshot_settings_form(
     owner: HWND,
     hotkey: String,
     appearance: Theme,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         form_fields_with_test_theme(
@@ -91,6 +99,8 @@ pub unsafe fn screenshot_settings_form(
             &[("区域截图快捷键（默认关闭；留空关闭）", Field::Text(hotkey))],
             None,
             appearance,
+            Validation::Screenshot,
+            submit,
         )
     }
 }
@@ -129,9 +139,14 @@ struct Form {
     done: bool,
     accepted: bool,
     test: Option<TestForm>,
+    validation: Validation,
+    status: FormStatus,
+    labels: Vec<String>,
+    health_requested: bool,
     test_gate: ConnectionTestGate,
     test_button: Option<HWND>,
     test_result: Option<HWND>,
+    error_result: Option<HWND>,
     save_button: Option<HWND>,
     model_button: Option<HWND>,
     models: Vec<crate::ai_models::ModelInfo>,
@@ -306,13 +321,115 @@ thread_local! {
     );
 }
 
-unsafe fn test_status(ptr: *const RefCell<Form>, message: &str) {
-    let output = unsafe { (*ptr).borrow().test_result };
+unsafe fn render_status(ptr: *const RefCell<Form>) {
+    let (output, message, error_output, error) = unsafe {
+        let form = (*ptr).borrow();
+        (
+            form.test_result,
+            form.status.text(),
+            form.error_result,
+            form.status
+                .error
+                .as_ref()
+                .map(|e| format!("未保存：{}", e.message))
+                .unwrap_or_default(),
+        )
+    };
+    if let Some(output) = error_output {
+        let error = wide(&error);
+        unsafe {
+            let _ = SetWindowTextW(output, PCWSTR(error.as_ptr()));
+        }
+    }
     if let Some(output) = output {
-        let message = wide(message);
+        let message = wide(&message);
         unsafe {
             let _ = SetWindowTextW(output, PCWSTR(message.as_ptr()));
         }
+    }
+}
+unsafe fn test_status(ptr: *const RefCell<Form>, message: &str) {
+    unsafe {
+        (*ptr)
+            .borrow_mut()
+            .status
+            .runtime_health(message.to_owned());
+        render_status(ptr);
+    }
+}
+unsafe fn form_error(ptr: *const RefCell<Form>, mut error: FormError) {
+    let edit = unsafe {
+        let mut form = (*ptr).borrow_mut();
+        if let Some(label) = form.labels.get(error.field) {
+            error.message = format!("{label}：{}", error.message);
+        }
+        let edit = form.edits.get(error.field).copied();
+        form.status.error = Some(error);
+        edit
+    };
+    unsafe {
+        render_status(ptr);
+        if let Some(edit) = edit {
+            // Checkboxes need not send BN_SETFOCUS; reveal the field explicitly too.
+            let (viewport, old) = {
+                let form = (*ptr).borrow();
+                (form.viewport, form.scroll_y)
+            };
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(edit, &mut rect);
+            let mut top = [POINT {
+                x: rect.left,
+                y: rect.top,
+            }];
+            windows::Win32::Graphics::Gdi::MapWindowPoints(None, Some(viewport), &mut top);
+            let label_height = 24 * (*ptr).borrow().dpi as i32 / 96;
+            scroll_form(ptr, old + top[0].y - label_height);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(edit));
+        }
+    }
+}
+struct FormValues {
+    values: Vec<String>,
+    passwords: Vec<usize>,
+}
+impl Drop for FormValues {
+    fn drop(&mut self) {
+        for &index in &self.passwords {
+            if let Some(value) = self.values.get_mut(index) {
+                drop(ai_client::SecretString(std::mem::take(value)));
+            }
+        }
+    }
+}
+unsafe fn read_values(ptr: *const RefCell<Form>) -> FormValues {
+    let (edits, choices, switches, password) = unsafe {
+        let form = (*ptr).borrow();
+        (
+            form.edits.clone(),
+            form.choices.clone(),
+            form.switches.clone(),
+            match form.test {
+                Some(TestForm::Ai(_)) => Some(4),
+                Some(TestForm::Embedding(_)) => Some(3),
+                _ => None,
+            },
+        )
+    };
+    FormValues {
+        values: edits
+            .iter()
+            .enumerate()
+            .map(|(i, edit)| unsafe {
+                if choices.contains(&i) {
+                    SendMessageW(*edit, CB_GETCURSEL, None, None).0.to_string()
+                } else if switches.contains(&i) {
+                    SendMessageW(*edit, BM_GETCHECK, None, None).0.to_string()
+                } else {
+                    text(*edit)
+                }
+            })
+            .collect(),
+        passwords: password.into_iter().collect(),
     }
 }
 
@@ -366,6 +483,9 @@ unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
         TestForm::Organizer {
             owner, ref health, ..
         } => {
+            unsafe {
+                (*ptr).borrow_mut().health_requested = true;
+            }
             *health.lock().unwrap() = "正在启动 Pi（不调用模型）…".into();
             unsafe {
                 let _ = PostMessageW(
@@ -438,14 +558,19 @@ unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
 
 unsafe fn poll_test(ptr: *const RefCell<Form>) {
     let health = unsafe {
-        match &(*ptr).borrow().test {
-            Some(TestForm::Organizer { health, .. }) => Some(health.clone()),
+        let form = (*ptr).borrow();
+        match &form.test {
+            Some(TestForm::Organizer { health, .. }) => {
+                Some((health.clone(), form.health_requested))
+            }
             _ => None,
         }
     };
-    if let Some(health) = health {
-        unsafe {
-            test_status(ptr, &health.lock().unwrap());
+    if let Some((health, requested)) = health {
+        if requested {
+            unsafe {
+                test_status(ptr, &health.lock().unwrap());
+            }
         }
         return;
     }
@@ -504,63 +629,23 @@ unsafe fn poll_test(ptr: *const RefCell<Form>) {
         }
     }
 }
-unsafe fn validate_form(ptr: *const RefCell<Form>) -> Result<(), String> {
-    let (config, edits, choices, switches, models) = unsafe {
+unsafe fn validate_form(ptr: *const RefCell<Form>, values: &[String]) -> Result<(), FormError> {
+    let (validation, config, models) = unsafe {
         let form = (*ptr).borrow();
         (
+            form.validation.clone(),
             form.test.clone(),
-            form.edits.clone(),
-            form.choices.clone(),
-            form.switches.clone(),
             form.models.clone(),
         )
     };
-    let mut values: Vec<String> = edits
-        .iter()
-        .enumerate()
-        .map(|(i, edit)| unsafe {
-            if choices.contains(&i) {
-                SendMessageW(*edit, CB_GETCURSEL, None, None).0.to_string()
-            } else if switches.contains(&i) {
-                SendMessageW(*edit, BM_GETCHECK, None, None).0.to_string()
-            } else {
-                text(*edit)
-            }
-        })
-        .collect();
-    match config {
-        Some(TestForm::Ai(mut saved)) => {
-            let key = ai_client::SecretString(std::mem::take(&mut values[4]));
-            if values[5] == "1" && !key.0.is_empty() {
-                return Err("清除密钥与填写新密钥请选择其中一个操作".into());
-            }
-            if !key.0.is_empty() {
-                if key.0.len() > 4096 || !key.0.bytes().all(|b| (33..=126).contains(&b)) {
-                    return Err("API Key 格式无效".into());
-                }
-                saved.encrypted_key = vec![1];
-            }
-            let next = crate::organizer_ui::parse_ai_fields(&saved, &values)?;
-            if let Some(error) =
-                crate::organizer_ui::effort_warning(&models, &next.model, next.effort)
-            {
-                return Err(error);
-            }
-            Ok(())
-        }
-        Some(TestForm::Organizer { mut ai, .. }) => {
-            let organizer = crate::organizer_ui::parse_organizer_fields(&values)?;
-            if organizer.enabled {
-                if let Some(message) = crate::organizer_ui::organizer_config_warning(&ai) {
-                    return Err(message);
-                }
-                ai.enabled = true;
-                ai_client::validate_settings(&ai)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
+    crate::form_validation::validate(&validation, values, &models)?;
+    if let Some(TestForm::Organizer { mut ai, .. }) = config
+        && values[0] == "1"
+    {
+        ai.enabled = true;
+        ai_client::validate_settings(&ai).map_err(|e| FormError::new(0, e))?;
     }
+    Ok(())
 }
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
@@ -574,11 +659,6 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 WM_COMMAND if (wp.0 & 0xffff) == 1 || (wp.0 & 0xffff) == 2 => {
                     let accept = (wp.0 & 0xffff) == 1;
                     if accept && (*ptr).borrow().test_gate.busy() {
-                        return LRESULT(0);
-                    }
-                    if accept && let Err(message) = validate_form(ptr) {
-                        test_status(ptr, &message);
-                        scroll_form(ptr, i32::MAX);
                         return LRESULT(0);
                     }
                     {
@@ -746,7 +826,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         0,
                         0,
                         client.right,
-                        (client.bottom - scale(58)).max(1),
+                        (client.bottom - scale(110)).max(1),
                         true,
                     );
                     for control in all.iter().take(edits * 2) {
@@ -767,6 +847,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                             points[0].y,
                             (client.right - scale(48)).max(1),
                             r.bottom - r.top,
+                            true,
+                        );
+                    }
+                    let error_result = (*ptr).borrow().error_result;
+                    if let Some(output) = error_result {
+                        let _ = MoveWindow(
+                            output,
+                            scale(18),
+                            client.bottom - scale(102),
+                            (client.right - scale(36)).max(1),
+                            scale(50),
                             true,
                         );
                     }
@@ -820,8 +911,40 @@ pub unsafe fn form(
         .iter()
         .map(|(label, value)| (*label, Field::Text(value.clone())))
         .collect();
-    unsafe { form_fields_with_test_theme(owner, title, &fields, None, appearance) }
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            title,
+            &fields,
+            None,
+            appearance,
+            Validation::None,
+            None,
+        )
+    }
 }
+pub unsafe fn favorite_form(
+    owner: HWND,
+    fields: &[(&str, String)],
+    appearance: Theme,
+) -> Option<Vec<String>> {
+    let fields: Vec<_> = fields
+        .iter()
+        .map(|(label, value)| (*label, Field::Text(value.clone())))
+        .collect();
+    unsafe {
+        form_fields_with_test_theme(
+            owner,
+            "编辑收藏",
+            &fields,
+            None,
+            appearance,
+            Validation::Favorite,
+            None,
+        )
+    }
+}
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn settings_form(
     owner: HWND,
     theme: usize,
@@ -830,6 +953,7 @@ pub unsafe fn settings_form(
     paused: bool,
     excluded: String,
     preferred: SmartSearchMode,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         form_fields_with_test_theme(
@@ -859,6 +983,8 @@ pub unsafe fn settings_form(
                 2 => Theme::Dark,
                 _ => Theme::System,
             },
+            Validation::General,
+            submit,
         )
     }
 }
@@ -882,6 +1008,8 @@ pub unsafe fn clipboard_metadata_form(
             ],
             None,
             appearance,
+            Validation::Metadata(summary.clone()),
+            None,
         )
     }
 }
@@ -889,6 +1017,7 @@ pub unsafe fn ai_settings_form(
     owner: HWND,
     settings: &crate::ai::AiSettings,
     appearance: Theme,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         form_fields_with_test_theme(
@@ -931,6 +1060,8 @@ pub unsafe fn ai_settings_form(
             ],
             Some(TestForm::Ai(settings.clone())),
             appearance,
+            Validation::Ai(settings.clone()),
+            submit,
         )
     }
 }
@@ -995,6 +1126,8 @@ pub unsafe fn organizer_settings_form(
                 health,
             }),
             appearance,
+            Validation::Organizer(ai.clone()),
+            None,
         )
     }
 }
@@ -1002,6 +1135,7 @@ pub unsafe fn embedding_settings_form(
     owner: HWND,
     settings: &crate::semantic::EmbeddingSettings,
     appearance: Theme,
+    submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         form_fields_with_test_theme(
@@ -1037,6 +1171,8 @@ pub unsafe fn embedding_settings_form(
             ],
             Some(TestForm::Embedding(settings.clone())),
             appearance,
+            Validation::Embedding(settings.clone()),
+            submit,
         )
     }
 }
@@ -1046,6 +1182,8 @@ unsafe fn form_fields_with_test_theme(
     fields: &[(&str, Field)],
     test: Option<TestForm>,
     appearance: Theme,
+    validation: Validation,
+    mut submit: Submit<'_>,
 ) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -1062,6 +1200,13 @@ unsafe fn form_fields_with_test_theme(
         let testing = test.is_some();
         let validating = test.is_some();
         let model_listing = matches!(test, Some(TestForm::Ai(_)));
+        let initial_test_note = if model_listing {
+            "获取模型不发推理请求；测试只发送内置文本"
+        } else if matches!(test, Some(TestForm::Embedding(_))) {
+            "测试只发送内置文本；保存不调用服务"
+        } else {
+            ""
+        };
         let state = Box::new(RefCell::new(Form {
             edits: Vec::new(),
             controls: Vec::new(),
@@ -1072,9 +1217,20 @@ unsafe fn form_fields_with_test_theme(
             done: false,
             accepted: false,
             test,
+            validation,
+            status: FormStatus {
+                test: initial_test_note.into(),
+                ..Default::default()
+            },
+            labels: fields
+                .iter()
+                .map(|(label, _)| (*label).to_owned())
+                .collect(),
+            health_requested: false,
             test_gate: ConnectionTestGate::default(),
             test_button: None,
             test_result: None,
+            error_result: None,
             save_button: None,
             model_button: None,
             models: Vec::new(),
@@ -1123,7 +1279,7 @@ unsafe fn form_fields_with_test_theme(
             .count() as i32
             * 92;
         let logical_height =
-            104 + fields.len() as i32 * 62 + multiline_extra + if validating { 96 } else { 0 };
+            156 + fields.len() as i32 * 62 + multiline_extra + if validating { 180 } else { 0 };
         let dpi = owner_dpi;
         let fit = crate::organizer_ui::fit_form(
             work.right - work.left,
@@ -1159,7 +1315,7 @@ unsafe fn form_fields_with_test_theme(
             0,
             0,
             client.right,
-            (client.bottom - scale(58)).max(1),
+            (client.bottom - scale(110)).max(1),
             Some(hwnd),
             None,
             None,
@@ -1179,7 +1335,7 @@ unsafe fn form_fields_with_test_theme(
         {
             let mut form = state.borrow_mut();
             form.viewport = viewport;
-            form.content_height = fit.content_height;
+            form.content_height = (fit.content_height - scale(52)).max(1);
         }
         let font = theme::font(dpi);
         {
@@ -1427,7 +1583,7 @@ unsafe fn form_fields_with_test_theme(
                 scale(18),
                 y + scale(36),
                 (client.right - scale(48)).max(1),
-                scale(42),
+                scale(126),
                 Some(viewport),
                 None,
                 None,
@@ -1461,8 +1617,9 @@ unsafe fn form_fields_with_test_theme(
                 }
             };
             if let Some(note) = note {
-                test_status(&*state, &note);
+                state.borrow_mut().status.config = note;
             }
+            render_status(&*state);
             let available = matches!(state.borrow().test, Some(TestForm::Organizer { .. }))
                 || !TEST_WORKER.with(|worker| worker.busy());
             let _ = EnableWindow(button, available);
@@ -1470,6 +1627,32 @@ unsafe fn form_fields_with_test_theme(
                 let _ = EnableWindow(button, false);
                 test_status(&*state, "无法启动连接测试状态更新，请重新打开设置");
             }
+        }
+        let error_output = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            w!(""),
+            WS_CHILD | WS_VISIBLE,
+            scale(18),
+            client.bottom - scale(102),
+            (client.right - scale(36)).max(1),
+            scale(50),
+            Some(hwnd),
+            None,
+            None,
+            None,
+        )
+        .ok()?;
+        SendMessageW(
+            error_output,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            None,
+        );
+        {
+            let mut form = state.borrow_mut();
+            form.error_result = Some(error_output);
+            form.controls.push(error_output);
         }
         for (id, label, x) in [
             (1, "保存", client.right - scale(218)),
@@ -1506,8 +1689,31 @@ unsafe fn form_fields_with_test_theme(
         }
         let mut msg = MSG::default();
         let mut quit = None;
+        let mut submission = Submission::default();
         loop {
             if state.borrow().done {
+                if state.borrow().accepted {
+                    state.borrow_mut().status.error = None;
+                    let values = read_values(&*state);
+                    submission.attempt(&values.values, |raw| {
+                        validate_form(&*state, raw)?;
+                        if let Some(callback) = submit.as_deref_mut() {
+                            callback(raw)?;
+                        }
+                        Ok(())
+                    });
+                    if !submission.accepted {
+                        {
+                            let mut form = state.borrow_mut();
+                            form.done = false;
+                            form.accepted = false;
+                        }
+                        if let Some(error) = submission.error.take() {
+                            form_error(&*state, error);
+                        }
+                        continue;
+                    }
+                }
                 break;
             }
             let status = GetMessageW(&mut msg, None, 0, 0);
@@ -1552,7 +1758,11 @@ unsafe fn form_fields_with_test_theme(
                 .enumerate()
                 .map(|(i, e)| match fields[i].1 {
                     Field::Text(_) | Field::Password(_) | Field::Multiline(_) | Field::Model(_) => {
-                        text(*e)
+                        if submit.is_some() && matches!(fields[i].1, Field::Password(_)) {
+                            String::new()
+                        } else {
+                            text(*e)
+                        }
                     }
                     Field::Choice(_)
                     | Field::AuthChoice(_)
