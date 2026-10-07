@@ -224,3 +224,24 @@ impl Submission {
         self.accepted = self.error.is_none();
     }
 }
+
+/// Reports a manual-test effort rejection without retaining the form's model borrow
+/// across the status callback, which may update the same form or dispatch messages.
+pub fn report_effort_warning<T>(
+    form: &std::cell::RefCell<T>,
+    models: impl FnOnce(&T) -> &[ModelInfo],
+    model: &str,
+    effort: crate::ai::Effort,
+    report: impl FnOnce(&str),
+) -> bool {
+    let message = {
+        let form = form.borrow();
+        crate::organizer_ui::effort_warning(models(&form), model, effort)
+    };
+    if let Some(message) = message {
+        report(&message);
+        true
+    } else {
+        false
+    }
+}

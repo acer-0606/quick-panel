@@ -516,13 +516,14 @@ unsafe fn begin_test(ptr: *const RefCell<Form>, list_models: bool) {
                     .copied()
                     .unwrap_or_default();
                 if !list_models
-                    && let Some(message) = crate::organizer_ui::effort_warning(
-                        &(*ptr).borrow().models,
+                    && crate::form_validation::report_effort_warning(
+                        &*ptr,
+                        |form| &form.models,
                         &settings.model,
                         settings.effort,
+                        |message| test_status(ptr, message),
                     )
                 {
-                    test_status(ptr, &message);
                     return;
                 }
             }
@@ -568,8 +569,9 @@ unsafe fn poll_test(ptr: *const RefCell<Form>) {
     };
     if let Some((health, requested)) = health {
         if requested {
+            let message = health.lock().unwrap().clone();
             unsafe {
-                test_status(ptr, &health.lock().unwrap());
+                test_status(ptr, &message);
             }
         }
         return;

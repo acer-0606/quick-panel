@@ -206,3 +206,54 @@ fn metadata_validation_preserves_raw_fields_and_reports_the_invalid_editor() {
         assert_eq!(raw[(index + 1) % 3], fields[(index + 1) % 3]);
     }
 }
+
+#[test]
+fn unsupported_effort_test_reports_into_the_same_form_after_releasing_model_borrow() {
+    use quick_panel::form_validation::report_effort_warning;
+    use std::cell::RefCell;
+    let form = RefCell::new((
+        vec![ModelInfo {
+            id: "known".into(),
+            display_name: None,
+            effort: Some(EffortCapabilities {
+                supported: Some(false),
+                ..Default::default()
+            }),
+        }],
+        FormStatus {
+            config: "保留配置依赖".into(),
+            error: Some(FormError::new(4, "保留保存错误")),
+            test: String::new(),
+        },
+        "  原始草稿  ".to_owned(),
+    ));
+    let rejected = report_effort_warning(
+        &form,
+        |form| &form.0,
+        "known",
+        Effort::Max,
+        |message| form.borrow_mut().1.runtime_health(message.to_owned()),
+    );
+    assert!(rejected);
+    {
+        let form = form.borrow();
+        assert!(form.1.test.contains("不支持"));
+        assert_eq!(form.1.config, "保留配置依赖");
+        assert_eq!(form.1.error.as_ref().unwrap().field, 4);
+        assert_eq!(form.2, "  原始草稿  ");
+    }
+    assert!(!report_effort_warning(
+        &form,
+        |form| &form.0,
+        "known",
+        Effort::Default,
+        |_| panic!("默认强度不应报告错误")
+    ));
+    assert!(!report_effort_warning(
+        &form,
+        |form| &form.0,
+        "unknown",
+        Effort::Max,
+        |_| panic!("未知能力不应阻断测试")
+    ));
+}
