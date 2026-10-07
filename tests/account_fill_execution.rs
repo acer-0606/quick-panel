@@ -314,3 +314,171 @@ fn hiding_panel_revokes_generation_without_changing_unlocked_epoch() {
     assert!(next.is_current());
     assert_eq!(next.epoch(), 41);
 }
+
+#[test]
+fn empty_username_preserves_target_for_saved_once_and_hint() {
+    for action in [
+        UserFillAction::SelectedAccount,
+        UserFillAction::ConfirmedHint,
+    ] {
+        for once in [false, true] {
+            if once && action == UserFillAction::ConfirmedHint {
+                continue;
+            }
+            let mut s = scene();
+            let mut user = s.fields[0].clone();
+            user.field_id = 2;
+            user.is_password = false;
+            user.selector.automation_id = Some("username".into());
+            s.fields.push(user);
+            s.node_count = 2;
+            let target = LiveTarget {
+                selector: s.fields[1].selector.clone(),
+                depth: 1,
+                value: "synthetic-server".into(),
+            };
+            s.targets.push(target.clone());
+            s.node_count += 1;
+            let mut b = binding(&s);
+            b.username = Some(s.fields[1].selector.clone());
+            b.target = Some(TargetCondition {
+                selector: target.selector,
+                expected: target.value,
+            });
+            let choice = if once {
+                let mut teacher = TeachingSession::begin(&s).unwrap();
+                teacher.select_password(1).unwrap();
+                teacher.select_username(Some(2)).unwrap();
+                teacher
+                    .select_target(b.target.as_ref().map(|t| &t.selector))
+                    .unwrap();
+                FillChoice::Once(
+                    teacher
+                        .finish_once("once".into(), "account".into())
+                        .unwrap(),
+                )
+            } else {
+                FillChoice::Saved(b)
+            };
+            let c = FillControl::new(1);
+            let lease = c.reserve(1).unwrap();
+            let mut backend = NativeDouble {
+                scenes: vec![s.clone(), s.clone()],
+                writes: vec![],
+                control: c,
+                cancel_on_write: false,
+            };
+            let result = execute_fill(
+                &mut FillGate::default(),
+                &mut backend,
+                &lease,
+                FillIntent {
+                    settings: AccountFillSettings {
+                        enabled: true,
+                        ..Default::default()
+                    },
+                    baseline: s,
+                    choice,
+                    action,
+                    browser_password_picked: false,
+                    username: Secret::new(String::new()),
+                    password: Secret::new("synthetic-password".into()),
+                },
+            );
+            assert_eq!(result.error, None);
+            assert!(result.password_written);
+            assert!(
+                !result.username_written,
+                "empty optional username must preserve target"
+            );
+            assert_eq!(backend.writes, vec![1]);
+            assert_eq!(
+                backend.scenes.len(),
+                1,
+                "password still gets a fresh sample"
+            );
+        }
+    }
+}
+#[test]
+fn equivalent_remember_reuses_id_and_keeps_exact_hint_without_merging_other_targets() {
+    use quick_panel::account_vault::{Account, VaultDocument};
+    let mut s = scene();
+    let target = LiveTarget {
+        selector: FieldSelector {
+            automation_id: Some("server".into()),
+            control_type: 50004,
+            class_name: None,
+            anchors: vec![],
+        },
+        depth: 1,
+        value: "server-a".into(),
+    };
+    s.targets.push(target.clone());
+    s.node_count += 1;
+    let mut first = binding(&s);
+    first.target = Some(TargetCondition {
+        selector: target.selector,
+        expected: target.value,
+    });
+    let mut doc = VaultDocument {
+        accounts: vec![Account {
+            id: "account".into(),
+            name: "Synthetic".into(),
+            username: String::new(),
+            password: Secret::new("synthetic".into()),
+        }],
+        bindings: vec![],
+    };
+    doc.upsert_binding(first.clone()).unwrap();
+    let mut repeat = first.clone();
+    repeat.binding_id = "new-id".into();
+    doc.upsert_binding(repeat).unwrap();
+    assert_eq!(
+        doc.bindings.len(),
+        1,
+        "repeated remember must not create ambiguity"
+    );
+    assert_eq!(doc.bindings[0].binding_id, "binding");
+    let hints = quick_panel::account_fill_ui::hint_candidates(&doc.bindings, &s);
+    assert_eq!(hints.len(), 1);
+    assert!(matches!(
+        match_binding(&hints[0], &s),
+        MatchDecision::Exact(_)
+    ));
+    let mut other = first.clone();
+    other.binding_id = "other-target".into();
+    other.target.as_mut().unwrap().expected = "server-b".into();
+    doc.upsert_binding(other).unwrap();
+    let mut account = doc.accounts[0].clone();
+    account.id = "other-account".into();
+    doc.accounts.push(account);
+    let mut other = first;
+    other.binding_id = "other-account-binding".into();
+    other.account_id = "other-account".into();
+    doc.upsert_binding(other).unwrap();
+    assert_eq!(doc.bindings.len(), 3);
+    for variant in 0..4 {
+        let mut changed = doc.bindings[0].clone();
+        changed.binding_id = format!("distinct-{variant}");
+        match variant {
+            0 => changed.app.file_fingerprint = [9; 32],
+            1 => changed.scene_key = "other-scene".into(),
+            2 => changed.password.automation_id = Some("other-password".into()),
+            _ => {
+                changed.username = Some(FieldSelector {
+                    automation_id: Some("other-user".into()),
+                    control_type: 50004,
+                    class_name: None,
+                    anchors: vec![],
+                })
+            }
+        }
+        assert!(doc.equivalent_binding(&changed).is_none());
+        doc.upsert_binding(changed).unwrap();
+    }
+    assert_eq!(doc.bindings.len(), 7);
+    let equivalent = doc.bindings[0].clone();
+    doc.accounts.clear();
+    assert!(doc.upsert_binding(equivalent).is_err());
+}

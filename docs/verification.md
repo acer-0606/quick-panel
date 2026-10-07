@@ -1,6 +1,16 @@
 # 2026-10-08 账号填充与保险箱集成
 
-## Task 4 gate 修复 round 1（当前修补）
+## 最终整体审查合并修复（当前交付）
+
+最终五项修复集中处理：全窗超限后 Runtime 保留仅供教学的请求/代次票据，点选继续由原 worker 核对窗口后形成完整 SelectedContext，仍只允许本次填入；空用户名在共享执行器中跳过用户名写入；同账号、应用、场景、字段及区分目标完全等价时复用已确认关联和稳定 ID，不重新保存密文，进行中或失败的保存仍阻止该捷径。不同账号或目标不会合并。
+
+Picker 新增真实生产 mouse/keyboard hook 的 down→Waiting→up→Selected/Cancelled、重新进入、撤销与 drop 清理合成序列；点选生命周期内显示角色专用的只读不激活提示，跟随指针所在屏幕 DPI 并使用远离指针的一侧，所有结束路径销毁提示。提示不持有 hint permit，不增加观察器、线程或快捷键。
+
+本轮共享 RED 为 10 passed / 2 failed，两个失败准确复现空用户名写入与重复关联；修复后覆盖回归 **62 passed / 0 failed**（匹配20、执行与文档→hint12、UI15、保险箱15），Windows integration 在 macOS **0执行**。新增 Runtime→worker 270浅节点、重复 remember/保存状态、Picker hook/指示窗口 fixture 仅交叉编译，未声称原生 RED/GREEN 或实机通过。host/Windows all-target strictClippy/check、fmt/diff记录见 `final-fix-report.md` 与同目录 `logs/final-fix-*`；发布版本、Release及逐成员包核验以最终报告和外置manifest为准。Windows GUI/UIA/hook/IME/DPI/多屏/锁屏实测仍为0。
+
+下方 full **567/0/3** 与上一轮 targeted **45/0** 均是历史证据；本轮未重复未变 full、Node suite 或 core-check。
+
+## Task 4 gate 修复 round 1（历史修补）
 
 针对初版 `c1cc45a` 的 I1/I2：前台/焦点/目标布局事件同步推进提示版本，即使多个 UIA 字段共用同一个 HWND/事件标识也不按 HWND 去重。计时器仅合并最新版本，一次仍最多基础采样和指定目标采样；过期结果不能重新显示提示。鼠标按下/松开与排队 `HINT_CLICK` 都携带显示版本，旧点击不能消费新提示；单次 permit 随 ConfirmedHint 进入 MTA，原采样预算内重新核对当前 UIA 聚焦密码字段和PID，在原 ValuePattern 写入边界再次核对版本。手动 Fill/Pick 的内部隐藏/恢复不使用提示 permit，保留原合同。
 

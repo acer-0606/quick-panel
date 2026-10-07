@@ -1,5 +1,7 @@
 //! Temporary GUI-thread native hooks capture only point/cancel notifications.
-//! No UIA, screenshots or keyboard recording. Task4 supplies no-activate instructions.
+//! No UIA, screenshots or keyboard recording. Read-only instructions share this lifetime.
+#[path = "account_instruction.rs"]
+mod instruction;
 use super::account_target::{capture_window, foreground_matches, hwnd, window_identity};
 use crate::{account_fill::WindowIdentity, account_fill_execution::FillError};
 use std::{
@@ -54,6 +56,7 @@ pub struct Picker {
     own_pid: u32,
     done: bool,
     signal: Arc<Signal>,
+    instruction: Option<instruction::Instruction>,
     mouse: Option<HHOOK>,
     keyboard: Option<HHOOK>,
     _gui_thread: PhantomData<Rc<()>>,
@@ -64,6 +67,7 @@ pub fn pick(
     owner: u64,
     target: Option<WindowIdentity>,
     role: PickRole,
+    appearance: crate::model::Theme,
 ) -> Result<Picker, FillError> {
     unsafe {
         let own = window_identity(owner)?;
@@ -87,6 +91,7 @@ pub fn pick(
             own_pid: own.pid,
             done: false,
             signal,
+            instruction: None,
             mouse: None,
             keyboard: None,
             _gui_thread: PhantomData,
@@ -105,6 +110,7 @@ pub fn pick(
             )
             .map_err(|_| FillError::QueryFailed)?,
         );
+        picker.instruction = Some(instruction::Instruction::show(role, appearance)?);
         Ok(picker)
     }
 }
@@ -185,6 +191,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: WPARAM, data: LPARAM
 }
 impl Picker {
     fn release(&mut self) {
+        self.instruction = None;
         unsafe {
             if let Some(hook) = self.mouse.take() {
                 let _ = UnhookWindowsHookEx(hook);
@@ -216,6 +223,9 @@ impl Picker {
                 .is_some_and(|target| !foreground_matches(target))
             {
                 return self.cancel();
+            }
+            if let Some(instruction) = &mut self.instruction {
+                instruction.position();
             }
             let notice = self
                 .signal
@@ -260,5 +270,142 @@ impl Picker {
 impl Drop for Picker {
     fn drop(&mut self) {
         self.release()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::core::w;
+    #[test]
+    fn production_hooks_pair_release_reenter_and_cleanup_instruction() {
+        unsafe {
+            let target = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("synthetic-picker"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                80,
+                80,
+                400,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(SetForegroundWindow(target).as_bool());
+            let identity = window_identity(target.0 as u64).unwrap();
+            let begin = |role| {
+                let mut picker = pick(
+                    target.0 as u64,
+                    Some(identity),
+                    role,
+                    crate::model::Theme::System,
+                )
+                .unwrap();
+                // Synthetic fixture is in-process; production forbids selecting own app.
+                // Only the fixture's excluded PID differs; callbacks/poll/window validation remain real.
+                picker.own_pid = 0;
+                picker
+            };
+            let mouse = MSLLHOOKSTRUCT {
+                pt: POINT { x: 150, y: 150 },
+                ..Default::default()
+            };
+            let key = KBDLLHOOKSTRUCT {
+                vkCode: VK_ESCAPE.0 as u32,
+                ..Default::default()
+            };
+            let send_mouse = |m| {
+                mouse_hook(
+                    0,
+                    WPARAM(m as usize),
+                    LPARAM((&mouse as *const MSLLHOOKSTRUCT) as isize),
+                )
+            };
+            for cancel in [0, 1, 2, 0] {
+                let role = match cancel {
+                    1 => PickRole::Username,
+                    2 => PickRole::Target,
+                    _ => PickRole::Password,
+                };
+                let mut picker = begin(role);
+                let instruction = picker.instruction.as_ref().unwrap().hwnd_for_test();
+                assert!(IsWindowVisible(instruction).as_bool());
+                let mut label = [0u16; 80];
+                let length = GetWindowTextW(instruction, &mut label);
+                let label = String::from_utf16_lossy(&label[..length as usize]);
+                assert!(label.contains(match role {
+                    PickRole::Password => "密码框",
+                    PickRole::Username => "用户名框",
+                    PickRole::Target => "区分目标",
+                }));
+                assert!(label.contains("Esc / 右键取消"));
+                assert_eq!(GetForegroundWindow(), target);
+                assert_ne!(
+                    GetWindowLongW(instruction, GWL_EXSTYLE) as u32 & WS_EX_NOACTIVATE.0,
+                    0
+                );
+                assert_eq!(
+                    SendMessageW(instruction, WM_MOUSEACTIVATE, None, None),
+                    LRESULT(MA_NOACTIVATE as isize)
+                );
+                match cancel {
+                    0 => {
+                        assert_eq!(send_mouse(WM_LBUTTONDOWN), LRESULT(1));
+                        assert_eq!(picker.poll(), PickEvent::Waiting);
+                        assert_eq!(send_mouse(WM_LBUTTONUP), LRESULT(1));
+                    }
+                    1 => {
+                        assert_eq!(send_mouse(WM_RBUTTONDOWN), LRESULT(1));
+                        assert_eq!(picker.poll(), PickEvent::Waiting);
+                        assert_eq!(send_mouse(WM_RBUTTONUP), LRESULT(1));
+                    }
+                    _ => {
+                        assert_eq!(
+                            keyboard_hook(
+                                0,
+                                WPARAM(WM_KEYDOWN as usize),
+                                LPARAM((&key as *const KBDLLHOOKSTRUCT) as isize)
+                            ),
+                            LRESULT(1)
+                        );
+                        assert_eq!(picker.poll(), PickEvent::Waiting);
+                        assert_eq!(
+                            keyboard_hook(
+                                0,
+                                WPARAM(WM_KEYUP as usize),
+                                LPARAM((&key as *const KBDLLHOOKSTRUCT) as isize)
+                            ),
+                            LRESULT(1)
+                        );
+                    }
+                }
+                if cancel == 0 {
+                    assert!(
+                        matches!(picker.poll(),PickEvent::Selected(PickPoint {window,..}) if window==identity)
+                    );
+                } else {
+                    assert_eq!(picker.poll(), PickEvent::Cancelled);
+                }
+                assert_eq!(picker.poll(), PickEvent::Cancelled);
+                assert!(ACTIVE.lock().unwrap().is_none());
+                assert!(picker.mouse.is_none() && picker.keyboard.is_none());
+                assert!(!IsWindow(Some(instruction)).as_bool());
+            }
+            let picker = begin(PickRole::Password);
+            let instruction = picker.instruction.as_ref().unwrap().hwnd_for_test();
+            drop(picker);
+            assert!(ACTIVE.lock().unwrap().is_none());
+            assert!(!IsWindow(Some(instruction)).as_bool());
+            let mut picker = begin(PickRole::Password);
+            let instruction = picker.instruction.as_ref().unwrap().hwnd_for_test();
+            let _ = DestroyWindow(target);
+            assert_eq!(picker.poll(), PickEvent::Cancelled);
+            assert!(ACTIVE.lock().unwrap().is_none());
+            assert!(!IsWindow(Some(instruction)).as_bool());
+        }
     }
 }

@@ -435,6 +435,9 @@ fn handle(
                 });
             }
             let current = session.as_mut().ok_or(FillError::Cancelled)?;
+            // A failed new teaching request supersedes the old inspection too.
+            current.id = id;
+            current.snapshot = None;
             automation.verify_app(&current.context, cache, query_deadline)?;
             let (field_id, snapshot) = automation.point(
                 &mut current.context,

@@ -336,6 +336,7 @@ fn native_synthetic_capture_inspect_write_two_windows_and_cancel() {
             second.root.0 as usize as u64,
             Some(first.identity()),
             PickRole::Password,
+            quick_panel::model::Theme::System,
         )
         .unwrap();
         assert_eq!(picker.cancel(), PickEvent::Cancelled);

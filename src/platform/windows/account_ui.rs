@@ -67,6 +67,7 @@ pub struct Runtime {
     attention: Option<String>,
     pub last_active: Instant,
     inspection: Option<(u64, u64, Inspection)>,
+    teaching_context: Option<(u64, u64)>,
     purpose: Purpose,
     pending: Option<u64>,
     queued_inspect: Option<Purpose>,
@@ -104,6 +105,7 @@ impl Runtime {
             attention: None,
             last_active: Instant::now(),
             inspection: None,
+            teaching_context: None,
             purpose: Purpose::Manual,
             pending: None,
             queued_inspect: None,
@@ -167,6 +169,7 @@ impl Runtime {
         }
         self.picker = None;
         self.inspection = None;
+        self.teaching_context = None;
         self.pending = None;
         self.queued_inspect = None;
         self.password = None;
@@ -363,6 +366,14 @@ impl Runtime {
                     {
                         self.attention = Some(format!("本次账号填入未完成：{}", error.message()));
                     }
+                    // A failed bounded sample is never an inspection or a fill grant.
+                    // Retain its identity solely so explicit teaching can narrow that context.
+                    self.teaching_context = (error == FillError::BudgetExceeded
+                        && self
+                            .worker
+                            .as_ref()
+                            .is_some_and(|w| w.control().generation() == reply.generation))
+                    .then_some((reply.request_id, reply.generation));
                     self.inspection = None;
                     self.binding = None;
                     self.password = None;
@@ -398,29 +409,13 @@ impl Runtime {
                 }
                 PickEvent::Selected(point) => {
                     self.picker = None;
-                    self.flow.target = Some(point.window);
-                    unsafe {
-                        let _ = SetForegroundWindow(HWND(point.window.handle as *mut _));
-                    }
-                    let id = self.inspection.as_ref().map(|(id, _, _)| *id);
-                    if let Some(worker) = &mut self.worker {
-                        match worker.teach_point(self.flow.vault.session().epoch(), id, point) {
-                            Ok(request) => {
-                                self.pending = Some(request);
-                                self.notice = "正在确认所选输入框…".into();
-                            }
-                            Err(error) => {
-                                self.notice = error.message().into();
-                                self.transfer = false;
-                            }
-                        }
-                    }
-                    self.changed();
+                    self.picked(point);
                 }
             }
         }
         if self.flow.target.is_some()
             && (self.inspection.is_some()
+                || self.teaching_context.is_some()
                 || self.pending.is_some()
                 || self.picker.is_some()
                 || self.after_save.is_some())
@@ -537,6 +532,7 @@ impl Runtime {
         match result {
             Ok(id) => {
                 self.inspection = None;
+                self.teaching_context = None;
                 self.password = None;
                 self.username = None;
                 self.binding = None;
@@ -597,6 +593,7 @@ impl Runtime {
             self.target_selector = None;
         }
         self.notice = crate::account_fill_ui::scene_message(&inspection.snapshot).into();
+        self.teaching_context = None;
         self.inspection = Some((id, generation, inspection.clone()));
         self.transfer = false;
         if picked.is_some() {
@@ -765,12 +762,31 @@ impl Runtime {
                 return Err("请先启用、解锁并等待当前操作完成".into());
             }
             let account = self.selected.clone().ok_or("请选择账号")?;
-            let id = format!("binding-{}-{}", timestamp(), self.flow.next_id());
+            let id = self
+                .binding
+                .as_ref()
+                .map(|b| b.binding_id.clone())
+                .unwrap_or_else(|| format!("binding-{}-{}", timestamp(), self.flow.next_id()));
             if remember {
                 let binding = self
                     .teaching()?
                     .finish(id, account)
                     .map_err(|e| FillError::Policy(e).message())?;
+                if let Some(confirmed) = self
+                    .flow
+                    .vault
+                    .session()
+                    .document()?
+                    .equivalent_binding(&binding)
+                    .cloned()
+                {
+                    self.do_fill(
+                        FillChoice::Saved(confirmed),
+                        UserFillAction::SelectedAccount,
+                        None,
+                    );
+                    return Ok(());
+                }
                 let mut document = self.flow.vault.session().document()?.clone();
                 document.upsert_binding(binding.clone())?;
                 let request = self.flow.next_id();
@@ -858,6 +874,39 @@ impl Runtime {
         }
         self.changed();
     }
+    fn picked(&mut self, point: account_picker::PickPoint) {
+        if self.teaching_context.is_some_and(|(_, generation)| {
+            self.worker
+                .as_ref()
+                .is_none_or(|w| w.control().generation() != generation)
+        }) {
+            self.revoke();
+            self.notice = FillError::TargetChanged.message().into();
+            return;
+        }
+        self.flow.target = Some(point.window);
+        unsafe {
+            let _ = SetForegroundWindow(HWND(point.window.handle as *mut _));
+        }
+        let id = self
+            .inspection
+            .as_ref()
+            .map(|(id, _, _)| *id)
+            .or_else(|| self.teaching_context.map(|(id, _)| id));
+        if let Some(worker) = &mut self.worker {
+            match worker.teach_point(self.flow.vault.session().epoch(), id, point) {
+                Ok(request) => {
+                    self.pending = Some(request);
+                    self.notice = "正在确认所选输入框…".into();
+                }
+                Err(error) => {
+                    self.notice = error.message().into();
+                    self.transfer = false;
+                }
+            }
+        }
+        self.changed();
+    }
     fn pick(&mut self, role: PickRole) {
         if !self.settings.enabled
             || !self.flow.vault.session().is_unlocked()
@@ -877,7 +926,7 @@ impl Runtime {
                 let _ = SetForegroundWindow(HWND(target.handle as *mut _));
             }
         }
-        match account_picker::pick(self.owner.0 as u64, self.flow.target, role) {
+        match account_picker::pick(self.owner.0 as u64, self.flow.target, role, self.appearance) {
             Ok(picker) => {
                 self.picker = Some(picker);
                 self.notice = "点选目标；Esc 或右键取消".into();
@@ -1702,6 +1751,345 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Synthetic {
+        root: HWND,
+        password: HWND,
+        owner: HWND,
+    }
+    impl Synthetic {
+        unsafe fn new(nodes: usize) -> Self {
+            unsafe {
+                let root = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("synthetic-runtime"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    50,
+                    50,
+                    500,
+                    240,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let owner = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("synthetic-owner"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    10,
+                    10,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let password = CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | WINDOW_STYLE(ES_PASSWORD as u32),
+                    20,
+                    40,
+                    280,
+                    30,
+                    Some(root),
+                    Some(HMENU(100usize as *mut _)),
+                    None,
+                    None,
+                )
+                .unwrap();
+                for i in 0..nodes {
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("STATIC"),
+                        w!("synthetic-label"),
+                        WS_CHILD | WS_VISIBLE,
+                        350,
+                        130,
+                        2,
+                        2,
+                        Some(root),
+                        Some(HMENU((200 + i) as *mut _)),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                }
+                assert!(SetForegroundWindow(root).as_bool());
+                let _ = SetFocus(Some(password));
+                Self {
+                    root,
+                    password,
+                    owner,
+                }
+            }
+        }
+        fn identity(&self) -> WindowIdentity {
+            account_target::window_identity(self.root.0 as u64).unwrap()
+        }
+        fn point(&self) -> account_picker::PickPoint {
+            let mut rect = RECT::default();
+            unsafe {
+                GetWindowRect(self.password, &mut rect).unwrap();
+            }
+            account_picker::PickPoint {
+                window: self.identity(),
+                x: rect.left + 5,
+                y: rect.top + 5,
+                role: PickRole::Password,
+            }
+        }
+    }
+    impl Drop for Synthetic {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.root);
+                let _ = DestroyWindow(self.owner);
+            }
+        }
+    }
+    fn pump_runtime(runtime: &mut Runtime) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while runtime.pending.is_some()
+            || runtime.queued_inspect.is_some()
+            || runtime.worker.as_ref().is_some_and(|w| w.is_busy())
+            || !runtime.flow.vault.can_shutdown()
+        {
+            unsafe {
+                let mut msg = MSG::default();
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            let mut receipt = None;
+            runtime.tick(|command| {
+                if let Command::WriteAccountVault {
+                    request_id,
+                    expected_revision,
+                    ..
+                } = command
+                {
+                    receipt = Some((request_id, expected_revision + 1));
+                }
+                Ok(())
+            });
+            if let Some((request_id, revision)) = receipt {
+                runtime.event(Event::AccountVaultWritten {
+                    request_id,
+                    result: Ok(revision),
+                });
+            }
+            assert!(Instant::now() < deadline, "synthetic runtime timeout");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn unlocked_runtime(fixture: &Synthetic) -> Runtime {
+        let mut runtime = Runtime::new();
+        runtime.owner = fixture.owner;
+        runtime.settings.enabled = true;
+        runtime.settings.show_hint = false;
+        runtime.open = true;
+        runtime.flow.target = Some(fixture.identity());
+        let master = Secret::new("synthetic-master-123".into());
+        let document = VaultDocument {
+            accounts: vec![crate::account_vault::Account {
+                id: "account".into(),
+                name: "synthetic".into(),
+                username: String::new(),
+                password: Secret::new("synthetic-password".into()),
+            }],
+            bindings: vec![],
+        };
+        let create_id = runtime.flow.next_id();
+        runtime
+            .flow
+            .vault
+            .accept_create(create_id, master.clone(), master, document)
+            .unwrap();
+        pump_runtime(&mut runtime);
+        runtime.selected = Some("account".into());
+        runtime
+    }
+    #[test]
+    fn runtime_budget_failure_teaches_local_once_and_rejects_old_or_other_target_tickets() {
+        unsafe {
+            let fixture = Synthetic::new(270);
+            let mut runtime = unlocked_runtime(&fixture);
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            assert!(runtime.inspection.is_none());
+            assert!(runtime.notice.contains("页面较复杂"));
+            assert!(
+                runtime.teaching_context.is_some(),
+                "failed complete capture must retain a teaching-only ticket"
+            );
+            runtime.picked(fixture.point());
+            pump_runtime(&mut runtime);
+            let (id, _, inspection) = runtime
+                .inspection
+                .as_ref()
+                .expect("Runtime must reach a complete local scope");
+            assert!(inspection.snapshot.complete);
+            assert_eq!(inspection.snapshot.scope, SceneScope::SelectedContext);
+            let local_binding = runtime
+                .teaching()
+                .unwrap()
+                .finish_once("local".into(), "account".into())
+                .unwrap()
+                .into_binding();
+            assert!(
+                crate::account_fill_ui::hint_candidates(
+                    std::slice::from_ref(&local_binding),
+                    &inspection.snapshot
+                )
+                .is_empty()
+            );
+            assert!(matches!(
+                match_binding(&local_binding, &inspection.snapshot),
+                MatchDecision::ApplicationOnly(_)
+            ));
+            assert_eq!(
+                runtime
+                    .teaching()
+                    .unwrap()
+                    .finish("b".into(), "account".into()),
+                Err(PolicyError::OneTimeOnly)
+            );
+            let old_id = *id;
+            let mut wrong_point = fixture.point();
+            wrong_point.window = account_target::window_identity(fixture.owner.0 as u64).unwrap();
+            let worker = runtime.worker.as_mut().unwrap();
+            let request = worker
+                .teach_point(
+                    runtime.flow.vault.session().epoch(),
+                    Some(old_id),
+                    wrong_point,
+                )
+                .unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(reply) = worker.try_recv() {
+                    assert_eq!(reply.request_id, request);
+                    assert!(matches!(
+                        reply.result,
+                        AccountResult::Failed(FillError::TargetChanged)
+                    ));
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            runtime.fill(true);
+            assert!(runtime.after_save.is_none());
+            assert!(runtime.notice.contains("只能本次"));
+            runtime.fill(false);
+            pump_runtime(&mut runtime);
+            let mut text = [0u16; 64];
+            let count = GetWindowTextW(fixture.password, &mut text);
+            assert_eq!(
+                String::from_utf16_lossy(&text[..count as usize]),
+                "synthetic-password"
+            );
+            // Successful fill revokes the generation. A supplied old ticket must never create a fresh context.
+            let cleanup_deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while runtime.worker.as_ref().unwrap().is_busy() {
+                assert!(Instant::now() < cleanup_deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let worker = runtime.worker.as_mut().unwrap();
+            let request = worker
+                .teach_point(
+                    runtime.flow.vault.session().epoch(),
+                    Some(old_id),
+                    fixture.point(),
+                )
+                .unwrap();
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(reply) = worker.try_recv() {
+                    assert_eq!(reply.request_id, request);
+                    assert!(matches!(
+                        reply.result,
+                        AccountResult::Failed(FillError::TargetChanged)
+                    ));
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(runtime.teaching_context.is_none());
+        }
+    }
+    #[test]
+    fn runtime_equal_remember_fills_without_save_but_pending_and_failed_save_still_block() {
+        unsafe {
+            let fixture = Synthetic::new(0);
+            let mut runtime = unlocked_runtime(&fixture);
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            let binding = runtime
+                .teaching()
+                .unwrap()
+                .finish("stable-id".into(), "account".into())
+                .unwrap();
+            let mut document = runtime.flow.vault.session().document().unwrap().clone();
+            document.upsert_binding(binding.clone()).unwrap();
+            let request = runtime.flow.next_id();
+            runtime.flow.vault.accept_save(request, document).unwrap();
+            pump_runtime(&mut runtime);
+            runtime.binding = Some(binding.clone());
+            runtime.fill(true);
+            assert!(runtime.after_save.is_none());
+            assert!(runtime.flow.vault.can_shutdown());
+            assert!(runtime.pending.is_some());
+            pump_runtime(&mut runtime);
+            let document = runtime.flow.vault.session().document().unwrap();
+            assert_eq!(document.bindings.len(), 1);
+            assert_eq!(document.bindings[0].binding_id, "stable-id");
+            runtime.open = true;
+            runtime.flow.target = Some(fixture.identity());
+            runtime.selected = Some("account".into());
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            let request = runtime.flow.next_id();
+            let document = runtime.flow.vault.session().document().unwrap().clone();
+            runtime.flow.vault.accept_save(request, document).unwrap();
+            runtime.fill(true);
+            assert!(runtime.pending.is_none());
+            assert!(runtime.after_save.is_none());
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let mut written = false;
+                runtime.tick(|command| {
+                    if matches!(command, Command::WriteAccountVault { .. }) {
+                        written = true;
+                    }
+                    Ok(())
+                });
+                if written {
+                    break;
+                }
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            runtime.event(Event::AccountVaultWritten {
+                request_id: request,
+                result: Err("synthetic-save-failure".into()),
+            });
+            runtime.fill(true);
+            assert!(runtime.pending.is_none());
+            assert!(runtime.after_save.is_none());
+            assert!(!runtime.flow.vault.can_shutdown());
+        }
+    }
     #[test]
     fn app_consumer_keeps_pumping_preparation_and_receipts_before_shutdown() {
         let mut runtime = Runtime::new();

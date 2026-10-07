@@ -180,7 +180,22 @@ impl VaultDocument {
         *self = candidate;
         Ok(())
     }
+    /// Equality excludes only the generated record ID, never account or target identity.
+    pub fn equivalent_binding(&self, binding: &Binding) -> Option<&Binding> {
+        self.bindings.iter().find(|saved| {
+            saved.account_id == binding.account_id
+                && saved.app == binding.app
+                && saved.scene_key == binding.scene_key
+                && saved.password == binding.password
+                && saved.username == binding.username
+                && saved.target == binding.target
+        })
+    }
     pub fn upsert_binding(&mut self, binding: Binding) -> Result<(), String> {
+        binding.validate().map_err(|_| INVALID_DOCUMENT)?;
+        if self.equivalent_binding(&binding).is_some() {
+            return self.validate();
+        }
         let mut candidate = self.clone();
         if let Some(i) = candidate
             .bindings

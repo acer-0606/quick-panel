@@ -498,6 +498,7 @@ impl Automation {
                 return Err(error);
             }
             if Instant::now() >= deadline {
+                context.needs_scope = true;
                 return Err(FillError::BudgetExceeded);
             }
             if context.watch.changed.load(Ordering::SeqCst) {

@@ -179,7 +179,7 @@ pub fn execute_fill(
             &intent.baseline,
         )?;
         for password in [false, true] {
-            if !password && binding.username.is_none() {
+            if !password && (binding.username.is_none() || username.is_empty()) {
                 continue;
             }
             if !lease.is_current() {
