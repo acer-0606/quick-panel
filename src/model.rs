@@ -168,6 +168,14 @@ pub struct SaveStats {
 
 #[derive(Clone, Debug)]
 pub enum Command {
+    ReadAccountVault {
+        request_id: u64,
+    },
+    WriteAccountVault {
+        request_id: u64,
+        expected_revision: u64,
+        envelope: Vec<u8>,
+    },
     HarnessContext {
         token: u64,
         request_id: u64,
@@ -275,6 +283,14 @@ pub enum Command {
 
 #[derive(Clone, Debug)]
 pub enum Event {
+    AccountVaultLoaded {
+        request_id: u64,
+        result: Result<Option<crate::account_vault::VaultSnapshot>, String>,
+    },
+    AccountVaultWritten {
+        request_id: u64,
+        result: Result<u64, String>,
+    },
     HarnessContext {
         token: u64,
         request_id: u64,

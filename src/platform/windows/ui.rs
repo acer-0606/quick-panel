@@ -2603,6 +2603,7 @@ impl App {
                         self.search();
                     }
                 }
+                Event::AccountVaultLoaded { .. } | Event::AccountVaultWritten { .. } => {}
                 Event::Ready(settings) => {
                     self.settings = settings;
                     self.update_organizer_timer();

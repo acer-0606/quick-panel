@@ -178,6 +178,13 @@ impl Engine {
             }
             return Ok(());
         }
+        if let Command::WriteAccountVault { envelope, .. } = &command {
+            crate::account_vault::validate_envelope(envelope)?;
+            if envelope.capacity() > state.queue_limit || envelope.capacity() > state.max_item_bytes
+            {
+                return Err("账号保险箱超过队列容量".into());
+            }
+        }
         let path_bytes = if let Command::ObservePaths(observations) = &command {
             if observations.is_empty() {
                 return Ok(());
@@ -259,6 +266,7 @@ impl Engine {
             _ => None,
         };
         let bytes = match &command {
+            Command::WriteAccountVault { envelope, .. } => envelope.capacity(),
             Command::Capture(snapshot) => snapshot.text.len().saturating_add(
                 snapshot
                     .representations
@@ -3075,6 +3083,20 @@ impl Actor {
                 }
             };
             let result = match command {
+                Command::ReadAccountVault { request_id } => {
+                    let result = self.repo.read_account_vault();
+                    self.emit(Event::AccountVaultLoaded { request_id, result });
+                    Ok(())
+                }
+                Command::WriteAccountVault {
+                    request_id,
+                    expected_revision,
+                    envelope,
+                } => {
+                    let result = self.repo.write_account_vault(expected_revision, &envelope);
+                    self.emit(Event::AccountVaultWritten { request_id, result });
+                    Ok(())
+                }
                 Command::HarnessContext { token, request_id } => {
                     let result = self.harness_context(token);
                     self.emit(Event::HarnessContext {
