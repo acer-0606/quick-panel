@@ -50,6 +50,7 @@ struct View {
     done: bool,
     enabled: bool,
     memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
+    open_settings: bool,
     feedback_rows: Vec<(String, crate::harness_tools::FeedbackTarget)>,
 }
 impl Drop for View {
@@ -172,7 +173,7 @@ unsafe fn selected(ptr: *const RefCell<View>) {
         set(
             detail,
             &format!(
-                "原名称：{}\r\n已有别名：{}\r\n原标签：{}{}\r\n来源摘要（最多 1024 字符）：\r\n{}\r\n\r\n建议依据：{}",
+                "原名称：{}\r\n已有别名：{}\r\n原标签：{}{}\r\n来源摘要（最多 1024 字符）：\r\n{}\r\n\r\n建议依据：{}\r\n新增标签会追加；留空不删除原标签。\r\n忽略建议仅忽略当前版本，不学习偏好；普通重试不会使其重新出现。",
                 p.candidate.title,
                 p.candidate.alias,
                 p.candidate.tags.join("、"),
@@ -182,7 +183,13 @@ unsafe fn selected(ptr: *const RefCell<View>) {
             ),
         );
     } else {
-        set(detail, "选择一条建议查看原始名称、完整路径或文本摘要");
+        let attention = state.borrow().attention_detail();
+        set(
+            detail,
+            attention
+                .as_deref()
+                .unwrap_or("选择一条建议查看原始名称、完整路径或文本摘要"),
+        );
     }
     if replace {
         let identity = (*ptr).borrow().editor_refresh.shown().cloned();
@@ -491,10 +498,17 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         )
                     };
                     if id == 6 {
-                        super::harness_memory_ui::show(hwnd, memory, submit, appearance);
+                        let settings =
+                            super::harness_memory_ui::show(hwnd, memory, submit, appearance);
+                        if settings {
+                            let mut v = (*ptr).borrow_mut();
+                            v.open_settings = true;
+                            v.done = true;
+                        }
                     } else {
+                        let list = (*ptr).borrow().list;
                         let index = SendMessageW(
-                            (*ptr).borrow().list,
+                            list,
                             LVM_GETNEXTITEM,
                             Some(WPARAM(usize::MAX)),
                             Some(LPARAM(LVNI_SELECTED as isize)),
@@ -506,9 +520,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                             None
                         };
                         if let Some(target) = target {
-                            super::harness_memory_ui::feedback(
+                            let settings = super::harness_memory_ui::feedback(
                                 hwnd, memory, submit, appearance, target,
                             );
+                            if settings {
+                                let mut v = (*ptr).borrow_mut();
+                                v.open_settings = true;
+                                v.done = true;
+                            }
                         } else {
                             let mut s = state.borrow_mut();
                             s.message = "请先选中一条已完成建议或需处理内容".into();
@@ -677,16 +696,16 @@ pub unsafe fn show(
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
     enabled: bool,
-) {
+) -> bool {
     let common = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES,
     };
     if !InitCommonControlsEx(&common).as_bool() {
-        return;
+        return false;
     }
     let Ok(instance) = GetModuleHandleW(None) else {
-        return;
+        return false;
     };
     let class = w!("QuickPanelOrganizerReview");
     let wc = WNDCLASSW {
@@ -733,6 +752,7 @@ pub unsafe fn show(
         done: false,
         enabled,
         memory,
+        open_settings: false,
         feedback_rows: vec![],
     }));
     let Ok(hwnd) = CreateWindowExW(
@@ -749,7 +769,7 @@ pub unsafe fn show(
         Some(instance.into()),
         Some((&*view as *const RefCell<View>).cast()),
     ) else {
-        return;
+        return false;
     };
     let font = view.borrow().font;
     let dark = view.borrow().colors.dark;
@@ -822,7 +842,7 @@ pub unsafe fn show(
         WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
         ALIAS,
     );
-    let tlabel = create(w!("STATIC"), "标签", WINDOW_STYLE::default(), 0);
+    let tlabel = create(w!("STATIC"), "新增标签", WINDOW_STYLE::default(), 0);
     let tags = create(
         w!("EDIT"),
         "",
@@ -832,7 +852,7 @@ pub unsafe fn show(
     SendMessageW(alias, EM_SETLIMITTEXT, Some(WPARAM(96)), None);
     SendMessageW(tags, EM_SETLIMITTEXT, Some(WPARAM(240)), None);
     let apply = create(w!("BUTTON"), "应用所选", WS_TABSTOP, 1);
-    let dismiss = create(w!("BUTTON"), "暂不处理", WS_TABSTOP, 2);
+    let dismiss = create(w!("BUTTON"), "忽略建议", WS_TABSTOP, 2);
     let retry = create(w!("BUTTON"), "重试", WS_TABSTOP, 3);
     let close = create(w!("BUTTON"), "关闭", WS_TABSTOP, 4);
     let feedback = create(w!("BUTTON"), "反馈并重做", WS_TABSTOP, 5);
@@ -914,4 +934,5 @@ pub unsafe fn show(
     if let Some(code) = quit {
         PostQuitMessage(code);
     }
+    view.borrow().open_settings
 }

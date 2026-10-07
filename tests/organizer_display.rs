@@ -192,3 +192,19 @@ fn organizer_entry_exposes_global_cooldown_without_per_item_errors() {
     p.items = vec![(source("a"), Stage::Ready)];
     assert!(p.label().contains("1") && p.label().contains("建议"));
 }
+
+#[test]
+fn clarity_attention_badge_and_count_survive_ready_and_paused_states() {
+    let entries = vec![Entry::Saved(saved("a"))];
+    let mut state = progress("a", Stage::Attention);
+    let rows = palette::row_details_with_progress(&entries, "", &state);
+    assert_eq!(rows[0].organizer_stage, Some(Stage::Attention));
+    assert_eq!(rows[0].organizer_stage.unwrap().label(), "需处理");
+    assert_eq!(state.label(), "AI 管家 · 需处理 1 条");
+    state.items.push((source("b"), Stage::Ready));
+    state.paused = true;
+    let label = state.label();
+    assert!(
+        label.contains("已暂停") && label.contains("1 条建议") && label.contains("需处理 1 条")
+    );
+}

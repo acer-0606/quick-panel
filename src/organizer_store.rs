@@ -130,7 +130,8 @@ impl OrganizerStore {
                         Status::Queued => Stage::Waiting,
                         Status::Processing => Stage::Processing,
                         Status::Ready(_) => Stage::Ready,
-                        Status::Done | Status::Attention { .. } => return None,
+                        Status::Attention { .. } => Stage::Attention,
+                        Status::Done => return None,
                     };
                     Some((r.candidate.source.clone(), stage))
                 })

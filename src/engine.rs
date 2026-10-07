@@ -633,7 +633,7 @@ impl Actor {
             return Ok(());
         }
         if !self.settings.organizer.memory_enabled {
-            return Err("请先启用“记住整理反馈”；反馈输入已保留".into());
+            return Err("请先启用“启用整理记忆（使用规则并记录反馈）”；反馈输入已保留".into());
         }
         if !text_valid(&reason, FEEDBACK_REASON_MAX_CHARS, false)
             || sources.is_empty()
@@ -1814,6 +1814,9 @@ impl Actor {
             {
                 return Err("整理建议已过期，请刷新后重试".into());
             }
+        }
+        for p in &proposals {
+            p.validate_manual()?;
         }
         let memory = self.harness_examples(&proposals, false)?;
         self.organizer_apply_metadata(&proposals, false)?;
@@ -3138,6 +3141,8 @@ impl Actor {
                 }
                 Command::HarnessMemorySnapshot { request_id } => {
                     let mut snapshot = self.repo.harness.snapshot();
+                    snapshot.organizer_enabled = self.settings.organizer.enabled;
+                    snapshot.memory_enabled = self.settings.organizer.memory_enabled;
                     let mut seen = std::collections::HashSet::new();
                     for record in &snapshot.records {
                         if let crate::harness_tools::MemoryScope::Item { source } = &record.scope

@@ -1114,7 +1114,10 @@ pub unsafe fn organizer_settings_form(
                 ),
                 (
                     "整理记忆",
-                    Field::Switch(settings.memory_enabled, "记住整理反馈"),
+                    Field::Switch(
+                        settings.memory_enabled,
+                        "启用整理记忆（使用规则并记录反馈）",
+                    ),
                 ),
                 (
                     "Pi 最大模型轮次（2–8）",
@@ -1492,7 +1495,7 @@ unsafe fn form_fields_with_test_theme(
                             "max",
                         ],
                         Field::OrganizerModeChoice(_) => {
-                            &["后台生成建议，由我确认", "后台自动应用空别名与标签"]
+                            &["后台生成建议，由我确认", "后台自动：仅填空别名，追加标签"]
                         }
                         _ => &[
                             "收藏、固定剪贴板和外部路径",

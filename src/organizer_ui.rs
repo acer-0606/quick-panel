@@ -546,7 +546,7 @@ impl ReviewState {
                 ReviewDecision::Dismiss(proposals.into_iter().map(|p| p.candidate.source).collect())
             } else {
                 for p in &proposals {
-                    p.validate()?;
+                    p.validate_manual()?;
                 }
                 self.submitted_sources = sources;
                 ReviewDecision::Apply(proposals)
@@ -590,6 +590,19 @@ impl ReviewState {
         true
     }
     pub fn status(&self, enabled: bool) -> String {
+        let mut status = self.status_inner(enabled);
+        if !enabled && !status.contains("管家已关闭") {
+            status = format!("管家已关闭，后台整理已停止；已有建议仍可管理。{status}");
+        }
+        if !self.snapshot.attention.is_empty() && !status.contains("需处理") {
+            status.push_str(&format!(
+                "；需处理 {} 条，可选中查看原因并重试",
+                self.snapshot.attention.len()
+            ));
+        }
+        status
+    }
+    fn status_inner(&self, enabled: bool) -> String {
         if !self.message.is_empty()
             && (self.pending() || self.needs_save || self.preserve_failed_drafts)
         {
@@ -652,6 +665,16 @@ impl ReviewState {
     }
 }
 
+/// In-memory draft carried through a settings round trip; never a submitted command.
+#[derive(Clone, Debug)]
+pub struct MemoryNavigationDraft {
+    pub target: Option<crate::harness_tools::FeedbackTarget>,
+    pub record: Option<crate::harness_tools::MemoryRecord>,
+    pub raw_input: String,
+    pub scope_choice: usize,
+    pub enabled: bool,
+    pub confirmed: bool,
+}
 /// Correlated native memory operations retain the exact submitted input for save retry.
 #[derive(Default)]
 pub struct MemoryUiState {
@@ -662,6 +685,7 @@ pub struct MemoryUiState {
     pub saving: bool,
     pub pending_save: bool,
     pub raw_input: String,
+    pub navigation_draft: Option<MemoryNavigationDraft>,
     snapshot_request: Option<u64>,
     semantic_admitted: bool,
     pending_work: Option<u64>,
@@ -686,6 +710,15 @@ pub fn memory_request_id() -> u64 {
     h.finish().max(1)
 }
 impl MemoryUiState {
+    pub fn navigation_draft_for(
+        &self,
+        target: Option<&crate::harness_tools::FeedbackTarget>,
+    ) -> Option<MemoryNavigationDraft> {
+        self.navigation_draft
+            .as_ref()
+            .filter(|draft| self.pending.is_none() && draft.target.as_ref() == target)
+            .cloned()
+    }
     /// Bind each not-yet-admitted attempt to the job present when sent to the actor.
     pub fn bind_work(&mut self, session: &OrganizerSession) {
         if !self.semantic_admitted {
@@ -768,6 +801,7 @@ impl MemoryUiState {
             Ok(()) if !pending_save => {
                 self.pending = None;
                 self.raw_input.clear();
+                self.navigation_draft = None;
                 "已保存".into()
             }
             Ok(()) => "尚未落盘，请重试保存".into(),
@@ -969,4 +1003,130 @@ pub fn memory_scrolled_fields(layout: &MemoryLayout, position: i32) -> [MemoryRe
         field.y -= position;
         field
     })
+}
+
+impl ReviewState {
+    pub fn attention_detail(&self) -> Option<String> {
+        self.selected_source.as_ref().and_then(|source| self.snapshot.attention.iter().find(|a| &a.source == source)).map(|a| format!("需处理：{}\r\n来源：{}\r\n所见版本：{}\r\n原因（{}）：{}\r\n\r\n该条没有可应用的完成建议。修复配置或原因后点击“重试”；也可“反馈并重做”（需启用管家与整理记忆）。", a.title, source_label(&a.source), a.expected_version, a.code, a.message))
+    }
+}
+pub fn memory_scope_label(
+    scope: &crate::harness_tools::MemoryScope,
+    snapshot: &crate::harness_tools::MemorySnapshot,
+) -> String {
+    use crate::harness_tools::MemoryScope;
+    match scope {
+        MemoryScope::Global => "全局".into(),
+        MemoryScope::Directory { path } => format!("目录：{path}"),
+        MemoryScope::Item { source } => format!(
+            "仅此内容：{}",
+            snapshot
+                .source_labels
+                .iter()
+                .find(|(s, _)| s == source)
+                .map(|(_, t)| t.as_str())
+                .unwrap_or("原内容已移除")
+        ),
+    }
+}
+pub fn source_label(source: &Source) -> String {
+    match source {
+        Source::SavedItem { id } => format!("本地内容：{id}"),
+        Source::ObservedPath { normalized_path } => format!("观察路径：{normalized_path}"),
+    }
+}
+pub fn memory_detail(
+    record: &crate::harness_tools::MemoryRecord,
+    snapshot: &crate::harness_tools::MemorySnapshot,
+) -> String {
+    use crate::harness_tools::{MemoryOrigin, MemoryScope};
+    let evidence = record
+        .evidence_ids
+        .iter()
+        .map(|id| {
+            id.strip_prefix("memory:")
+                .and_then(|s| s.parse::<u64>().ok())
+                .and_then(|id| snapshot.records.iter().find(|m| m.id == id))
+                .map(|m| format!("{}：{}", m.kind.label(), m.text))
+                .unwrap_or_else(|| format!("{id}（依据已移除）"))
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    let source = match &record.scope {
+        MemoryScope::Item { source } => source_label(source),
+        MemoryScope::Directory { path } => path.clone(),
+        MemoryScope::Global => "覆盖所有整理来源".into(),
+    };
+    format!(
+        "类型：{}\r\n{}\r\n来源：{}{}；{}\r\n单条配置：{}，{}\r\n{}\r\n关联别名：{}\r\n关联标签：{}\r\n规则或示例：{}\r\n依据：{}\r\n\r\n保存时将换行转为空格；扩大范围会将本条完整规则或示例用于新范围，包括拒绝示例的被拒别名。",
+        record.kind.label(),
+        memory_scope_label(&record.scope, snapshot),
+        if record.origin == MemoryOrigin::Human {
+            "人工"
+        } else {
+            "AI"
+        },
+        if record.proposed_by_ai {
+            "（最初由 AI 提出）"
+        } else {
+            ""
+        },
+        source,
+        if record.enabled {
+            "已启用"
+        } else {
+            "已停用"
+        },
+        if record.confirmed {
+            "已确认"
+        } else {
+            "待确认"
+        },
+        if snapshot.record_effective(record) {
+            "当前生效：是（仅所选范围）"
+        } else {
+            "当前不生效（需管家与整理记忆开启，且本条为已启用、已确认的人工记忆）"
+        },
+        record.alias.as_deref().unwrap_or("无"),
+        if record.tags.is_empty() {
+            "无".into()
+        } else {
+            record.tags.join("、")
+        },
+        record.text,
+        if evidence.is_empty() {
+            "本地整理与反馈"
+        } else {
+            &evidence
+        }
+    )
+}
+pub fn memory_scope_impact(
+    record: &crate::harness_tools::MemoryRecord,
+    scope: &crate::harness_tools::MemoryScope,
+    snapshot: &crate::harness_tools::MemorySnapshot,
+) -> String {
+    format!(
+        "所选范围：{}\r\n将用于此范围的{}：{}\r\n{}别名：{}\r\n关联标签：{}",
+        memory_scope_label(scope, snapshot),
+        record.kind.label(),
+        record.text,
+        if record.kind == crate::harness_tools::MemoryKind::Rejected {
+            "被拒"
+        } else {
+            "关联"
+        },
+        record.alias.as_deref().unwrap_or("无"),
+        record.tags.join("、")
+    )
+}
+pub fn feedback_intro(title: &str, target: &crate::harness_tools::FeedbackTarget) -> String {
+    format!(
+        "原名称：{title}\r\n来源：{}\r\n所见被拒名称：{}\r\n拒绝原因（1–256字符）。保存即启用此反馈，并重做当前来源；选择同目录或全局会扩大此反馈及被拒名称的影响范围。",
+        source_label(&target.source),
+        target
+            .rejected_alias
+            .as_deref()
+            .unwrap_or("暂无完成建议，仅记录原因")
+    )
 }

@@ -6,6 +6,7 @@ pub enum Stage {
     Waiting,
     Processing,
     Ready,
+    Attention,
 }
 impl Stage {
     pub fn label(self) -> &'static str {
@@ -13,6 +14,7 @@ impl Stage {
             Self::Waiting => "待整理",
             Self::Processing => "整理中",
             Self::Ready => "有整理建议",
+            Self::Attention => "需处理",
         }
     }
 }
@@ -49,6 +51,11 @@ impl Progress {
             .iter()
             .filter(|(_, s)| *s == Stage::Waiting)
             .count();
+        let attention = self
+            .items
+            .iter()
+            .filter(|(_, s)| *s == Stage::Attention)
+            .count();
         let mut text = String::from("AI 管家");
         if !status.is_empty() {
             text.push_str(&format!(" · {status}"));
@@ -57,8 +64,11 @@ impl Progress {
             text.push_str(&format!(" · {ready} 条建议"));
         } else if status.is_empty() && waiting > 0 {
             text.push_str(&format!(" · 待整理 {waiting} 条"));
-        } else if status.is_empty() {
+        } else if status.is_empty() && attention == 0 {
             text.push_str(" · 暂无待办");
+        }
+        if attention > 0 {
+            text.push_str(&format!(" · 需处理 {attention} 条"));
         }
         text
     }

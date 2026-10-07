@@ -308,6 +308,8 @@ impl HarnessStore {
     }
     pub fn snapshot(&self) -> MemorySnapshot {
         MemorySnapshot {
+            organizer_enabled: false,
+            memory_enabled: false,
             source_labels: Vec::new(),
             version: self.version,
             records: self.memories.clone(),

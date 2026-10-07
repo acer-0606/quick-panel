@@ -106,6 +106,32 @@ pub struct Proposal {
     pub reason: String,
 }
 impl Proposal {
+    /// Human input errors identify the field; persisted/model validation remains unchanged.
+    pub fn validate_manual(&self) -> Result<(), String> {
+        if let Some(alias) = &self.alias {
+            if alias.chars().count() > MAX_ALIAS_CHARS {
+                return Err("别名最多48字符，请缩短后再应用".into());
+            }
+            if !metadata_text(alias, MAX_ALIAS_CHARS) {
+                return Err("别名须为1–48字符，不能含控制字符或方向控制符".into());
+            }
+        }
+        if self.tags.len() > MAX_TAGS {
+            return Err("新增标签最多4个，请减少后再应用".into());
+        }
+        for (index, tag) in self.tags.iter().enumerate() {
+            if tag.chars().count() > MAX_TAG_CHARS {
+                return Err("每个新增标签最多24字符，请缩短后再应用".into());
+            }
+            if !metadata_text(tag, MAX_TAG_CHARS) {
+                return Err("新增标签须为1–24字符，不能含控制字符或方向控制符".into());
+            }
+            if self.tags[..index].contains(tag) {
+                return Err("新增标签不能重复，请删除重复项后再应用".into());
+            }
+        }
+        self.validate()
+    }
     /// Validate edited or persisted suggestions again before local application.
     pub fn validate(&self) -> Result<(), String> {
         if self

@@ -78,6 +78,8 @@ pub struct MemoryEdit {
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MemorySnapshot {
+    pub organizer_enabled: bool,
+    pub memory_enabled: bool,
     pub source_labels: Vec<(Source, String)>,
     pub version: u64,
     pub records: Vec<MemoryRecord>,
@@ -162,4 +164,44 @@ pub(crate) struct RuleArgs {
     pub index: usize,
     pub text: String,
     pub evidence_ids: Vec<String>,
+}
+
+impl MemorySnapshot {
+    /// Read-only availability; never mutates stored record flags.
+    pub fn feedback_available(&self) -> bool {
+        self.organizer_enabled && self.memory_enabled && self.storage_error.is_none()
+    }
+    pub fn record_effective(&self, record: &MemoryRecord) -> bool {
+        self.feedback_available()
+            && record.enabled
+            && record.confirmed
+            && record.origin == MemoryOrigin::Human
+    }
+    pub fn availability(&self) -> String {
+        let mut messages = Vec::new();
+        if !self.organizer_enabled {
+            messages.push("AI 管家已关闭：后台整理已停止；已有建议与记忆仍可管理，记忆当前不生效，新反馈请先到管家设置启用。");
+        }
+        if !self.memory_enabled {
+            messages.push("整理记忆已关闭：不使用已有记忆，也不记录新反馈；单条启用状态仍保留，已有记忆可编辑或删除。请到管家设置启用。");
+        }
+        if let Some(error) = &self.storage_error {
+            messages.push(error);
+        }
+        if messages.is_empty() {
+            messages.push("整理记忆已启用：使用已确认的人工记忆并记录反馈；范围与单条启用、确认状态按您的选择保存。");
+        }
+        messages.join("\r\n")
+    }
+}
+impl MemoryKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rule => "规则",
+            Self::Accepted => "采用示例",
+            Self::Edited => "修改示例",
+            Self::Rejected => "拒绝示例",
+            Self::AiApplied => "自动结果",
+        }
+    }
 }

@@ -275,10 +275,15 @@ impl RenderState {
         n * self.dpi as i32 / 96
     }
 }
+enum OrganizerManagement {
+    Memory,
+    Review,
+}
 enum UiEffect {
     OrganizerSettings {
         owner: HWND,
         settings: crate::organizer::OrganizerSettings,
+        return_to: Option<OrganizerManagement>,
     },
     HarnessMemory {
         owner: HWND,
@@ -1009,6 +1014,7 @@ impl App {
         self.effects.push_back(UiEffect::OrganizerSettings {
             owner: self.hwnd,
             settings: self.settings.organizer.clone(),
+            return_to: None,
         });
     }
     unsafe fn review_organizer(&mut self) {
@@ -4370,7 +4376,11 @@ impl Host {
                 break;
             };
             match effect {
-                UiEffect::OrganizerSettings { owner, settings } => {
+                UiEffect::OrganizerSettings {
+                    owner,
+                    settings,
+                    return_to,
+                } => {
                     let (appearance, ai, path_enabled) = {
                         let app = self.app.borrow();
                         (
@@ -4409,6 +4419,13 @@ impl Host {
                             }
                         }
                     }
+                    if app.state.lifecycle == Lifecycle::Running {
+                        match return_to {
+                            Some(OrganizerManagement::Memory) => app.show_harness_memory(),
+                            Some(OrganizerManagement::Review) => app.review_organizer(),
+                            None => (),
+                        }
+                    }
                 }
                 UiEffect::HarnessMemory {
                     owner,
@@ -4417,7 +4434,14 @@ impl Host {
                     appearance,
                 } => {
                     let address = owner.0 as usize;
-                    super::harness_memory_ui::show(
+                    {
+                        let app = self.app.borrow();
+                        let mut memory = state.borrow_mut();
+                        memory.snapshot.organizer_enabled = app.settings.organizer.enabled;
+                        memory.snapshot.memory_enabled = app.settings.organizer.memory_enabled;
+                        memory.revision += 1;
+                    }
+                    let settings_requested = super::harness_memory_ui::show(
                         owner,
                         state,
                         Rc::new(move |command| {
@@ -4431,7 +4455,16 @@ impl Host {
                         }),
                         appearance,
                     );
-                    self.app.borrow_mut().state.modal_open = false;
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if settings_requested {
+                        app.organizer_settings();
+                        if let Some(UiEffect::OrganizerSettings { return_to, .. }) =
+                            app.effects.back_mut()
+                        {
+                            *return_to = Some(OrganizerManagement::Memory);
+                        }
+                    }
                 }
                 UiEffect::OrganizerReview {
                     owner,
@@ -4442,7 +4475,14 @@ impl Host {
                 } => {
                     let address = owner.0 as usize;
                     let memory = self.app.borrow().harness_memory.clone();
-                    organizer_ui::show(
+                    {
+                        let app = self.app.borrow();
+                        let mut m = memory.borrow_mut();
+                        m.snapshot.organizer_enabled = app.settings.organizer.enabled;
+                        m.snapshot.memory_enabled = app.settings.organizer.memory_enabled;
+                        m.revision += 1;
+                    }
+                    let settings_requested = organizer_ui::show(
                         owner,
                         state,
                         memory,
@@ -4468,6 +4508,14 @@ impl Host {
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     app.organizer_page_open = false;
+                    if settings_requested {
+                        app.organizer_settings();
+                        if let Some(UiEffect::OrganizerSettings { return_to, .. }) =
+                            app.effects.back_mut()
+                        {
+                            *return_to = Some(OrganizerManagement::Review);
+                        }
+                    }
                 }
                 UiEffect::ScreenshotSelect {
                     owner,

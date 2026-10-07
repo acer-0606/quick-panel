@@ -405,6 +405,7 @@ fn feedback_persists_reason_scope_negative_alias_and_duplicate_request_is_idempo
     assert!(receipt(&e, 80).0.is_ok());
     let m = memory(&e);
     assert_eq!(m.records.len(), 1);
+    assert!(m.organizer_enabled && m.memory_enabled);
     assert_eq!(m.records[0].text, "要保留项目标识");
     assert_eq!(m.records[0].alias.as_deref(), Some("已拒别名"));
     assert_eq!(
@@ -430,6 +431,33 @@ fn feedback_persists_reason_scope_negative_alias_and_duplicate_request_is_idempo
     )
     .unwrap();
     assert_eq!(recalled["records"][0]["text"], "要保留项目标识");
+    let mut disabled = config();
+    disabled.organizer.memory_enabled = false;
+    settings(&e, disabled.clone());
+    let records = memory(&e).records;
+    let db = Connection::open(&p).unwrap();
+    let before = data_version(&db);
+    for _ in 0..4 {
+        let projected = memory(&e);
+        assert!(projected.organizer_enabled && !projected.memory_enabled);
+        assert_eq!(projected.records, records);
+        assert!(!projected.record_effective(&projected.records[0]));
+        assert!(projected.availability().contains("整理记忆已关闭"));
+    }
+    assert_eq!(
+        data_version(&db),
+        before,
+        "read-only projection must not commit"
+    );
+    let redo = work(&e);
+    assert!(submit(&e, &redo, "negative-disabled", "已拒别名").is_ok());
+    assert_eq!(memory(&e).records, records);
+    disabled.organizer.enabled = false;
+    settings(&e, disabled);
+    let projected = memory(&e);
+    assert!(!projected.organizer_enabled && !projected.memory_enabled);
+    assert_eq!(projected.records, records);
+    assert!(projected.availability().contains("AI 管家已关闭"));
     stop(&e);
     let e = open(&p);
     assert_eq!(memory(&e).records.len(), 1);
@@ -1593,6 +1621,25 @@ fn feedback_on_processing_and_attention_without_displayed_alias_never_learns_hid
         retryable: false,
     })
     .unwrap();
+    e.send(Command::OrganizerProgress { request_id: 909 })
+        .unwrap();
+    let Event::OrganizerProgress { progress, .. } = wait(&e, |v| {
+        matches!(
+            v,
+            Event::OrganizerProgress {
+                request_id: 909,
+                ..
+            }
+        )
+    }) else {
+        panic!()
+    };
+    assert!(
+        progress.label().contains("需处理 1 条"),
+        "{}",
+        progress.label()
+    );
+    assert!(!progress.label().contains("暂无待办"));
     let attention = snapshot(&e).attention[0].clone();
     let target = FeedbackTarget {
         source: attention.source,

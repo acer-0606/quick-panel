@@ -31,12 +31,14 @@ struct View {
     target: Option<(String, FeedbackTarget)>,
     shown: Option<MemoryRecord>,
     records: Vec<MemoryRecord>,
+    availability: Option<(bool, bool, bool)>,
     controls: Vec<HWND>,
     colors: theme::Colors,
     appearance: Theme,
     font: HFONT,
     dpi: u32,
     done: bool,
+    open_settings: bool,
     revision: u64,
     viewport: HWND,
     scroll_y: i32,
@@ -47,21 +49,6 @@ unsafe fn set(hwnd: HWND, value: &str) {
     if text(hwnd) != value {
         let s = wide(value);
         let _ = SetWindowTextW(hwnd, PCWSTR(s.as_ptr()));
-    }
-}
-fn scope_label(scope: &MemoryScope, snapshot: &MemorySnapshot) -> String {
-    match scope {
-        MemoryScope::Global => "全局".into(),
-        MemoryScope::Directory { path } => format!("目录：{path}"),
-        MemoryScope::Item { source } => format!(
-            "仅此内容：{}",
-            snapshot
-                .source_labels
-                .iter()
-                .find(|(s, _)| s == source)
-                .map(|(_, t)| t.as_str())
-                .unwrap_or("原内容已移除")
-        ),
     }
 }
 unsafe fn selected(ptr: *const RefCell<View>) {
@@ -78,39 +65,9 @@ unsafe fn selected(ptr: *const RefCell<View>) {
         .flatten();
     if let Some(record) = record {
         let snapshot = state.borrow().snapshot.clone();
-        let evidence = record
-            .evidence_ids
-            .iter()
-            .map(|id| {
-                id.strip_prefix("memory:")
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .and_then(|id| snapshot.records.iter().find(|m| m.id == id))
-                    .map(|m| m.text.clone())
-                    .unwrap_or_else(|| "依据已移除".into())
-            })
-            .collect::<Vec<_>>()
-            .join("；");
         set(
             controls[2],
-            &format!(
-                "{}\r\n来源：{}{}\r\n依据：{}",
-                scope_label(&record.scope, &snapshot),
-                if record.origin == MemoryOrigin::Human {
-                    "人工"
-                } else {
-                    "AI"
-                },
-                if record.proposed_by_ai {
-                    "（最初由 AI 提出）"
-                } else {
-                    ""
-                },
-                if evidence.is_empty() {
-                    "本地整理与反馈"
-                } else {
-                    &evidence
-                }
-            ),
+            &crate::organizer_ui::memory_detail(&record, &snapshot),
         );
         set(controls[3], &record.text);
         let scope = match record.scope {
@@ -131,6 +88,7 @@ unsafe fn selected(ptr: *const RefCell<View>) {
             Some(WPARAM(usize::from(record.confirmed))),
             None,
         );
+        state.borrow_mut().navigation_draft = None;
         (*ptr).borrow_mut().shown = Some(record);
     }
 }
@@ -160,35 +118,45 @@ unsafe fn render(ptr: *const RefCell<View>) {
     if old == revision {
         return;
     }
+    let note = snapshot.availability();
     set(
         controls[0],
-        snapshot
-            .storage_error
-            .as_deref()
-            .unwrap_or(if message.is_empty() {
-                "保存时将换行转为空格；范围与确认状态按您的选择保存。"
-            } else {
-                &message
-            }),
+        &if message.is_empty() {
+            note
+        } else {
+            format!("{message}\r\n{note}")
+        },
     );
-    if !feedback && (*ptr).borrow().records != snapshot.records && !saving && !pending_save {
+    let availability = (
+        snapshot.organizer_enabled,
+        snapshot.memory_enabled,
+        snapshot.storage_error.is_some(),
+    );
+    let rebuild = {
+        let v = (*ptr).borrow();
+        v.records != snapshot.records || v.availability != Some(availability)
+    };
+    if !feedback && rebuild && !saving && !pending_save {
         let selected_id = (*ptr).borrow().shown.as_ref().map(|m| m.id);
         let top = SendMessageW(controls[1], LB_GETTOPINDEX, None, None);
         SendMessageW(controls[1], WM_SETREDRAW, Some(WPARAM(0)), None);
         SendMessageW(controls[1], LB_RESETCONTENT, None, None);
         for record in &snapshot.records {
             let label = wide(&format!(
-                "{}  ·  {}  ·  {}  ·  {}",
-                scope_label(&record.scope, &snapshot),
+                "{} · {} · {} · {} · {}",
+                record.kind.label(),
+                crate::organizer_ui::memory_scope_label(&record.scope, &snapshot),
                 if record.origin == MemoryOrigin::Human {
                     "人工"
                 } else {
                     "AI"
                 },
                 if !record.enabled {
-                    "已停用"
+                    "单条已停用"
+                } else if snapshot.record_effective(record) {
+                    "当前生效"
                 } else if record.confirmed {
-                    "已确认"
+                    "单条已启用/已确认，当前不生效"
                 } else {
                     "待确认"
                 },
@@ -216,13 +184,25 @@ unsafe fn render(ptr: *const RefCell<View>) {
         );
         SendMessageW(controls[1], WM_SETREDRAW, Some(WPARAM(1)), None);
         let _ = InvalidateRect(Some(controls[1]), None, true);
-        (*ptr).borrow_mut().records = snapshot.records;
+        (*ptr).borrow_mut().records = snapshot.records.clone();
     }
+    let available = !feedback || snapshot.feedback_available();
     for c in &controls[3..8] {
-        let _ = EnableWindow(*c, !saving && !pending_save);
+        let _ = EnableWindow(*c, !saving && !pending_save && available);
     }
-    let _ = EnableWindow(controls[8], !saving && state.borrow().pending.is_some());
+    let has_pending = state.borrow().pending.is_some();
+    set(
+        controls[8],
+        if has_pending {
+            "重试保存"
+        } else {
+            "管家设置"
+        },
+    );
+    let _ = EnableWindow(controls[8], !saving);
     let _ = EnableWindow(controls[9], !saving && !pending_save && !feedback);
+    scope_preview(ptr);
+    (*ptr).borrow_mut().availability = Some(availability);
     (*ptr).borrow_mut().revision = revision;
 }
 unsafe fn action(ptr: *const RefCell<View>, id: usize) {
@@ -241,12 +221,32 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
         return;
     }
     if id == 8 {
-        if let Some(command) = state.borrow_mut().retry() {
-            submit(command);
+        let has_pending = state.borrow().pending.is_some();
+        if has_pending {
+            let command = state.borrow_mut().retry();
+            if let Some(command) = command {
+                submit(command);
+            }
+        } else {
+            let draft = crate::organizer_ui::MemoryNavigationDraft {
+                target: target.as_ref().map(|(_, target)| target.clone()),
+                record: shown,
+                raw_input: text(controls[3]),
+                scope_choice: SendMessageW(controls[4], CB_GETCURSEL, None, None).0.max(0) as usize,
+                enabled: SendMessageW(controls[5], BM_GETCHECK, None, None).0 == 1,
+                confirmed: SendMessageW(controls[6], BM_GETCHECK, None, None).0 == 1,
+            };
+            state.borrow_mut().navigation_draft = Some(draft);
+            let mut v = (*ptr).borrow_mut();
+            v.open_settings = true;
+            v.done = true;
         }
         return;
     }
     if state.borrow().saving || state.borrow().pending_save {
+        return;
+    }
+    if target.is_some() && !state.borrow().snapshot.feedback_available() {
         return;
     }
     let command = if id == 9 {
@@ -318,11 +318,71 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
             }
         }
     };
-    match state.borrow_mut().submit(command) {
+    let result = state.borrow_mut().submit(command);
+    match result {
         Ok(command) => submit(command),
         Err(message) => {
             set(controls[0], &message);
         }
+    }
+}
+unsafe fn scope_preview(ptr: *const RefCell<View>) {
+    let (controls, state, target, shown) = {
+        let v = (*ptr).borrow();
+        (
+            v.controls.clone(),
+            v.state.clone(),
+            v.target.clone(),
+            v.shown.clone(),
+        )
+    };
+    if controls.len() != 11 {
+        return;
+    }
+    let snapshot = state.borrow().snapshot.clone();
+    let choice = SendMessageW(controls[4], CB_GETCURSEL, None, None).0;
+    if let Some((title, target)) = target {
+        let scope = match choice {
+            1 => "同目录：此目录内的整理来源",
+            2 => "全局：所有整理来源",
+            _ => "仅当前内容",
+        };
+        set(
+            controls[2],
+            &format!(
+                "{}\r\n当前所选范围：{scope}",
+                crate::organizer_ui::feedback_intro(&title, &target)
+            ),
+        );
+    } else if let Some(record) = shown {
+        let valid = choice == 2
+            || (choice == 1 && matches!(record.scope, MemoryScope::Directory { .. }))
+            || (choice == 0 && matches!(record.scope, MemoryScope::Item { .. }));
+        let scope = if choice == 2 {
+            MemoryScope::Global
+        } else {
+            record.scope.clone()
+        };
+        if !valid {
+            set(
+                controls[2],
+                &format!(
+                    "{}\r\n所选范围无效：请保留原范围或明确选择全局；目录反馈请从原内容发起。",
+                    crate::organizer_ui::memory_detail(&record, &snapshot)
+                ),
+            );
+            return;
+        }
+        let mut preview = record.clone();
+        preview.text = text(controls[3]);
+        set(
+            controls[2],
+            &format!(
+                "{}\r\n\r\n{}",
+                crate::organizer_ui::memory_detail(&record, &snapshot),
+                crate::organizer_ui::memory_scope_impact(&preview, &scope, &snapshot)
+            ),
+        );
     }
 }
 unsafe fn scroll_content(ptr: *const RefCell<View>, position: i32) {
@@ -559,6 +619,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 let id = wp.0 & 0xffff;
                 if id == 1 && wp.0 >> 16 == LBN_SELCHANGE as usize {
                     selected(ptr);
+                } else if (id == 4 && wp.0 >> 16 == CBN_SELCHANGE as usize)
+                    || (id == 3 && wp.0 >> 16 == EN_CHANGE as usize)
+                {
+                    scope_preview(ptr);
                 } else if (7..=10).contains(&id) {
                     action(ptr, id);
                 }
@@ -648,7 +712,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_THEMECHANGED | WM_SETTINGCHANGE => {
                 let appearance = (*ptr).borrow().appearance;
                 (*ptr).borrow_mut().colors = theme::Colors::new(appearance);
-                theme::apply(hwnd, (*ptr).borrow().colors.dark);
+                let dark = (*ptr).borrow().colors.dark;
+                theme::apply(hwnd, dark);
                 let _ = InvalidateRect(Some(hwnd), None, true);
                 return LRESULT(0);
             }
@@ -662,8 +727,8 @@ pub unsafe fn show(
     state: Rc<RefCell<MemoryUiState>>,
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
-) {
-    show_form(owner, state, submit, appearance, None);
+) -> bool {
+    show_form(owner, state, submit, appearance, None)
 }
 pub unsafe fn feedback(
     owner: HWND,
@@ -671,8 +736,8 @@ pub unsafe fn feedback(
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
     target: (String, FeedbackTarget),
-) {
-    show_form(owner, state, submit, appearance, Some(target));
+) -> bool {
+    show_form(owner, state, submit, appearance, Some(target))
 }
 unsafe fn show_form(
     owner: HWND,
@@ -680,15 +745,15 @@ unsafe fn show_form(
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
     target: Option<(String, FeedbackTarget)>,
-) {
-    if target.is_none() {
+) -> bool {
+    {
         let command = state.borrow_mut().request_snapshot();
         if let Some(command) = command {
             submit(command);
         }
     }
     let Ok(instance) = GetModuleHandleW(None) else {
-        return;
+        return false;
     };
     let class = w!("QuickPanelHarnessMemory");
     RegisterClassW(&WNDCLASSW {
@@ -716,12 +781,14 @@ unsafe fn show_form(
         target: target.clone(),
         shown: None,
         records: vec![],
+        availability: None,
         controls: vec![],
         colors: theme::Colors::new(appearance),
         appearance,
         font: theme::font(dpi),
         dpi,
         done: false,
+        open_settings: false,
         revision: u64::MAX,
         viewport: HWND::default(),
         scroll_y: 0,
@@ -748,7 +815,7 @@ unsafe fn show_form(
         Some((&*view as *const RefCell<View>).cast()),
     ) else {
         let _ = DeleteObject(view.borrow().font.into());
-        return;
+        return false;
     };
     let Ok(viewport) = CreateWindowExW(
         WS_EX_CONTROLPARENT,
@@ -766,7 +833,7 @@ unsafe fn show_form(
     ) else {
         let _ = DestroyWindow(hwnd);
         let _ = DeleteObject(view.borrow().font.into());
-        return;
+        return false;
     };
     view.borrow_mut().viewport = viewport;
     if !SetWindowSubclass(
@@ -779,7 +846,7 @@ unsafe fn show_form(
     {
         let _ = DestroyWindow(hwnd);
         let _ = DeleteObject(view.borrow().font.into());
-        return;
+        return false;
     }
     let create = |class: PCWSTR, label: &str, style: WINDOW_STYLE, id: usize| {
         let label = wide(label);
@@ -800,7 +867,12 @@ unsafe fn show_form(
         .unwrap_or_default()
     };
     let controls = vec![
-        create(w!("STATIC"), "", WINDOW_STYLE::default(), 0),
+        create(
+            w!("EDIT"),
+            "",
+            WS_TABSTOP | WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_READONLY) as u32),
+            0,
+        ),
         create(
             w!("LISTBOX"),
             "",
@@ -825,18 +897,26 @@ unsafe fn show_form(
             WS_TABSTOP | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
             4,
         ),
-        create(
-            w!("BUTTON"),
-            "启用这条记忆",
-            WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-            5,
-        ),
-        create(
-            w!("BUTTON"),
-            "我确认此规则及所选范围",
-            WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-            6,
-        ),
+        if target.is_none() {
+            create(
+                w!("BUTTON"),
+                "启用这条记忆",
+                WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                5,
+            )
+        } else {
+            create(w!("STATIC"), "", WINDOW_STYLE::default(), 5)
+        },
+        if target.is_none() {
+            create(
+                w!("BUTTON"),
+                "我确认此规则及所选范围",
+                WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                6,
+            )
+        } else {
+            create(w!("STATIC"), "", WINDOW_STYLE::default(), 6)
+        },
         create(
             w!("BUTTON"),
             if target.is_some() {
@@ -876,20 +956,20 @@ unsafe fn show_form(
     if let Some((title, target)) = &target {
         set(
             controls[2],
-            &format!(
-                "原名称：{title}\r\n所见建议：{}\r\n请说明拒绝原因（1–256 字符）；需先启用“记住整理反馈”。",
-                target.rejected_alias.as_deref().unwrap_or("暂无建议")
-            ),
+            &crate::organizer_ui::feedback_intro(title, target),
         );
+        let (pending, raw) = {
+            let s = state.borrow();
+            (s.pending.clone(), s.raw_input.clone())
+        };
         if let Some(Command::HarnessFeedback {
             sources,
             reason,
             scope,
             ..
-        }) = &state.borrow().pending
+        }) = &pending
             && sources == &vec![target.clone()]
         {
-            let raw = state.borrow().raw_input.clone();
             set(controls[3], if raw.is_empty() { reason } else { &raw });
             SendMessageW(
                 controls[4],
@@ -922,7 +1002,7 @@ unsafe fn show_form(
                 controls[2],
                 &format!(
                     "{}\r\n尚未确认落盘的编辑已保留",
-                    scope_label(&input.scope, &snapshot)
+                    crate::organizer_ui::memory_scope_label(&input.scope, &snapshot)
                 ),
             );
             set(controls[3], if raw.is_empty() { &input.text } else { &raw });
@@ -946,15 +1026,41 @@ unsafe fn show_form(
             );
         }
     }
-    for c in &controls {
+    let draft = state
+        .borrow()
+        .navigation_draft_for(target.as_ref().map(|(_, target)| target));
+    if let Some(draft) = draft {
+        view.borrow_mut().shown = draft.record;
+        set(controls[3], &draft.raw_input);
         SendMessageW(
-            *c,
-            WM_SETFONT,
-            Some(WPARAM(view.borrow().font.0 as usize)),
+            controls[4],
+            CB_SETCURSEL,
+            Some(WPARAM(draft.scope_choice)),
             None,
         );
+        if target.is_none() {
+            SendMessageW(
+                controls[5],
+                BM_SETCHECK,
+                Some(WPARAM(usize::from(draft.enabled))),
+                None,
+            );
+            SendMessageW(
+                controls[6],
+                BM_SETCHECK,
+                Some(WPARAM(usize::from(draft.confirmed))),
+                None,
+            );
+        }
     }
-    let focus = if target.is_some() {
+    let font = view.borrow().font;
+    for c in &controls {
+        SendMessageW(*c, WM_SETFONT, Some(WPARAM(font.0 as usize)), None);
+    }
+    let feedback_available = state.borrow().snapshot.feedback_available();
+    let focus = if target.is_some() && !feedback_available {
+        controls[8]
+    } else if target.is_some() {
         controls[3]
     } else {
         controls[1]
@@ -968,7 +1074,8 @@ unsafe fn show_form(
         );
     }
     view.borrow_mut().controls = controls;
-    theme::apply(hwnd, view.borrow().colors.dark);
+    let dark = view.borrow().colors.dark;
+    theme::apply(hwnd, dark);
     layout(hwnd, &*view);
     render(&*view);
     let _ = EnableWindow(owner, false);
@@ -1014,4 +1121,5 @@ unsafe fn show_form(
     if let Some(code) = quit {
         PostQuitMessage(code);
     }
+    view.borrow().open_settings
 }

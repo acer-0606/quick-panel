@@ -695,6 +695,17 @@ fn attention_rows_remain_non_applicable_and_status_explains_local_recovery() {
     assert!(state.begin_decision(false).is_err());
     assert_eq!(state.feedback_target().unwrap().1.rejected_alias, None);
     assert!(state.status(true).contains("需处理"));
+    let detail = state.attention_detail().unwrap();
+    for part in [
+        "合成来源",
+        "synthetic",
+        "round_limit",
+        "已达到模型轮次上限",
+        "重试",
+        "反馈并重做",
+    ] {
+        assert!(detail.contains(part), "{detail}");
+    }
 }
 #[test]
 fn memory_small_screen_layout_scrolls_every_field_without_overlap_or_footer_obstruction() {
@@ -892,4 +903,152 @@ fn memory_scroll_explicitly_repositions_partially_clipped_children() {
     assert_eq!(memory_scrolled_fields(&layout, -99), layout.fields);
     let clamped = memory_scrolled_fields(&layout, i32::MAX);
     assert_eq!(clamped[6].bottom(), layout.viewport_height - 24);
+}
+
+#[test]
+fn clarity_manual_alias_error_names_field_and_retains_raw_input() {
+    let mut ui = ReviewState::default();
+    ui.snapshot.proposals = vec![proposal()];
+    ui.select(Some(0));
+    ui.check(0, true);
+    let raw = format!(" {} ", "名".repeat(49));
+    ui.edit(raw.clone(), "资料".into());
+    let error = ui.begin_decision(false).unwrap_err();
+    assert!(error.contains("别名最多48字符"), "{error}");
+    assert_eq!(ui.editor_text().unwrap().0, raw);
+    assert!(!ui.pending());
+}
+#[test]
+fn clarity_manual_tags_error_names_count_and_item_limits() {
+    let mut ui = ReviewState::default();
+    ui.snapshot.proposals = vec![proposal()];
+    ui.select(Some(0));
+    ui.check(0, true);
+    ui.edit("名称".into(), "一,二,三,四,五".into());
+    let error = ui.begin_decision(false).unwrap_err();
+    assert!(error.contains("新增标签最多4个"), "{error}");
+    ui.edit("名称".into(), "标".repeat(25));
+    let error = ui.begin_decision(false).unwrap_err();
+    assert!(error.contains("每个新增标签最多24字符"), "{error}");
+}
+
+#[test]
+fn clarity_memory_detail_discloses_rejected_alias_tags_scope_and_disabled_effect() {
+    use quick_panel::harness_tools::*;
+    let record = MemoryRecord {
+        id: 1,
+        scope: MemoryScope::Global,
+        kind: MemoryKind::Rejected,
+        origin: MemoryOrigin::Human,
+        proposed_by_ai: false,
+        text: "保留标识".into(),
+        alias: Some("被拒名称完整".into()),
+        tags: vec!["项目".into()],
+        evidence_ids: vec![],
+        confirmed: true,
+        enabled: true,
+        created_at_ms: 0,
+    };
+    let snapshot = MemorySnapshot {
+        organizer_enabled: true,
+        memory_enabled: false,
+        records: vec![record.clone()],
+        ..Default::default()
+    };
+    assert!(!snapshot.record_effective(&record));
+    assert!(snapshot.availability().contains("整理记忆已关闭"));
+    let detail = memory_detail(&record, &snapshot);
+    for part in ["拒绝示例", "被拒名称完整", "项目", "全局", "当前不生效"] {
+        assert!(detail.contains(part), "{detail}");
+    }
+    let impact = memory_scope_impact(&record, &MemoryScope::Global, &snapshot);
+    for part in [
+        "所选范围：全局",
+        "被拒别名：被拒名称完整",
+        "保留标识",
+        "关联标签：项目",
+    ] {
+        assert!(impact.contains(part), "{impact}");
+    }
+    for organizer_enabled in [false, true] {
+        for memory_enabled in [false, true] {
+            let projection = MemorySnapshot {
+                organizer_enabled,
+                memory_enabled,
+                ..snapshot.clone()
+            };
+            assert_eq!(
+                projection.feedback_available(),
+                organizer_enabled && memory_enabled
+            );
+            assert_eq!(
+                projection.record_effective(&record),
+                organizer_enabled && memory_enabled
+            );
+            assert_eq!(projection.records, snapshot.records);
+        }
+    }
+}
+#[test]
+fn clarity_feedback_intro_explains_immediate_activation_and_has_no_confirm_fields() {
+    let p = proposal();
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![p],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    let intro = feedback_intro("原文", &target);
+    for part in ["保存即启用", "建议", "范围", "拒绝"] {
+        assert!(intro.contains(part), "{intro}");
+    }
+    let feedback = memory_layout(640, 360, 96, true);
+    assert_eq!(feedback.fields[5].height, 0);
+    assert_eq!(feedback.fields[6].height, 0);
+    let management = memory_layout(640, 360, 96, false);
+    assert!(management.fields[5].height > 0 && management.fields[6].height > 0);
+}
+
+#[test]
+fn clarity_settings_navigation_keeps_raw_feedback_bound_to_exact_seen_target() {
+    use quick_panel::{harness_tools::FeedbackScope, model::Command};
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    let raw = "  不要换名\r\n保留标识  ";
+    let mut state = MemoryUiState::default();
+    state.navigation_draft = Some(MemoryNavigationDraft {
+        target: Some(target.clone()),
+        record: None,
+        raw_input: raw.into(),
+        scope_choice: 2,
+        enabled: false,
+        confirmed: false,
+    });
+    let id = state.request_snapshot().unwrap();
+    let Command::HarnessMemorySnapshot { request_id } = id else {
+        panic!()
+    };
+    state.adopt(request_id, Default::default());
+    let draft = state.navigation_draft_for(Some(&target)).unwrap();
+    assert_eq!(draft.raw_input, raw);
+    assert_eq!(draft.scope_choice, 2);
+    assert!(state.navigation_draft_for(None).is_none());
+    let mut advanced = target.clone();
+    advanced.rejected_alias = Some("另一个所见别名".into());
+    assert!(state.navigation_draft_for(Some(&advanced)).is_none());
+    state
+        .submit(Command::HarnessFeedback {
+            request_id: 5,
+            sources: vec![target.clone()],
+            reason: "保留标识".into(),
+            scope: FeedbackScope::Global,
+        })
+        .unwrap();
+    assert!(state.navigation_draft_for(Some(&target)).is_none());
+    assert!(state.receipt(5, Ok(()), false));
+    assert!(state.navigation_draft.is_none());
 }
