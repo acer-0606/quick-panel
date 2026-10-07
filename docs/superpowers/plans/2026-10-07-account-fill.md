@@ -16,7 +16,7 @@
 - 密码只进入独立加密保险箱/临时受控填入路径，不进入普通剪贴板、Item/搜索/RAG/AI/Pi/遥测/异常文本。不得读取、导入或探测用户真实密码库；测试只用合成数据。
 - 主线程不运行KDF、解密、UIA跨进程查询或磁盘I/O。KDF/加密与UIA各有一个有界实际工作槽，取消/锁定/退出不join阻塞线程；过期结果拒绝，实际占用未结束不伪装空闲、不累积替代线程。
 - 只允许用户明确点击的填入。每次填入绑定保险箱代次、目标窗口实例、来源应用、所见场景和字段；关闭/失焦到第三方/换连接/锁定/退出撤销许可，迟到结果不可操作新目标。
-- 保存错误保留当前编辑内容；只有关联本次请求的持久化回执可报告已保存。已提交加密写入交给既有actor正常退出排空；未提交的密码/密钥在锁定/取消后尽快清理。
+- 保存错误保留当前编辑内容；只有关联本次请求的持久化回执可报告已保存。点击保存后已接纳的操作包括后台加密准备和actor密文写入；锁定/关闭撤销填充和显示但不默默取消该保存。正常退出异步等待此流水线落盘后再发送Engine Shutdown，失败提供重试或取消退出；未点击保存的草稿可取消清理。
 - 普通历史仍保持默认60秒缓冲/正常退出保存；账号与关联的人工修改立即持久化。浏览、匹配、提示、填充不提交事务、不发网络请求、不扫描普通正文或图片BLOB。
 - Cargo全程串行：CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0。Rust子进程测试固定QP_TEST_NODE=/Users/chuwujie/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node。
 - 工作目录/分支为/Users/chuwujie/workspace/quick-panel与codex/quick-panel；不创建worktree、不push、不修改全局环境。root只维护docs/scratch，单一实现者；不回退他人修改。
@@ -66,7 +66,7 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 - [ ] 写合成crypto及真实SQLite actor RED：从可编译但未提供创建/解锁能力的实现获得行为RED，不引入可运行的明文存储过渡方案；实现后检验明文名称/用户名/密码/绑定目标在DB/WAL中均不存在。测试正确/错误主密码、每次nonce不同、tag/格式/参数篡改、截断、过大文档、随机失败处理；不以仅检查密文!=明文代替实际解密/完整性断言。
 - [ ] 使用RustCrypto库固定Argon2id v19参数64MiB/3/1与32-byte密钥、XChaCha20Poly1305随机salt16/nonce24，OS随机源与zeroize；核验实际crate版本/MSRV/Windows支持并锁定Cargo.lock，不自行实现算法。格式上限/参数先验证再KDF；Secret Debug/错误不输出原文。设置/解锁/修改主密码12–256字符/1024bytes，账号/关联上限遵循spec。
 - [ ] VaultSession只存解锁密钥及有界文档；公开摘要无密码；password留空编辑保留旧值、新增不可空；删除账号同时删除其关联。每次锁定递增epoch并清除摘要/秘密；主密码不长期保存。后台KDF/序列化单实际工作槽，取消后不join也不伪装任务完成，过期结果清理。
-- [ ] 添加独立密文SQLite表/actor消息；真实SQL触发器模拟写失败，确认旧密文可解锁、原请求可重试、CAS冲突不覆盖、重试已提交同密文无额外事务。读/匹配/锁定不增加写入；Shutdown排空已发送密文命令，未发送明文任务可撤销。不得把vault作为ContentSource暴露给Pi/普通搜索。
+- [ ] 添加独立密文SQLite表/actor消息；真实SQL触发器模拟写失败，确认旧密文可解锁、原请求可重试、CAS冲突不覆盖、重试已提交同密文无额外事务。读/匹配/锁定不增加写入；Shutdown排空已发送密文命令；提供单一已接纳保存状态，锁定/关闭不取消保存加密准备，迟到回执不重新解锁。Task4在发送Engine Shutdown前等待已接纳保存settle；未点击保存的草稿和解锁/查询任务可撤销。加入准备阶段锁定/关闭、原密文重试、迟到成功不解锁的回归。不得把vault作为ContentSource暴露给Pi/普通搜索。
 - [ ] 针对Task2测试：cargo test --locked --test account_vault --test account_fill，并对受影响的真实persistence/engine/harness隔离用例做定点；再host/Windows all-target strictClippy/check、fmt/diff。不full/Release，不触碰真实API或用户数据库。新Rust依赖许可必须更新。
 - [ ] 提交owned文件，task-2-report.md给出VaultSession/Worker/Secret/命令事件的精确签名、保存准备→回执接纳的用法、错误保留/锁定/退出合同与验证日志。
 
@@ -93,7 +93,7 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 - [ ] 原生窗口完成创建/解锁/管理/新增编辑删除/主密码更改/关联移除、原生安全密码Edit与IME/可滚长错误/DPI固定footer。账号搜索仅解锁后本地RAM执行；锁定时清显示。首次用户流程和“填充并记住/仅填这次/重新指定位置/换账号”全部接线，无法识别时仍能明确选目标，而不是要求写规则。
 - [ ] App.show_panel在展示前快速捕获目标票据，后台inspect可稍后完成但只能更新本票据。账户面板标题持续显示“将填入：应用/目标”；对被调用弹窗/面板focus迁移与真正切至第三方作区分。关闭、显示布局变化、原目标消失、vault锁定、配置禁用等同步撤销提示和任务。
 - [ ] 设置新增“账号填充”：启用、前台提示、闲置1–60分钟、管理、锁定。默认关闭；禁用后无hook/浮层，管理仍可达但不能填入。只对已解锁且已验证Exact关联的前台密码框显示不激活提示；点击才授权填入。使用WinEvent/UIA轻量焦点事件唤醒有界后台检查，不周期性全桌面扫描。会话锁定/休眠通知立即撤销并锁定。
-- [ ] Vault编辑准备新密文并发actor，关联本请求回执后才接纳；失败保留草稿且Retry原sealed请求。先保存关联成功再执行仍有效的填入；目标期间改变只保存关联而不迟到填入。fill确认不自动提交登录；不支持控件清楚报告。退出让既有actor排空已接纳密文写入，未提交编辑可关闭清理。
+- [ ] Vault编辑准备新密文并发actor，关联本请求回执后才接纳；失败保留草稿且Retry原sealed请求。先保存关联成功再执行仍有效的填入；目标期间改变只保存关联而不迟到填入。fill确认不自动提交登录；不支持控件清楚报告。退出先异步完成已点击保存的加密准备/密文写入，成功后才让Engine Shutdown排空；失败给重试或取消退出。锁定/关闭不取消已接纳保存，不接受其迟到结果恢复解锁/填入；未点击保存的草稿可关闭清理。
 - [ ] 对新增真实消费者运行定点RED/GREEN及跨模块回归。冻结实现后一次cargo test --locked -- --test-threads=1（固定Node）；host/Windows all-target strictClippy/check、fmt/diff；Windows Release与共享core-check严格串行。Windows原生fixtures执行0不能算通过运行。
 - [ ] 更新README实际流程/权限/支持范围/主密码无法找回与密文备份，更新新增Rust依赖许可；不宣称第三方软件全部兼容或Windows实测。原脚本freshpack使用本计划node-assets内复制并核验的既有runtime（不下载、不改Node），逐成员source/stage/ZIP/CRC/SHA/manifest/canonical校验；记录实际大小、hash及源码版本。命令metadata与产物JSON使用不同名。
 - [ ] 自审所有A1–A8，提交owned实现和文档，task-4-report.md含精确接口、全部命令/失败/平台边界/最终产物。root随后逐任务gate及一次全变更审查，最后归档并清理仅本计划scratch。
