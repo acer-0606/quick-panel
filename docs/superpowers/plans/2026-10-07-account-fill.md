@@ -99,3 +99,5 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 - [ ] 对新增真实消费者运行定点RED/GREEN及跨模块回归。冻结实现后一次cargo test --locked -- --test-threads=1（固定Node）；host/Windows all-target strictClippy/check、fmt/diff；Windows Release与共享core-check严格串行。Windows原生fixtures执行0不能算通过运行。
 - [ ] 更新README实际流程/权限/支持范围/主密码无法找回与密文备份，更新新增Rust依赖许可；不宣称第三方软件全部兼容或Windows实测。原脚本freshpack使用本计划node-assets内复制并核验的既有runtime（不下载、不改Node），逐成员source/stage/ZIP/CRC/SHA/manifest/canonical校验；记录实际大小、hash及源码版本。命令metadata与产物JSON使用不同名。
 - [ ] 自审所有A1–A8，提交owned实现和文档，task-4-report.md含精确接口、全部命令/失败/平台边界/最终产物。root随后逐任务gate及一次全变更审查，最后归档并清理仅本计划scratch。
+
+失败恢复：若密文写入发生CAS冲突，原请求重试不能覆盖新版本。仅对已经终止的失败保存提供用户明确触发的“放弃未保存修改并重新解锁”；清理候选、锁定并递增代次后重读快照。不能自动放弃、取消进行中保存，或预先复制凭据绕过锁定继续旧填入；“仅填这次”仍须当前有效的解锁会话和新的明确填入动作。
