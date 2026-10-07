@@ -36,16 +36,22 @@
 - [ ] 为复杂状态新增实际生产使用的便携策略，最小合同示例（最终可采用既有等价类型）：
 
 ```rust
-pub struct FieldError { pub field: usize, pub message: String }
-pub fn unsupported_effort_error(enabled: bool, warning: Option<String>) -> Option<String> {
-    enabled.then_some(warning).flatten()
-}
 #[test]
 fn disabling_ai_does_not_require_a_supported_effort() {
-    assert_eq!(unsupported_effort_error(false, Some("unsupported".into())), None);
-    assert!(unsupported_effort_error(true, Some("unsupported".into())).is_some());
+    let saved = AiSettings { enabled: true, encrypted_key: vec![1], ..Default::default() };
+    let mut fields = ["0", "https://example.com/v1/messages", "known", "0", "", "0", "5"].map(str::to_owned);
+    let models = vec![ModelInfo { id: "known".into(), display_name: None,
+        effort: Some(EffortCapabilities { supported: Some(false), ..Default::default() }) }];
+    let next = validate_ai_form(&saved, &fields, &models).unwrap();
+    assert!(!next.enabled);
+    assert_eq!(next.effort, Effort::Max);
+    assert_eq!(next.encrypted_key, saved.encrypted_key);
+    fields[0] = "1".into();
+    assert!(validate_ai_form(&saved, &fields, &models).is_err());
 }
 ```
+
+`validate_ai_form` 是本任务新增并由native保存实际使用的共享校验（可采用相同职责的现有helper），调用真实 `parse_ai_fields` 并仅在返回配置enabled时阻断 `effort_warning`。RED先以旧无条件effort行为可编译接线，再验证以上用户关停流程失败；不能把缺函数编译错误当作行为RED。
 
 - [ ] 先运行定点用例得到行为RED，实施最小校验/状态/草稿生命周期变更，再运行GREEN；不为文案单独写镜像测试。测试应实际调用native消费的共享校验，不另造平行实现。
 - [ ] 命令：`cargo test --test form_validation --test organizer_ui --test hotkeys --test connection_test`（若未新增文件去掉对应target）；全部exit0后 `cargo fmt --all -- --check`、host严格Clippy和Windows all-target严格Clippy/check。Cargo严格串行。此阶段不跑完整suite/Release。
