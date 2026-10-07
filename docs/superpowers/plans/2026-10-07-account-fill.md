@@ -44,7 +44,7 @@
 
 完整matcher测试必须进一步构造真实Binding/SceneSnapshot，不仅测试字符串helper；覆盖ApplicationOnly不得升格Exact、相同字段重复、同HWND不同PID/start、不同HWND同应用、撤销/代次过期、teach取消不产生绑定、上限拒绝。
 
-- [ ] 实现共享类型、校验、场景构造/匹配及填充票据，全部函数将由Task3/4实际消费，不另建测试平行逻辑。单次非秘密snapshot最多256节点/8层；selector串与anchors设明确上限；目标值做保守首尾空白规范化，不做子串或模糊目标匹配。
+- [ ] 实现共享类型、校验、场景构造/匹配及填充票据，全部函数将由Task3/4实际消费，不另建测试平行逻辑。单次非秘密snapshot最多256节点/8层，必须有完整采集标记；超时/截断的部分结果不能证明唯一或保存教学/Exact/填入；selector串与anchors设明确上限；目标值做保守首尾空白规范化，不做子串或模糊目标匹配。
 - [ ] 新Settings字段必须serde(default)向后兼容，锁定分钟1–60、默认5；关闭模式策略可测试，不新增I/O。
 - [ ] 定点cargo test --locked --test account_fill；随后host/Windows all-target strictClippy/check、fmt/diff。此阶段不full/Release/Node。
 - [ ] 自审后只提交owned文件，写task-1-report.md：精确所有公开类型/签名、约束、真实RED/GREEN命令输出、native后续接线要求与Windows未执行边界。
@@ -77,7 +77,7 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 **Interfaces:** 消费Task1 SceneSnapshot/Binding/FillGate与Task2 Secret。提供快速非UIA的capture_foreground(own_pid)->Result<WindowIdentity,..>；后台单槽AccountWorker执行inspect/point-teach/validate-and-fill，输出只含非秘密DTO/完成状态；提供原生pick(owner,target,role)点选入口。所有精确函数签名、消息enum与取消方法写报告交Task4。
 
 - [ ] 用生产helper写RED：目标绑定在面板显示前；两个应用/同进程两窗口/进程创建时间变化/目标控件消失拒绝；填入需要vault_epoch及当前ticket、窗口/场景复核；多个/不可写/隐藏/非密码字段拒绝，密码不经过剪贴板或按键序列。
-- [ ] 面板弹出后的GetFocusedElement不得作为原目标；使用已捕获的窗口范围/快速GUI线程焦点信息，无法保留具体字段时在原窗口内唯一定位或点选。UIA在独立MTA线程创建使用和释放，COM对象不跨到GUI线程；设置连接/事务超时，所有查询有256节点/8层/2秒预算。工作槽忙时不再建线程，取消只撤销结果和填充许可，不join主线程。事件/观察回调只投递轻量通知，不在callback做UIA/文件指纹。文件指纹首次/变化时后台读取并缓存，读取失败拒绝匹配。
+- [ ] 面板弹出后的GetFocusedElement不得作为原目标；使用已捕获的窗口范围/快速GUI线程焦点信息，无法保留具体字段时在原窗口内唯一定位或点选。UIA在独立MTA线程创建使用和释放，COM对象不跨到GUI线程；设置连接/事务超时，所有查询有256节点/8层/2秒预算，逐步TreeWalker/有界缓存遍历，不以全子树FindAll后截断冒充有界；未完整采集则返回失败或请求点选小范围重采样。工作槽忙时不再建线程，取消只撤销结果和填充许可，不join主线程。事件/观察回调只投递轻量通知，不在callback做UIA/文件指纹。文件指纹首次/变化时后台读取并缓存，读取失败拒绝匹配。
 - [ ] inspect仅提取控件结构和非输入标签；不读取密码控件Name/Value，普通输入值默认不采集，仅用户点选的非密码目标可读取。ElementPath不持久化RuntimeId/绝对像素。自动唯一定位密码框与可选用户名；有歧义返回TeachingRequired。
 - [ ] 点选只记录元素/目标条件，不录制键盘、不截屏。覆盖Esc/右键取消、原目标切换/退出、同窗口字段重建和多屏DPI物理坐标。已知目标的选择限制在该窗口，未知目标让用户明确选一个输入框再捕获其窗口。
 - [ ] 填入路径拿到用户点击票据后逐步重新核验目标/焦点/epoch/scene并定向SetValue；密码BSTR及可控UTF16缓冲用完清理。没有可写ValuePattern即返回中文“不支持此输入框”，不做隐式Clipboard/SendInput/Tab/Enter或自动登录。跨进程操作不能提供原子事务，已发出的写入不能宣称可撤回；停止后续写入并如实报告部分完成。
