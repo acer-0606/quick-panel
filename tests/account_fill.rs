@@ -16,6 +16,7 @@ fn selector(id: &str) -> FieldSelector {
 fn scene() -> SceneSnapshot {
     SceneSnapshot {
         complete: true,
+        scope: quick_panel::account_fill::SceneScope::Window,
         app: AppIdentity {
             canonical_path: "C:\\Apps\\DbClient.exe".into(),
             file_fingerprint: [7; 32],
@@ -609,4 +610,29 @@ fn incomplete_uia_traversal_never_proves_uniqueness_or_authorizes_teaching() {
         )
         .unwrap();
     assert!(gate.validate(&ticket, &enabled(), 1, true, &s).is_err());
+}
+
+#[test]
+fn selected_scope_never_becomes_exact_or_reusable_teaching() {
+    let mut snapshot = scene();
+    snapshot.scope = quick_panel::account_fill::SceneScope::SelectedContext;
+    let binding = binding();
+    assert!(matches!(
+        match_binding(&binding, &snapshot),
+        MatchDecision::ApplicationOnly(_)
+    ));
+    let mut teacher = TeachingSession::begin(&snapshot).unwrap();
+    teacher
+        .select_password(
+            snapshot
+                .fields
+                .iter()
+                .find(|f| f.is_password)
+                .unwrap()
+                .field_id,
+        )
+        .unwrap();
+    teacher.select_username(None).unwrap();
+    teacher.select_target(None).unwrap();
+    assert!(teacher.finish("small".into(), "account".into()).is_err());
 }

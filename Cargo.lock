@@ -409,6 +409,7 @@ dependencies = [
  "sqlite-vec",
  "tempfile",
  "windows",
+ "windows-core",
  "zeroize",
 ]
 

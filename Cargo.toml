@@ -18,6 +18,7 @@ pinyin = "0.11"
 sqlite-vec = "=0.1.9"
 
 [target.'cfg(windows)'.dependencies]
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_Networking_WinHttp",
@@ -40,6 +41,7 @@ windows = { version = "0.62.2", features = [
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Imaging",
+  "Win32_UI_Accessibility",
   "Win32_UI_Shell",
   "Win32_UI_Shell_Common",
   "Win32_UI_Controls",

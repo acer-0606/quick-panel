@@ -124,10 +124,16 @@ pub enum SceneOrigin {
     NativeDesktop,
     UnverifiedBrowser,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneScope {
+    Window,
+    SelectedContext,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SceneSnapshot {
     /// True only when bounded traversal finished without timeout or truncation.
     pub complete: bool,
+    pub scope: SceneScope,
     pub app: AppIdentity,
     pub window: WindowIdentity,
     pub scene_key: String,
@@ -247,6 +253,7 @@ pub enum PolicyError {
     StaleTicket,
     Cancelled,
     IncompleteTeaching,
+    OneTimeOnly,
     Exhausted,
 }
 fn validate_text(value: &str, max_bytes: usize) -> Result<(), PolicyError> {
@@ -337,7 +344,11 @@ pub fn target_matches(expected: &str, observed: Option<&str>) -> bool {
 }
 pub fn match_binding(binding: &Binding, snapshot: &SceneSnapshot) -> MatchDecision {
     match resolve_binding(binding, snapshot) {
-        Ok(fields) if binding.target.is_some() && snapshot.origin == SceneOrigin::NativeDesktop => {
+        Ok(fields)
+            if binding.target.is_some()
+                && snapshot.origin == SceneOrigin::NativeDesktop
+                && snapshot.scope == SceneScope::Window =>
+        {
             MatchDecision::Exact(fields)
         }
         Ok(fields) => MatchDecision::ApplicationOnly(fields),
@@ -498,8 +509,20 @@ pub enum TeachingStep {
     Ready,
     Cancelled,
 }
-/// Only non-secret selections are retained. Completing this session produces a
-/// draft binding; persisting it requires the later vault save receipt.
+/// A non-serializable, one-use draft; only the execution module can unwrap it.
+#[derive(Debug)]
+pub struct OneTimeBinding(Binding);
+impl OneTimeBinding {
+    #[cfg(windows)]
+    pub(crate) fn binding(&self) -> &Binding {
+        &self.0
+    }
+    pub(crate) fn into_binding(self) -> Binding {
+        self.0
+    }
+}
+
+/// Only non-secret selections are retained; durable save needs a later vault receipt.
 pub struct TeachingSession {
     snapshot: SceneSnapshot,
     password: Option<FieldSelector>,
@@ -583,11 +606,26 @@ impl TeachingSession {
         self.target = None;
         self.step = TeachingStep::Cancelled;
     }
+    /// One-use draft for explicit selection. Caller must never persist this draft.
+    pub fn finish_once(
+        self,
+        binding_id: String,
+        account_id: String,
+    ) -> Result<OneTimeBinding, PolicyError> {
+        self.build(binding_id, account_id).map(OneTimeBinding)
+    }
     pub fn finish(self, binding_id: String, account_id: String) -> Result<Binding, PolicyError> {
         self.require_step(TeachingStep::Ready)?;
         if self.snapshot.origin == SceneOrigin::UnverifiedBrowser {
             return Err(PolicyError::UnverifiedBrowser);
         }
+        if self.snapshot.scope == SceneScope::SelectedContext {
+            return Err(PolicyError::OneTimeOnly);
+        }
+        self.build(binding_id, account_id)
+    }
+    fn build(self, binding_id: String, account_id: String) -> Result<Binding, PolicyError> {
+        self.require_step(TeachingStep::Ready)?;
         let binding = Binding {
             binding_id,
             account_id,

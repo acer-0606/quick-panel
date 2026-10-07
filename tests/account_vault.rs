@@ -706,6 +706,7 @@ fn cas_conflict_explicit_discard_reloads_and_revokes_old_fill_epoch() {
     b.target = None;
     let scene = SceneSnapshot {
         complete: true,
+        scope: quick_panel::account_fill::SceneScope::Window,
         app: b.app.clone(),
         window: WindowIdentity {
             handle: 1,

@@ -1,5 +1,6 @@
 //! Shared data, persistence and search for the native Windows panel.
 pub mod account_fill;
+pub mod account_fill_execution;
 pub mod account_vault;
 pub mod account_vault_jobs;
 mod account_vault_store;
