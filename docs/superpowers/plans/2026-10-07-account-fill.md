@@ -74,7 +74,7 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 
 ### Task 3: Windows 目标捕获、UIA后台、点选教学和定向填入
 
-**Files:** 新增src/platform/windows/account_target.rs、account_worker.rs、account_picker.rs、tests/windows_account_fill.rs；可按单一职责合并/拆分此三文件。修改src/platform/windows/mod.rs和Cargo.toml的Windows features，必要时Task1共享策略及其测试做真实接线补充。此任务不做App主界面整合。
+**Files:** 新增src/platform/windows/account_target.rs、account_worker.rs、account_picker.rs、tests/windows_account_fill.rs；可按单一职责合并/拆分此三文件。修改src/platform/windows/mod.rs和Cargo.toml的Windows features，必要时Task1共享策略及其测试做真实接线补充。可新增src/account_fill_runtime.rs及tests/account_fill_runtime.rs并窄改lib.rs承载native实际消费的共享执行门面，避免测试平行实现。此任务不做App主界面整合。
 
 **Interfaces:** 消费Task1 SceneSnapshot/Binding/FillGate与Task2 Secret。提供快速非UIA的capture_foreground(own_pid)->Result<WindowIdentity,..>；后台单槽AccountWorker执行inspect/point-teach/validate-and-fill，输出只含非秘密DTO/完成状态；提供原生pick(owner,target,role)点选入口。所有精确函数签名、消息enum与取消方法写报告交Task4。
 
