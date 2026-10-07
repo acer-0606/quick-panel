@@ -188,3 +188,87 @@ pub fn form_progress(
         FormProgress::Pending
     }
 }
+
+/// Shared by the WinEvent producer, hint consumer and MTA final write boundary.
+/// A WinEvent is a new observation version even when HWND/object/child repeat:
+/// virtual UIA elements do not necessarily have distinct native event identities.
+#[derive(Clone)]
+pub struct HintClock(Arc<std::sync::atomic::AtomicU64>);
+impl Default for HintClock {
+    fn default() -> Self {
+        Self(Arc::new(std::sync::atomic::AtomicU64::new(1)))
+    }
+}
+impl HintClock {
+    pub fn event(&self) {
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |v| Some(v.saturating_add(1)),
+        );
+    }
+    pub fn version(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn current(&self, version: u64) -> bool {
+        version != u64::MAX && self.version() == version
+    }
+}
+/// Non-cloneable, one-click grant. Hiding the native window does not revoke this
+/// already consumed grant; subsequent external focus/layout events do.
+pub struct HintPermit {
+    clock: HintClock,
+    version: u64,
+}
+impl HintPermit {
+    pub fn current(&self) -> bool {
+        self.clock.current(self.version)
+    }
+    pub fn matches_focused_password(&self, expected: u64, focused: Option<u64>) -> bool {
+        self.current() && focused == Some(expected)
+    }
+}
+pub struct HintChecks {
+    clock: HintClock,
+    last_check: u64,
+    offered: Option<HintPermit>,
+}
+impl HintChecks {
+    pub fn new(clock: HintClock) -> Self {
+        Self {
+            clock,
+            last_check: 0,
+            offered: None,
+        }
+    }
+    /// Drain at most one latest version when the actual worker slot is available.
+    pub fn take_check(&mut self) -> Option<u64> {
+        let v = self.clock.version();
+        if v == self.last_check || v == u64::MAX {
+            return None;
+        }
+        self.last_check = v;
+        self.offered = None;
+        Some(v)
+    }
+    pub fn offer(&mut self, version: u64) -> bool {
+        if self.last_check != version || !self.clock.current(version) {
+            return false;
+        }
+        self.offered = Some(HintPermit {
+            clock: self.clock.clone(),
+            version,
+        });
+        true
+    }
+    pub fn hide(&mut self) {
+        self.offered = None;
+    }
+    pub fn consume(&mut self, clicked_version: u64) -> Option<HintPermit> {
+        if self.offered.as_ref()?.version != clicked_version {
+            return None;
+        }
+        let permit = self.offered.take()?;
+        permit.current().then_some(permit)
+    }
+}

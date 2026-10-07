@@ -342,3 +342,72 @@ fn account_management_returns_to_settings_source_without_releasing_main_query_ga
     nav.close();
     assert!(nav.allows_panel_query());
 }
+
+#[test]
+fn hint_focus_or_layout_event_invalidates_click_before_timer_consumes_event() {
+    use quick_panel::account_fill_ui::{HintChecks, HintClock};
+    for _event_kind in ["focus", "layout"] {
+        let clock = HintClock::default();
+        let mut checks = HintChecks::new(clock.clone());
+        let version = checks.take_check().unwrap();
+        assert!(checks.offer(version));
+        clock.event(); // Same producer call as the native callback; no timer/check yet.
+        assert!(checks.consume(version).is_none());
+        assert!(!checks.offer(version)); // A late MTA inspection cannot reinstall it.
+    }
+}
+#[test]
+fn same_native_hwnd_logical_focus_returns_to_password_each_round() {
+    use quick_panel::account_fill_ui::{HintChecks, HintClock};
+    let clock = HintClock::default();
+    let mut checks = HintChecks::new(clock.clone());
+    for password_focused in [false, true, false, true] {
+        // Virtual fields share HWND/object/child; each actual focus notification counts.
+        clock.event();
+        let version = checks
+            .take_check()
+            .expect("focus change must schedule a fresh bounded check");
+        assert!(checks.take_check().is_none());
+        if password_focused {
+            assert!(checks.offer(version));
+            assert!(checks.consume(version).is_some());
+            assert!(checks.consume(version).is_none());
+        }
+    }
+}
+#[test]
+fn repeated_hint_events_coalesce_and_consumed_grant_survives_internal_hide_only() {
+    use quick_panel::account_fill_ui::{HintChecks, HintClock};
+    let clock = HintClock::default();
+    let mut checks = HintChecks::new(clock.clone());
+    for _ in 0..10_000 {
+        clock.event();
+    }
+    let version = checks.take_check().unwrap();
+    assert_eq!(version, clock.version());
+    for _ in 0..100 {
+        assert!(checks.take_check().is_none());
+    }
+    assert!(checks.offer(version));
+    let permit = checks.consume(version).unwrap();
+    checks.hide();
+    assert!(permit.current());
+    assert!(permit.matches_focused_password(7, Some(7)));
+    assert!(!permit.matches_focused_password(7, Some(8)));
+    assert!(!permit.matches_focused_password(7, None));
+    clock.event();
+    assert!(!permit.current());
+}
+#[test]
+fn queued_old_hint_click_cannot_consume_a_newly_built_offer() {
+    use quick_panel::account_fill_ui::{HintChecks, HintClock};
+    let clock = HintClock::default();
+    let mut checks = HintChecks::new(clock.clone());
+    let old = checks.take_check().unwrap();
+    assert!(checks.offer(old));
+    clock.event();
+    let new = checks.take_check().unwrap();
+    assert!(checks.offer(new));
+    assert!(checks.consume(old).is_none());
+    assert!(checks.consume(new).is_some());
+}

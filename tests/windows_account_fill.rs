@@ -268,6 +268,62 @@ fn native_synthetic_capture_inspect_write_two_windows_and_cancel() {
             match_binding(&remembered, &target_scene.snapshot),
             MatchDecision::Exact(_)
         ));
+        // Capture native focus only after moving to the username HWND. The old
+        // HWND-only write guard would accept this; ConfirmedHint must query UIA focus.
+        use quick_panel::account_fill_ui::{HintChecks, HintClock};
+        let permit = || {
+            let clock = HintClock::default();
+            let mut checks = HintChecks::new(clock.clone());
+            let v = checks.take_check().unwrap();
+            assert!(checks.offer(v));
+            (clock, checks.consume(v).unwrap())
+        };
+        SetWindowTextW(first.password, w!("")).unwrap();
+        let _ = SetFocus(Some(first.user));
+        let mut hinted = command(target_id, remembered.clone(), captured);
+        hinted.action = UserFillAction::ConfirmedHint;
+        let (_, grant) = permit();
+        let request = worker.fill_hint(1, hinted, grant).unwrap();
+        let AccountResult::Filled(wrong_focus) = wait(&worker, request).result else {
+            panic!("hint focus result missing")
+        };
+        assert!(!wrong_focus.username_written && !wrong_focus.password_written);
+        assert_eq!(wrong_focus.error, Some(FillError::TargetChanged));
+        assert_eq!(first.password_text(), "");
+        first.activate();
+        let fresh = worker
+            .inspect_binding(1, captured, remembered.clone())
+            .unwrap();
+        assert!(matches!(
+            wait(&worker, fresh).result,
+            AccountResult::Inspected(_)
+        ));
+        let mut hinted = command(fresh, remembered.clone(), captured);
+        hinted.action = UserFillAction::ConfirmedHint;
+        let (clock, grant) = permit();
+        clock.event();
+        assert_eq!(
+            worker.fill_hint(1, hinted, grant).err(),
+            Some(FillError::Cancelled)
+        );
+        let mut hinted = command(fresh, remembered.clone(), captured);
+        hinted.action = UserFillAction::ConfirmedHint;
+        assert_eq!(worker.fill(1, hinted).err(), Some(FillError::Cancelled));
+        let mut hinted = command(fresh, remembered.clone(), captured);
+        hinted.action = UserFillAction::ConfirmedHint;
+        let (_, grant) = permit();
+        let request = worker.fill_hint(1, hinted, grant).unwrap();
+        let AccountResult::Filled(correct_focus) = wait(&worker, request).result else {
+            panic!("hint fill result missing")
+        };
+        assert!(correct_focus.password_written);
+        let target_id = worker
+            .inspect_binding(1, captured, remembered.clone())
+            .unwrap();
+        assert!(matches!(
+            wait(&worker, target_id).result,
+            AccountResult::Inspected(_)
+        ));
         SetWindowTextW(first.server, w!("db-b")).unwrap();
         let changed_fill = worker
             .fill(1, command(target_id, remembered, captured))

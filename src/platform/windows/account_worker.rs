@@ -3,7 +3,9 @@ use super::{
     account_picker::{PickPoint, PickRole},
     account_target::{Automation, Context, Fingerprints, focus_handle},
 };
-use crate::{account_fill::*, account_fill_execution::*, account_vault::Secret};
+use crate::{
+    account_fill::*, account_fill_execution::*, account_fill_ui::HintPermit, account_vault::Secret,
+};
 use std::{
     cell::Cell,
     sync::{
@@ -62,7 +64,7 @@ enum Operation {
         inspection_id: Option<u64>,
         point: PickPoint,
     },
-    Fill(Box<FillCommand>, u64),
+    Fill(Box<FillCommand>, u64, Option<HintPermit>),
 }
 enum Message {
     Job(Box<Job>),
@@ -182,8 +184,30 @@ impl AccountWorker {
     }
     /// Only call from an explicit fill click, after restoring target foreground.
     pub fn fill(&mut self, epoch: u64, command: FillCommand) -> Result<u64, FillError> {
+        self.submit_fill(epoch, command, None)
+    }
+    /// A hint click carries its already-consumed event version to the final MTA write.
+    pub fn fill_hint(
+        &mut self,
+        epoch: u64,
+        command: FillCommand,
+        permit: HintPermit,
+    ) -> Result<u64, FillError> {
+        self.submit_fill(epoch, command, Some(permit))
+    }
+    fn submit_fill(
+        &mut self,
+        epoch: u64,
+        command: FillCommand,
+        permit: Option<HintPermit>,
+    ) -> Result<u64, FillError> {
+        if (command.action == UserFillAction::ConfirmedHint) != permit.is_some()
+            || permit.as_ref().is_some_and(|p| !p.current())
+        {
+            return Err(FillError::Cancelled);
+        }
         let focus = focus_handle(command.expected_window).ok_or(FillError::TargetChanged)?;
-        self.submit(epoch, Operation::Fill(Box::new(command), focus))
+        self.submit(epoch, Operation::Fill(Box::new(command), focus, permit))
     }
     fn submit(&mut self, epoch: u64, operation: Operation) -> Result<u64, FillError> {
         if self.pending.get().is_some() || self.cleanup_requested.load(Ordering::SeqCst) {
@@ -430,7 +454,7 @@ fn handle(
                 role: point.role,
             }))
         }
-        Operation::Fill(command, expected_focus) => {
+        Operation::Fill(command, expected_focus, hint) => {
             let current = session.as_mut().ok_or(FillError::TargetChanged)?;
             if current.id != command.inspection_id
                 || current.generation != lease.generation()
@@ -439,6 +463,14 @@ fn handle(
                 return Err(FillError::TargetChanged);
             }
             let baseline = current.snapshot.take().ok_or(FillError::TargetChanged)?;
+            let hint_password = if hint.is_some() {
+                match match_binding(command.choice.binding(), &baseline) {
+                    MatchDecision::Exact(fields) => Some(fields.password_id),
+                    _ => return Err(FillError::TargetChanged),
+                }
+            } else {
+                None
+            };
             let browser_password_picked = current.context.picked_password.is_some_and(|id| {
                 baseline
                     .fields
@@ -452,6 +484,8 @@ fn handle(
                 lease,
                 deadline: query_deadline,
                 expected_focus,
+                hint,
+                hint_password,
             };
             let result = execute_fill(
                 gate,
@@ -482,15 +516,27 @@ struct NativeBackend<'a> {
     lease: &'a FillLease,
     deadline: Instant,
     expected_focus: u64,
+    hint: Option<HintPermit>,
+    hint_password: Option<u64>,
 }
 impl FillBackend for NativeBackend<'_> {
     fn sample(&mut self) -> Result<SceneSnapshot, FillError> {
         self.automation
             .verify_app(self.context, self.cache, self.deadline)?;
-        self.automation.sample(self.context, self.deadline)
+        let snapshot = self.automation.sample(self.context, self.deadline)?;
+        if let (Some(permit), Some(expected)) = (&self.hint, self.hint_password) {
+            let focused =
+                self.automation
+                    .focused_password(self.context, &snapshot, self.deadline)?;
+            if !permit.matches_focused_password(expected, focused) {
+                return Err(FillError::TargetChanged);
+            }
+        }
+        Ok(snapshot)
     }
     fn foreground_matches(&self, window: WindowIdentity) -> bool {
         focus_handle(window) == Some(self.expected_focus)
+            && self.hint.as_ref().is_none_or(HintPermit::current)
     }
     fn write(&mut self, field: u64, value: &Secret) -> Result<(), FillError> {
         self.automation.write(
@@ -500,6 +546,7 @@ impl FillBackend for NativeBackend<'_> {
             self.lease,
             self.deadline,
             self.expected_focus,
+            self.hint.as_ref(),
         )
     }
 }

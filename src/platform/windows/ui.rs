@@ -3862,7 +3862,7 @@ unsafe fn app_message(
             return Some(LRESULT(0));
         }
         super::account_hint::HINT_CLICK => {
-            app.accounts.borrow_mut().hint_click();
+            app.accounts.borrow_mut().hint_click(wp.0 as u64);
             return Some(LRESULT(0));
         }
         WM_WTSSESSION_CHANGE if wp.0 == 7 => {

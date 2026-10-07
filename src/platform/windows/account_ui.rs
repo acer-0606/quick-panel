@@ -10,7 +10,7 @@ use super::{
 use crate::{
     account_fill::*,
     account_fill_execution::*,
-    account_fill_ui::AccountFlow,
+    account_fill_ui::{AccountFlow, HintPermit},
     account_vault::{AccountDraft, Secret, VaultDocument},
     account_vault_jobs::{SaveState, VaultNotice},
     model::{Command, Event, Theme},
@@ -34,8 +34,16 @@ pub const TIMER: usize = 794;
 enum Purpose {
     Manual,
     Saved(Box<Binding>),
-    HintBase,
-    HintBinding(Vec<Binding>),
+    HintBase(u64),
+    HintBinding(u64, Vec<Binding>),
+}
+impl Purpose {
+    fn hint_version(&self) -> Option<u64> {
+        match self {
+            Self::HintBase(version) | Self::HintBinding(version, _) => Some(*version),
+            _ => None,
+        }
+    }
 }
 struct AfterSave {
     binding: Binding,
@@ -73,8 +81,6 @@ pub struct Runtime {
     after_save: Option<AfterSave>,
     hint: Hint,
     hint_binding: Option<Binding>,
-    hint_dirty: bool,
-    hint_stamp: Option<(WindowIdentity, usize)>,
     queued: Option<Command>,
     pub shutdown_requested: bool,
     pub shutdown_sent: bool,
@@ -112,8 +118,6 @@ impl Runtime {
             after_save: None,
             hint: Hint::default(),
             hint_binding: None,
-            hint_dirty: false,
-            hint_stamp: None,
             queued: None,
             shutdown_requested: false,
             shutdown_sent: false,
@@ -176,7 +180,7 @@ impl Runtime {
         self.changed();
     }
     pub fn dismiss(&mut self) {
-        self.hint_stamp = None;
+        self.hint.request_check();
         self.revoke();
         self.flow.dismiss();
         self.selected = None;
@@ -289,6 +293,7 @@ impl Runtime {
                     self.do_fill(
                         FillChoice::Saved(continuation.binding),
                         UserFillAction::SelectedAccount,
+                        None,
                     );
                 } else if self.fill_mode && self.open && self.inspection.is_none() {
                     self.start_inspect(Purpose::Manual);
@@ -449,36 +454,25 @@ impl Runtime {
             self.flow.vault.session().epoch(),
             self.flow.target,
         );
-        if let Some(layout) = self.hint.changed() {
-            self.hint_dirty = true;
-            if layout {
-                self.hint_stamp = None;
-            }
+        if self.hint.changed() {
             self.hint.hide();
             self.hint_binding = None;
         }
         if observing
-            && self.hint_dirty
             && !self.open
             && self.pending.is_none()
             && self.picker.is_none()
             && self.worker.as_ref().is_none_or(|w| !w.is_busy())
-        {
-            self.hint_dirty = false;
-            if let Ok(target) = account_target::capture_foreground(unsafe {
+            && let Some(version) = self.hint.begin_check()
+            && let Ok(target) = account_target::capture_foreground(unsafe {
                 windows::Win32::System::Threading::GetCurrentProcessId()
-            }) {
-                // Win32 focus identity coalesces repeated events. No timer initiates a UIA scan.
-                let focus = account_target::focus_handle(target).unwrap_or(0) as usize;
-                let stamp = (target, focus);
-                if self.hint_stamp != Some(stamp) {
-                    self.hint_stamp = Some(stamp);
-                    self.hint.target(target.handle, focus);
-                    self.revoke();
-                    self.flow.target = Some(target);
-                    self.start_inspect(Purpose::HintBase);
-                }
-            }
+            })
+        {
+            let focus = account_target::focus_handle(target).unwrap_or(0) as usize;
+            self.hint.target(target.handle, focus);
+            self.revoke();
+            self.flow.target = Some(target);
+            self.start_inspect(Purpose::HintBase(version));
         }
         if self.shutdown_requested && self.flow.shutdown_ready() && !self.shutdown_sent {
             match send(Command::Shutdown) {
@@ -504,6 +498,12 @@ impl Runtime {
         true
     }
     fn start_inspect(&mut self, purpose: Purpose) {
+        if purpose
+            .hint_version()
+            .is_some_and(|v| !self.hint.current(v))
+        {
+            return;
+        }
         if !self.settings.enabled
             || !self.flow.vault.session().is_unlocked()
             || !self.ensure_worker()
@@ -527,7 +527,7 @@ impl Runtime {
                 target,
                 (**binding).clone(),
             ),
-            Purpose::HintBinding(bindings) => worker.inspect_binding(
+            Purpose::HintBinding(_, bindings) => worker.inspect_binding(
                 self.flow.vault.session().epoch(),
                 target,
                 bindings[0].clone(),
@@ -563,6 +563,14 @@ impl Runtime {
             .worker
             .as_ref()
             .is_none_or(|w| w.control().generation() != generation)
+        {
+            return;
+        }
+        if picked.is_none()
+            && self
+                .purpose
+                .hint_version()
+                .is_some_and(|v| !self.hint.current(v))
         {
             return;
         }
@@ -616,18 +624,18 @@ impl Runtime {
                     self.notice = "关联与当前目标不符；请重新指定位置".into();
                 }
             },
-            Purpose::HintBase => {
+            Purpose::HintBase(version) => {
                 if let Ok(document) = self.flow.vault.session().document() {
                     let candidates = crate::account_fill_ui::hint_candidates(
                         &document.bindings,
                         &inspection.snapshot,
                     );
                     if !candidates.is_empty() {
-                        self.start_inspect(Purpose::HintBinding(candidates));
+                        self.start_inspect(Purpose::HintBinding(version, candidates));
                     }
                 }
             }
-            Purpose::HintBinding(bindings) => {
+            Purpose::HintBinding(version, bindings) => {
                 let matches: Vec<_> = bindings
                     .into_iter()
                     .filter_map(|b| match match_binding(&b, &inspection.snapshot) {
@@ -642,9 +650,9 @@ impl Runtime {
                         .settings
                         .observe_enabled(self.flow.vault.session().is_unlocked())
                     && account_target::foreground_matches(inspection.snapshot.window)
+                    && self.hint.show(bounds, self.appearance, version)
                 {
                     self.hint_binding = Some(binding.clone());
-                    self.hint.show(bounds, self.appearance);
                 }
             }
         }
@@ -677,13 +685,16 @@ impl Runtime {
             self.attention = Some(format!("本次账号填入：{}", self.notice));
         }
     }
-    pub fn hint_click(&mut self) {
+    pub fn hint_click(&mut self, clicked_version: u64) {
         if !self
             .settings
             .observe_enabled(self.flow.vault.session().is_unlocked())
         {
             return;
         }
+        let Some(permit) = self.hint.consume(clicked_version) else {
+            return;
+        };
         if let Some(binding) = self.hint_binding.take()
             && self.inspection.as_ref().is_some_and(|(_, g, i)| {
                 self.worker
@@ -697,7 +708,11 @@ impl Runtime {
             })
         {
             self.selected = Some(binding.account_id.clone());
-            self.do_fill(FillChoice::Saved(binding), UserFillAction::ConfirmedHint);
+            self.do_fill(
+                FillChoice::Saved(binding),
+                UserFillAction::ConfirmedHint,
+                Some(permit),
+            );
         }
     }
     fn select(&mut self, id: String) {
@@ -778,7 +793,7 @@ impl Runtime {
                             .map_err(|e| FillError::Policy(e).message())?,
                     )
                 };
-                self.do_fill(choice, UserFillAction::SelectedAccount);
+                self.do_fill(choice, UserFillAction::SelectedAccount, None);
             }
             Ok(())
         })();
@@ -787,7 +802,7 @@ impl Runtime {
         }
         self.changed();
     }
-    fn do_fill(&mut self, choice: FillChoice, action: UserFillAction) {
+    fn do_fill(&mut self, choice: FillChoice, action: UserFillAction, permit: Option<HintPermit>) {
         let result = (|| -> Result<(), String> {
             if !self.settings.enabled || !self.flow.vault.session().is_unlocked() {
                 return Err("保险箱已锁定或填充已停用".into());
@@ -800,33 +815,34 @@ impl Runtime {
                 .credentials(self.selected.as_deref().ok_or("请选择账号")?)?;
             self.hint.hide();
             self.transfer = true;
-            unsafe {
-                if !self.view.is_invalid() {
-                    let _ = ShowWindow(self.view, SW_HIDE);
+            if action != UserFillAction::ConfirmedHint {
+                unsafe {
+                    if !self.view.is_invalid() {
+                        let _ = ShowWindow(self.view, SW_HIDE);
+                    }
+                    let _ = ShowWindow(self.owner, SW_HIDE);
+                    let _ = SetForegroundWindow(HWND(inspection.snapshot.window.handle as *mut _));
                 }
-                let _ = ShowWindow(self.owner, SW_HIDE);
-                let _ = SetForegroundWindow(HWND(inspection.snapshot.window.handle as *mut _));
             }
             if !account_target::foreground_matches(inspection.snapshot.window) {
                 return Err("无法返回原目标，请重新呼出".into());
             }
-            let request = self
-                .worker
-                .as_mut()
-                .ok_or("无法识别输入框")?
-                .fill(
-                    self.flow.vault.session().epoch(),
-                    FillCommand {
-                        inspection_id: *id,
-                        expected_window: inspection.snapshot.window,
-                        choice,
-                        settings: self.settings.clone(),
-                        action,
-                        username,
-                        password,
-                    },
-                )
-                .map_err(|e| e.message())?;
+            let command = FillCommand {
+                inspection_id: *id,
+                expected_window: inspection.snapshot.window,
+                choice,
+                settings: self.settings.clone(),
+                action,
+                username,
+                password,
+            };
+            let worker = self.worker.as_mut().ok_or("无法识别输入框")?;
+            let request = if let Some(permit) = permit {
+                worker.fill_hint(self.flow.vault.session().epoch(), command, permit)
+            } else {
+                worker.fill(self.flow.vault.session().epoch(), command)
+            }
+            .map_err(|e| e.message())?;
             self.last_fill = Some((
                 request,
                 self.worker.as_ref().unwrap().control().generation(),

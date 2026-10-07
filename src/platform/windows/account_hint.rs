@@ -1,9 +1,13 @@
-//! WinEvent callbacks only coalesce notifications. All inspection stays on the MTA.
+//! WinEvent versions revoke hint grants synchronously and coalesce MTA checks.
 use super::{account_target::PasswordBounds, theme};
-use crate::model::Theme;
+use crate::{
+    account_fill_ui::{HintChecks, HintClock, HintPermit},
+    model::Theme,
+};
+use std::cell::{Cell, RefCell};
 use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    LazyLock, Mutex,
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use windows::{
     Win32::{
@@ -13,8 +17,9 @@ use windows::{
     },
     core::w,
 };
-static DIRTY: AtomicBool = AtomicBool::new(false);
-static LAYOUT: AtomicBool = AtomicBool::new(false);
+static EVENTS: LazyLock<HintClock> = LazyLock::new(HintClock::default);
+static SHOWN: AtomicU64 = AtomicU64::new(0);
+static PRESSED: AtomicU64 = AtomicU64::new(0);
 static TARGET: AtomicUsize = AtomicUsize::new(0);
 static FOCUS: AtomicUsize = AtomicUsize::new(0);
 static OWNER: AtomicUsize = AtomicUsize::new(0);
@@ -60,14 +65,23 @@ unsafe extern "system" fn event(
         }
     }
     if event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_FOCUS {
-        if TARGET.load(Ordering::Relaxed) != hwnd.0 as usize
-            && FOCUS.load(Ordering::Relaxed) != hwnd.0 as usize
+        let target = TARGET.load(Ordering::Acquire);
+        if target == 0 {
+            return;
+        }
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) }.0 as usize;
+        // Descendant controls may report layout/hide separately from the native
+        // focus host. A destroyed HWND can no longer report its ancestor; revoke
+        // conservatively rather than retaining a potentially dead field's grant.
+        if target != hwnd.0 as usize
+            && FOCUS.load(Ordering::Acquire) != hwnd.0 as usize
+            && root != target
+            && !(root == 0 && matches!(event, EVENT_OBJECT_DESTROY | EVENT_OBJECT_HIDE))
         {
             return;
         }
-        LAYOUT.store(true, Ordering::Release);
     }
-    DIRTY.store(true, Ordering::Release);
+    EVENTS.event();
 }
 struct Style {
     colors: theme::Colors,
@@ -91,13 +105,26 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+            WM_LBUTTONDOWN => {
+                let version = SHOWN.load(Ordering::SeqCst);
+                PRESSED.store(
+                    if EVENTS.current(version) { version } else { 0 },
+                    Ordering::SeqCst,
+                );
+                return LRESULT(0);
+            }
             WM_LBUTTONUP => {
+                let version = PRESSED.swap(0, Ordering::SeqCst);
                 let owner = OWNER.load(Ordering::Acquire);
-                if owner != 0 {
+                if owner != 0
+                    && version != 0
+                    && version == SHOWN.load(Ordering::SeqCst)
+                    && EVENTS.current(version)
+                {
                     let _ = PostMessageW(
                         Some(HWND(owner as *mut _)),
                         HINT_CLICK,
-                        WPARAM(0),
+                        WPARAM(version as usize),
                         LPARAM(0),
                     );
                 }
@@ -133,6 +160,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
 }
 pub struct Hint {
+    checks: RefCell<HintChecks>,
+    observed: Cell<u64>,
     hooks: Vec<HWINEVENTHOOK>,
     hwnd: HWND,
     style: Box<Style>,
@@ -140,6 +169,8 @@ pub struct Hint {
 impl Default for Hint {
     fn default() -> Self {
         Self {
+            checks: RefCell::new(HintChecks::new(EVENTS.clone())),
+            observed: Cell::new(0),
             hooks: vec![],
             hwnd: HWND::default(),
             style: Box::new(Style {
@@ -193,25 +224,44 @@ impl Hint {
                     self.hooks.push(hook);
                 }
             }
-            DIRTY.store(true, Ordering::Release);
+            EVENTS.event();
         }
     }
-    pub fn changed(&self) -> Option<bool> {
-        (!self.hooks.is_empty() && DIRTY.swap(false, Ordering::AcqRel))
-            .then(|| LAYOUT.swap(false, Ordering::AcqRel))
+    pub fn changed(&self) -> bool {
+        let version = EVENTS.version();
+        !self.hooks.is_empty() && self.observed.replace(version) != version
+    }
+    pub fn request_check(&self) {
+        EVENTS.event();
+    }
+    pub fn begin_check(&self) -> Option<u64> {
+        self.checks.borrow_mut().take_check()
+    }
+    pub fn current(&self, version: u64) -> bool {
+        EVENTS.current(version)
+    }
+    pub fn consume(&self, version: u64) -> Option<HintPermit> {
+        self.checks.borrow_mut().consume(version)
     }
     pub fn target(&self, handle: u64, focus: usize) {
         TARGET.store(handle as usize, Ordering::Release);
         FOCUS.store(focus, Ordering::Release);
     }
     pub fn hide(&self) {
+        self.checks.borrow_mut().hide();
+        SHOWN.store(0, Ordering::SeqCst);
+        PRESSED.store(0, Ordering::SeqCst);
         unsafe {
             if !self.hwnd.is_invalid() {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
         }
     }
-    pub fn show(&mut self, bounds: PasswordBounds, appearance: Theme) {
+    pub fn show(&mut self, bounds: PasswordBounds, appearance: Theme, version: u64) -> bool {
+        if !self.checks.borrow_mut().offer(version) {
+            return false;
+        }
+        SHOWN.store(version, Ordering::SeqCst);
         unsafe {
             self.style.colors = theme::Colors::new(appearance);
             if self.hwnd.is_invalid() {
@@ -290,16 +340,18 @@ impl Hint {
             );
             let _ = InvalidateRect(Some(self.hwnd), None, true);
         }
+        true
     }
     pub fn stop(&mut self) {
         self.hide();
+        if !self.hooks.is_empty() {
+            EVENTS.event();
+        }
         for h in self.hooks.drain(..) {
             unsafe {
                 let _ = UnhookWinEvent(h);
             }
         }
-        DIRTY.store(false, Ordering::Release);
-        LAYOUT.store(false, Ordering::Release);
         TARGET.store(0, Ordering::Release);
         FOCUS.store(0, Ordering::Release);
         *GUARD.lock().unwrap_or_else(|p| p.into_inner()) = None;
@@ -312,6 +364,134 @@ impl Drop for Hint {
             if !self.hwnd.is_invalid() {
                 let _ = DestroyWindow(self.hwnd);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// Exercise the real callback and click message, not a parallel hook policy.
+    #[test]
+    fn native_hint_versions_cover_same_hwnd_events_and_queued_old_click() {
+        unsafe {
+            struct Owner(HWND);
+            impl Drop for Owner {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                    }
+                    OWNER.store(0, Ordering::SeqCst);
+                }
+            }
+            let owner = Owner(
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("Synthetic hint owner"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    1,
+                    1,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            OWNER.store(owner.0.0 as usize, Ordering::SeqCst);
+            let mut hint = Hint::default();
+            hint.target(owner.0.0 as u64, owner.0.0 as usize);
+            let child = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("Synthetic field"),
+                WS_CHILD,
+                0,
+                0,
+                1,
+                1,
+                Some(owner.0),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let bounds = PasswordBounds {
+                field_id: 7,
+                left: 50,
+                top: 50,
+                right: 250,
+                bottom: 80,
+            };
+            for _ in 0..2 {
+                // Ordinary field -> password -> ordinary: all use the same native HWND.
+                event(
+                    HWINEVENTHOOK::default(),
+                    EVENT_OBJECT_FOCUS,
+                    owner.0,
+                    -4,
+                    1,
+                    0,
+                    0,
+                );
+                assert!(hint.begin_check().is_some());
+                for _ in 0..50 {
+                    event(
+                        HWINEVENTHOOK::default(),
+                        EVENT_OBJECT_FOCUS,
+                        owner.0,
+                        -4,
+                        2,
+                        0,
+                        0,
+                    );
+                }
+                let password = hint.begin_check().unwrap();
+                assert!(hint.begin_check().is_none());
+                assert!(hint.show(bounds, Theme::System, password));
+                event(
+                    HWINEVENTHOOK::default(),
+                    EVENT_OBJECT_FOCUS,
+                    owner.0,
+                    -4,
+                    1,
+                    0,
+                    0,
+                );
+                assert!(hint.consume(password).is_none()); // No timer/changed() between event and click.
+            }
+            let old = hint.begin_check().unwrap();
+            assert!(hint.show(bounds, Theme::System, old));
+            proc(hint.hwnd, WM_LBUTTONDOWN, WPARAM(0), LPARAM(0));
+            proc(hint.hwnd, WM_LBUTTONUP, WPARAM(0), LPARAM(0));
+            event(
+                HWINEVENTHOOK::default(),
+                EVENT_OBJECT_LOCATIONCHANGE,
+                child,
+                -4,
+                2,
+                0,
+                0,
+            );
+            let new = hint.begin_check().unwrap();
+            assert!(hint.show(bounds, Theme::System, new));
+            let mut message = MSG::default();
+            assert!(
+                PeekMessageW(
+                    &mut message,
+                    Some(owner.0),
+                    HINT_CLICK,
+                    HINT_CLICK,
+                    PM_REMOVE
+                )
+                .as_bool()
+            );
+            assert_eq!(message.wParam.0 as u64, old);
+            assert!(hint.consume(message.wParam.0 as u64).is_none());
+            assert!(hint.consume(new).is_some());
         }
     }
 }

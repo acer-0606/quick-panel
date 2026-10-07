@@ -683,6 +683,32 @@ impl Automation {
         }
         Ok(())
     }
+    /// Current UIA focus is distinct from the native GUI-thread focus HWND.
+    /// Used only by ConfirmedHint, after the fresh sample and before FillGate.consume.
+    pub(crate) fn focused_password(
+        &self,
+        context: &Context,
+        snapshot: &SceneSnapshot,
+        deadline: Instant,
+    ) -> Result<Option<u64>, FillError> {
+        let focused = self.query(deadline, || unsafe { self.uia.GetFocusedElement() })?;
+        if self.query(deadline, || unsafe { focused.CurrentProcessId() })? as u32
+            != context.target.pid
+        {
+            return Ok(None);
+        }
+        let runtime_id = self.identity(deadline, &focused)?;
+        Ok(context.ids.get(&runtime_id).copied().filter(|id| {
+            snapshot.fields.iter().any(|field| {
+                field.field_id == *id
+                    && field.is_password
+                    && field.visible
+                    && field.enabled
+                    && field.writable
+            })
+        }))
+    }
+    #[allow(clippy::too_many_arguments)]
     pub fn write(
         &self,
         context: &Context,
@@ -691,6 +717,7 @@ impl Automation {
         lease: &crate::account_fill_execution::FillLease,
         deadline: Instant,
         expected_focus: u64,
+        hint: Option<&crate::account_fill_ui::HintPermit>,
     ) -> Result<(), FillError> {
         unsafe {
             // This writable pattern was acquired by the just-completed sample.
@@ -701,7 +728,7 @@ impl Automation {
             if focus_handle(context.target) != Some(expected_focus) {
                 return Err(FillError::TargetChanged);
             }
-            if !lease.is_current() {
+            if !lease.is_current() || hint.is_some_and(|permit| !permit.current()) {
                 return Err(FillError::Cancelled);
             }
             if context.watch.changed.load(Ordering::SeqCst) {
