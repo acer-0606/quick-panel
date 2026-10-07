@@ -89,7 +89,7 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 
 ### Task 4: 原生账号流程、设置、提示与最终交付
 
-**Files:** 新增src/platform/windows/account_ui.rs、account_hint.rs，按需新增src/account_fill_ui.rs及tests/account_fill_ui.rs；修改src/platform/windows/ui.rs、dialogs.rs、settings_ui.rs、src/settings_ui.rs、palette.rs、model.rs所需UI字段和对应tests；更新README.md/docs/verification.md。不得在UI里实现第二份密码加密或UIA逻辑。
+**Files:** 新增src/platform/windows/account_ui.rs、account_hint.rs，按需新增src/account_fill_ui.rs及tests/account_fill_ui.rs；修改src/platform/windows/ui.rs、dialogs.rs、settings_ui.rs、src/settings_ui.rs、palette.rs、model.rs所需UI字段和对应tests；更新README.md/docs/verification.md。不得在UI里实现第二份密码加密或UIA逻辑。为提示定位可窄改account_target.rs/account_worker.rs：在已有MTA采样/同一预算中返回与当前inspection/字段ID关联的非COM物理矩形DTO；无有效密码框矩形就隐藏提示，GUI不能查询UIA。此为Task4提示消费者所需的接口补充，不增加第二份匹配或UIA实现。
 
 **Interfaces:** 消费前三任务报告公开API，所有操作使用实际匹配/VaultWorker/AccountWorker。新增账号设置分组及Fill/Manage/Lock可搜索功能；主面板只提供本地命令，账号操作不加入AI/Pi可执行工具或AI函数目录；保险箱内容只在专属原生账号窗口内查找。保持现有设置导航及跨页草稿合同。
 
