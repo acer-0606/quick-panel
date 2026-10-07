@@ -67,6 +67,8 @@ actor仅处理密文，不能拥有主密码/明文Account/Scene；写入前校�
 - [ ] 使用RustCrypto库固定Argon2id v19参数64MiB/3/1与32-byte密钥、XChaCha20Poly1305随机salt16/nonce24，OS随机源与zeroize；核验实际crate版本/MSRV/Windows支持并锁定Cargo.lock，不自行实现算法。格式上限/参数先验证再KDF；Secret Debug/错误不输出原文。设置/解锁/修改主密码12–256字符/1024bytes，账号/关联上限遵循spec。
 - [ ] VaultSession只存解锁密钥及有界文档；公开摘要无密码；password留空编辑保留旧值、新增不可空；删除账号同时删除其关联。每次锁定递增epoch并清除摘要/秘密；主密码不长期保存。后台KDF/序列化单实际工作槽，取消后不join也不伪装任务完成，过期结果清理。
 - [ ] 添加独立密文SQLite表/actor消息；真实SQL触发器模拟写失败，确认旧密文可解锁、原请求可重试、CAS冲突不覆盖、重试已提交同密文无额外事务。读/匹配/锁定不增加写入；Shutdown排空已发送密文命令；提供单一已接纳保存状态，锁定/关闭不取消保存加密准备，迟到回执不重新解锁。Task4在发送Engine Shutdown前等待已接纳保存settle；未点击保存的草稿和解锁/查询任务可撤销。加入准备阶段锁定/关闭、原密文重试、迟到成功不解锁的回归。不得把vault作为ContentSource暴露给Pi/普通搜索。
+特殊失败边界：若OS随机源等在生成密文之前失败，且会话已锁定，秘密仍应清理；保留无秘密的准备失败状态并阻止静默退出。未锁定可保留候选并重试同一操作；已锁定可取消退出后重新解锁/创建并重新输入，或明确放弃本次失败的未保存修改后退出。不能自动放弃或把失败当成功；已生成密文的写入失败仍原包重试。
+
 - [ ] 针对Task2测试：cargo test --locked --test account_vault --test account_fill，并对受影响的真实persistence/engine/harness隔离用例做定点；再host/Windows all-target strictClippy/check、fmt/diff。不full/Release，不触碰真实API或用户数据库。新Rust依赖许可必须更新。
 - [ ] 提交owned文件，task-2-report.md给出VaultSession/Worker/Secret/命令事件的精确签名、保存准备→回执接纳的用法、错误保留/锁定/退出合同与验证日志。
 
