@@ -98,6 +98,7 @@ pub struct SemanticIndexStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub account_fill: crate::account_fill::AccountFillSettings,
     pub path_activity: crate::path_activity::PathActivitySettings,
     pub ai: crate::ai::AiSettings,
     pub organizer: crate::organizer::OrganizerSettings,
@@ -119,6 +120,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            account_fill: crate::account_fill::AccountFillSettings::default(),
             path_activity: crate::path_activity::PathActivitySettings::default(),
             ai: crate::ai::AiSettings::default(),
             organizer: crate::organizer::OrganizerSettings::default(),
