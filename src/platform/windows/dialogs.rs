@@ -25,7 +25,7 @@ pub fn wide(s: &str) -> Vec<u16> {
 pub unsafe fn text(hwnd: HWND) -> String {
     unsafe {
         let n = GetWindowTextLengthW(hwnd).max(0) as usize;
-        let mut b = vec![0u16; n + 1];
+        let mut b = zeroize::Zeroizing::new(vec![0u16; n + 1]);
         let n = GetWindowTextW(hwnd, &mut b);
         String::from_utf16_lossy(&b[..n.max(0) as usize])
     }
@@ -103,6 +103,18 @@ enum Field {
     Toggle(bool),
     Switch(bool, &'static str),
 }
+impl Drop for Field {
+    fn drop(&mut self) {
+        match self {
+            Self::Hidden(s)
+            | Self::Model(s)
+            | Self::Text(s)
+            | Self::Multiline(s)
+            | Self::Password(s) => zeroize::Zeroize::zeroize(s),
+            _ => (),
+        }
+    }
+}
 struct FormWindow(HWND);
 impl Drop for FormWindow {
     fn drop(&mut self) {
@@ -114,6 +126,7 @@ impl Drop for FormWindow {
     }
 }
 struct Form {
+    passwords: Vec<usize>,
     edits: Vec<HWND>,
     controls: Vec<HWND>,
     colors: theme::Colors,
@@ -525,11 +538,7 @@ unsafe fn read_values(ptr: *const RefCell<Form>) -> FormValues {
             form.edits.clone(),
             form.choices.clone(),
             form.switches.clone(),
-            match form.test {
-                Some(TestForm::Ai(_)) => Some(4),
-                Some(TestForm::Embedding(_)) => Some(3),
-                _ => None,
-            },
+            form.passwords.clone(),
         )
     };
     FormValues {
@@ -546,7 +555,7 @@ unsafe fn read_values(ptr: *const RefCell<Form>) -> FormValues {
                 }
             })
             .collect(),
-        passwords: password.into_iter().collect(),
+        passwords: password,
     }
 }
 
@@ -948,6 +957,23 @@ pub unsafe fn settings_form(
 ) -> Option<Vec<String>> {
     use crate::{hotkeys::format_hotkey, settings_ui::Action};
     let fields = match action {
+        Action::Accounts => vec![
+            (
+                "账号填充",
+                Field::Switch(settings.account_fill.enabled, "启用账号填充（默认关闭）"),
+            ),
+            (
+                "前台提示",
+                Field::Switch(
+                    settings.account_fill.show_hint,
+                    "已核验密码框显示可点击提示",
+                ),
+            ),
+            (
+                "闲置锁定（1–60 分钟）",
+                Field::Text(settings.account_fill.lock_minutes.to_string()),
+            ),
+        ],
         Action::General => vec![
             (
                 "外观主题",
@@ -1257,6 +1283,48 @@ pub unsafe fn embedding_settings_form(
         )
     }
 }
+/// Async account operations keep this same native form open until their typed receipt.
+/// A failed operation leaves every Edit unchanged; retry reuses the accepted request.
+pub enum AccountFormSignal<'a> {
+    Activity,
+    Submit(&'a [String]),
+    Poll,
+}
+pub use crate::account_fill_ui::FormProgress as AccountFormProgress;
+pub unsafe fn account_form(
+    owner: HWND,
+    title: &str,
+    fields: &[(&str, String, bool)],
+    appearance: Theme,
+    mut operation: impl FnMut(AccountFormSignal<'_>) -> AccountFormProgress,
+) -> bool {
+    let fields: Vec<_> = fields
+        .iter()
+        .map(|(label, value, password)| {
+            (
+                *label,
+                if *password {
+                    Field::Password(value.clone())
+                } else {
+                    Field::Text(value.clone())
+                },
+            )
+        })
+        .collect();
+    unsafe {
+        form_fields_async(
+            owner,
+            title,
+            &fields,
+            None,
+            appearance,
+            Validation::None,
+            None,
+            Some(&mut operation),
+        )
+        .is_some()
+    }
+}
 unsafe fn form_fields_with_test_theme(
     owner: HWND,
     title: &str,
@@ -1264,7 +1332,24 @@ unsafe fn form_fields_with_test_theme(
     test: Option<TestForm>,
     appearance: Theme,
     validation: Validation,
+    submit: Submit<'_>,
+) -> Option<Vec<String>> {
+    unsafe {
+        form_fields_async(
+            owner, title, fields, test, appearance, validation, submit, None,
+        )
+    }
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn form_fields_async(
+    owner: HWND,
+    title: &str,
+    fields: &[(&str, Field)],
+    test: Option<TestForm>,
+    appearance: Theme,
+    validation: Validation,
     mut submit: Submit<'_>,
+    mut account: Option<&mut dyn FnMut(AccountFormSignal<'_>) -> AccountFormProgress>,
 ) -> Option<Vec<String>> {
     unsafe {
         let instance = GetModuleHandleW(None).ok()?;
@@ -1320,6 +1405,13 @@ unsafe fn form_fields_with_test_theme(
             models: model_listing,
         };
         let state = Box::new(RefCell::new(Form {
+            passwords: fields
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (_, f))| {
+                    (account.is_some() || matches!(f, Field::Password(_))).then_some(i)
+                })
+                .collect(),
             edits: Vec::new(),
             controls: Vec::new(),
             colors: theme::Colors::new(appearance),
@@ -1892,7 +1984,69 @@ unsafe fn form_fields_with_test_theme(
         let mut msg = MSG::default();
         let mut quit = None;
         let mut submission = Submission::default();
+        let mut account_pending = false;
         loop {
+            if account.is_some() && state.borrow().done && !state.borrow().accepted {
+                break;
+            }
+            if let Some(callback) = account.as_deref_mut() {
+                let progress = if state.borrow().done && state.borrow().accepted && !account_pending
+                {
+                    let values = read_values(&*state);
+                    callback(AccountFormSignal::Submit(&values.values))
+                } else {
+                    callback(AccountFormSignal::Poll)
+                };
+                match progress {
+                    AccountFormProgress::Complete => {
+                        state.borrow_mut().accepted = true;
+                        break;
+                    }
+                    AccountFormProgress::Cancelled => {
+                        state.borrow_mut().accepted = false;
+                        break;
+                    }
+                    AccountFormProgress::Failed(message) => {
+                        if account_pending || state.borrow().accepted {
+                            let explanation = if !account_pending || text(hwnd).contains("解锁") {
+                                "请修正当前输入后重试，原输入仍保留。"
+                            } else {
+                                "保存失败可重试原请求；如需更改内容，请关闭本表单后明确放弃失败修改。"
+                            };
+                            form_error(
+                                &*state,
+                                FormError::new(0, format!("{message}\r\n{explanation}")),
+                            );
+                        }
+                        account_pending = false;
+                        {
+                            let mut form = state.borrow_mut();
+                            form.done = false;
+                            form.accepted = false;
+                        }
+                        test_controls(&*state, false);
+                    }
+                    AccountFormProgress::Pending => {
+                        if state.borrow().accepted {
+                            account_pending = true;
+                            {
+                                let mut form = state.borrow_mut();
+                                form.done = false;
+                                form.accepted = false;
+                            }
+                            test_controls(&*state, true);
+                            let output = state.borrow().error_result;
+                            if let Some(output) = output {
+                                let message = wide(&format!(
+                                    "正在处理：{}…\r\n可关闭窗口；已点击保存的操作会继续完成。",
+                                    text(hwnd)
+                                ));
+                                let _ = SetWindowTextW(output, PCWSTR(message.as_ptr()));
+                            }
+                        }
+                    }
+                }
+            }
             if state.borrow().done {
                 if state.borrow().accepted {
                     state.borrow_mut().status.error = None;
@@ -1922,6 +2076,12 @@ unsafe fn form_fields_with_test_theme(
             if status.0 <= 0 {
                 quit = Some(msg.wParam.0 as i32);
                 break;
+            }
+            if (msg.hwnd == hwnd || IsChild(hwnd, msg.hwnd).as_bool())
+                && matches!(msg.message, WM_KEYDOWN | WM_LBUTTONDOWN | WM_MOUSEWHEEL)
+                && let Some(callback) = account.as_deref_mut()
+            {
+                let _ = callback(AccountFormSignal::Activity);
             }
             let context = windows::Win32::UI::Input::Ime::ImmGetContext(msg.hwnd);
             let composing = if !context.is_invalid() {
@@ -1964,7 +2124,9 @@ unsafe fn form_fields_with_test_theme(
                     | Field::Password(_)
                     | Field::Multiline(_)
                     | Field::Model(_) => {
-                        if submit.is_some() && matches!(fields[i].1, Field::Password(_)) {
+                        if account.is_some()
+                            || (submit.is_some() && matches!(fields[i].1, Field::Password(_)))
+                        {
                             String::new()
                         } else {
                             text(*e)
@@ -1985,6 +2147,11 @@ unsafe fn form_fields_with_test_theme(
                 })
                 .collect()
         });
+        for (i, edit) in edits.iter().enumerate() {
+            if matches!(fields[i].1, Field::Password(_)) {
+                let _ = SetWindowTextW(*edit, w!(""));
+            }
+        }
         let _ = DestroyWindow(hwnd);
 
         let _ = EnableWindow(owner, true);

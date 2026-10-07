@@ -23,7 +23,7 @@ fn all_settings_entries_share_hub_and_operations_are_not_groups() {
     for entry in [Entry::Main, Entry::Tray, Entry::Search] {
         assert_eq!(settings_ui::entry_group(entry), Group::General);
     }
-    assert_eq!(Group::ALL.len(), 6);
+    assert!(Group::ALL.contains(&Group::Accounts));
     assert_eq!(
         settings_ui::function_group(quick_panel::palette::Function::Settings),
         Some(Group::General)

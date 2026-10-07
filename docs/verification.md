@@ -1,4 +1,20 @@
-# 2026-10-07 交互清晰化与统一设置中心（当前交付）
+# 2026-10-08 账号填充与保险箱集成
+
+新增默认关闭的账号填充设置、三条仅本地命令及独立原生账号窗口。主界面只显示功能，不显示账号内容；`ai_catalog` 和 `ai_results` 同时拒绝账号命令。原生表单复用现有密码 Edit、IME、滚动和固定页脚，异步解锁/保存失败保留原输入。账号搜索只查询当前解锁文档的有界 RAM 摘要。
+
+App 持有保险箱控制器和单个 UIA MTA worker。所有正常 `Shutdown` 入口统一经过账号保存流水线；退出期间继续处理加密准备和专属持久化回执，失败可重试原密文或取消退出。关闭已解锁账号窗口只撤销当前填入/点选并清显示，保留闲置解锁间隔；未完成的解锁取消后递增代次。锁屏/休眠/禁用/退出锁定并撤销。
+
+提示使用前台/焦点及当前目标布局事件合并唤醒，最多一次基础采样加一次指定目标采样；按应用指纹及场景筛选、最多8个候选且只允许同一个区分目标选择器。只有唯一 Exact、当前聚焦密码框和有效物理矩形才显示不激活提示。没有可用矩形时隐藏；多候选/复杂选择器改走手动入口。UI线程不查询UIA、读磁盘或运行KDF。浏览器及点选局部范围只允许本次填入，不能记住或自动提示。每次实际填入仍由原执行器重新验证，不提交登录。
+
+本轮消费者 RED：未等待已接纳保存、旧读回执/取消状态、账号本地命令接线和异步表单完成策略均出现预期失败后修正。定点账号/UI/设置/功能目录/表单回归通过；唯一一次完整共享 `cargo test --locked -- --test-threads=1` 使用固定 `QP_TEST_NODE`，**567 passed / 0 failed / 3 ignored，45 summaries，exit0，207.737秒**。其中2项为既有显式大库/性能检查，另1项为由有界读取父测试在隔离子进程中执行的 SQLite probe 入口；不是3项测试失败。未变 Node suite 未重跑。
+
+完整共享套件之后，仅补 Win32 隐藏提示填入的专属结果消息：实际失败、partial/uncertain 可见；后台提示检查失败及无写入的主动取消不弹窗；旧操作结果单独说明，不改变新目标/解锁状态。协调者明确批准共享代码不变时不重复 full；补丁使用消费者定点及最终 Windows all-target strict/check，最终 Release 包含补丁。
+
+最终定点 **55 passed / 0 failed**（账号消费者11 + 设置13 + 功能目录22 + 表单9）。host/Windows `cargo check --locked --all-targets` 及两平台 strict Clippy `-D warnings` 均exit0；fmt/diff检查exit0。Windows GNU Release exit0（75.615秒），共享Release core-check exit0（39.647秒），`pending_visible`、`disk_empty_before_flush`、`exit_restored`均为true。准确源码版本、分发大小与SHA在 `dist/package-manifest.json` / `dist/SHA256SUMS` 及本轮报告中记录。Windows 原生 fixtures 在本 macOS **执行0项**，GUI/UIA/IME/DPI/多屏/锁屏/休眠均未实测。交叉编译与共享状态测试不能代替 Windows 实机验收。系统强制结束会话只有既有有限等待，不宣称断电或强杀安全。测试只使用合成账号和临时数据库，没有访问真实密码库、API、剪贴板或录屏。
+
+新增密码依赖许可已随 Task2 收入 `THIRD_PARTY_NOTICES.txt`；本任务仅增加 windows crate 的会话通知 feature，无新增依赖包。分发复用计划中已核验的 Windows Node 24.19.0、NODE-LICENSE 和既有 Pi bundle，不下载或更改全局运行时。
+
+# 2026-10-07 交互清晰化与统一设置中心（历史交付）
 
 本轮集成 UX01–UX22，主面板、托盘、功能搜索“设置”进入同一 Win32 原生中心。六组为常规与快捷键、剪贴板与数据、常用路径、智能查找、AI 管家、服务连接。保留原生主题/Segoe UI、分组返回上下文、提交失败 raw 草稿、记忆精确目标与独立重试；截图/建立索引等立即操作保留在独立功能入口。
 

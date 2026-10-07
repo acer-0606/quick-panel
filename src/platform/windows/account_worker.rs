@@ -17,6 +17,7 @@ use windows::Win32::System::Com::*;
 
 #[derive(Clone, Debug)]
 pub struct Inspection {
+    pub password_bounds: Option<super::account_target::PasswordBounds>,
     pub snapshot: SceneSnapshot,
     pub suggested_password: Option<u64>,
     pub suggested_username: Option<u64>,
@@ -236,7 +237,11 @@ struct Session {
     context: Context,
     snapshot: Option<SceneSnapshot>,
 }
-fn inspection(snapshot: SceneSnapshot, manual_only: bool) -> Inspection {
+fn inspection(
+    snapshot: SceneSnapshot,
+    manual_only: bool,
+    password_bounds: Option<super::account_target::PasswordBounds>,
+) -> Inspection {
     let passwords: Vec<_> = snapshot.fields.iter().filter(|f| f.is_password).collect();
     let usernames: Vec<_> = snapshot.fields.iter().filter(|f| !f.is_password).collect();
     let eligible = |f: &&LiveField| {
@@ -260,6 +265,7 @@ fn inspection(snapshot: SceneSnapshot, manual_only: bool) -> Inspection {
         .map(|f| f.field_id);
     let teaching_required = suggested_password.is_none() || usernames.len() > 1;
     Inspection {
+        password_bounds,
         manual_only: manual_only
             || snapshot.origin == SceneOrigin::UnverifiedBrowser
             || snapshot.scope == SceneScope::SelectedContext,
@@ -377,7 +383,11 @@ fn handle(
                 return Err(FillError::Cancelled);
             }
             current.snapshot = Some(snapshot.clone());
-            Ok(AccountResult::Inspected(inspection(snapshot, false)))
+            Ok(AccountResult::Inspected(inspection(
+                snapshot,
+                false,
+                current.context.password_bounds,
+            )))
         }
         Operation::Point {
             inspection_id,
@@ -415,7 +425,7 @@ fn handle(
             current.id = id;
             current.snapshot = Some(snapshot.clone());
             Ok(AccountResult::Taught(TaughtPoint {
-                inspection: inspection(snapshot, false),
+                inspection: inspection(snapshot, false, current.context.password_bounds),
                 field_id,
                 role: point.role,
             }))

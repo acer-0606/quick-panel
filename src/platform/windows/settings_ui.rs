@@ -413,7 +413,9 @@ pub unsafe fn show(
                         .copied()
                 })
                 .flatten();
-            if selected.is_some_and(|a| matches!(a, Action::Review | Action::Memory)) {
+            if selected.is_some_and(|a| {
+                matches!(a, Action::Review | Action::Memory | Action::AccountManage)
+            }) {
                 // Commit the current group to the RAM navigation frame before suspension.
                 let _ = update(hwnd, group, None);
                 result = selected;

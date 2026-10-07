@@ -305,6 +305,7 @@ impl Automation {
                 .AddStructureChangedEventHandler(&root, TreeScope_Subtree, None, &watch.handler)
         })?;
         Ok(Context {
+            password_bounds: None,
             target,
             app,
             watch,
@@ -476,6 +477,7 @@ impl Automation {
                 node_count: 0,
                 max_depth: 0,
             };
+            context.password_bounds = None;
             context.patterns.clear();
             context.selectors.clear();
             let mut structure = Sha256::new();
@@ -614,6 +616,25 @@ impl Automation {
                 let enabled = self
                     .query(deadline, || element.CurrentIsEnabled())?
                     .as_bool();
+                if is_password
+                    && visible
+                    && enabled
+                    && writable
+                    && self
+                        .query(deadline, || element.CurrentHasKeyboardFocus())
+                        .is_ok_and(|v| v.as_bool())
+                    && let Ok(r) = self.query(deadline, || element.CurrentBoundingRectangle())
+                    && r.right > r.left
+                    && r.bottom > r.top
+                {
+                    context.password_bounds = Some(PasswordBounds {
+                        field_id: id,
+                        left: r.left,
+                        top: r.top,
+                        right: r.right,
+                        bottom: r.bottom,
+                    });
+                }
                 scene.fields.push(LiveField {
                     field_id: id,
                     selector: selector.clone(),
@@ -696,7 +717,16 @@ impl Automation {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PasswordBounds {
+    pub field_id: u64,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
 pub(crate) struct Context {
+    pub password_bounds: Option<PasswordBounds>,
     pub target: WindowIdentity,
     app: AppIdentity,
     watch: Watch,

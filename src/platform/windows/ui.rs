@@ -302,6 +302,17 @@ impl RenderState {
     }
 }
 enum UiEffect {
+    AccountResult {
+        owner: HWND,
+        message: String,
+    },
+    Accounts {
+        owner: HWND,
+        fill: bool,
+    },
+    AccountExitFailure {
+        owner: HWND,
+    },
     HarnessMemory {
         owner: HWND,
         state: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
@@ -454,6 +465,7 @@ impl Drop for WindowGuard {
 type OrganizerWorker = crate::harness_worker::HarnessWorker;
 pub(super) const PI_HEALTH_WAKE: u32 = WM_APP + 81;
 struct App {
+    accounts: Rc<RefCell<super::account_ui::Runtime>>,
     organizer_progress: crate::organizer_display::ProgressCache,
     organizer_label: HWND,
     organizer_preserve_order: bool,
@@ -585,6 +597,7 @@ pub fn run() -> Result<(), String> {
         let (tx, work_rx) = mpsc::channel();
         let (done_tx, rx) = mpsc::channel();
         let app_data = App {
+            accounts: Rc::new(RefCell::new(super::account_ui::Runtime::new())),
             organizer_progress: crate::organizer_display::ProgressCache::default(),
             organizer_label: HWND::default(),
             organizer_preserve_order: false,
@@ -696,6 +709,14 @@ pub fn run() -> Result<(), String> {
         let _window_guard = WindowGuard(hwnd);
         let mut app = host.app.borrow_mut();
         app.hwnd = hwnd;
+        app.accounts.borrow_mut().owner = hwnd;
+        if SetTimer(Some(hwnd), super::account_ui::TIMER, 100, None) == 0 {
+            return Err("无法启动账号状态处理".into());
+        }
+        let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
+            hwnd,
+            windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
+        );
         app.dpi = GetDpiForWindow(hwnd).max(96);
         app.create_controls()?;
         let handle = hwnd.0 as usize;
@@ -1707,6 +1728,16 @@ impl App {
     }
 
     fn send(&self, c: Command) {
+        if matches!(c, Command::Shutdown) {
+            let mut accounts = self.accounts.borrow_mut();
+            accounts.exit();
+            accounts.shutdown_requested = true;
+            accounts.shutdown_sent = false;
+            return;
+        }
+        if matches!(c, Command::CancelShutdown) {
+            self.accounts.borrow_mut().cancel_exit();
+        }
         if let Some(e) = &self.engine
             && let Err(error) = e.send(c)
         {
@@ -2044,6 +2075,13 @@ impl App {
         let mut process = 0u32;
         GetWindowThreadProcessId(foreground, Some(&mut process));
         let own_window = process == windows::Win32::System::Threading::GetCurrentProcessId();
+        if update_target && !own_window {
+            let target = super::account_target::capture_foreground(
+                windows::Win32::System::Threading::GetCurrentProcessId(),
+            )
+            .ok();
+            self.accounts.borrow_mut().capture(target, false);
+        }
         if update_target
             && !foreground.is_invalid()
             && self.state.may_update_target(own_window)
@@ -2090,6 +2128,9 @@ impl App {
         self.search();
     }
     unsafe fn hide(&mut self) {
+        if !self.accounts.borrow().open {
+            self.accounts.borrow_mut().dismiss();
+        }
         // Selection hides the native panel only after setting state.visible=false.
         // Its resulting WA_INACTIVE must not revoke its own screenshot.
         if self.state.visible {
@@ -2603,9 +2644,14 @@ impl App {
                         self.search();
                     }
                 }
-                Event::AccountVaultLoaded { .. } | Event::AccountVaultWritten { .. } => {}
+                event @ (Event::AccountVaultLoaded { .. } | Event::AccountVaultWritten { .. }) => {
+                    self.accounts.borrow_mut().event(event);
+                }
                 Event::Ready(settings) => {
                     self.settings = settings;
+                    self.accounts
+                        .borrow_mut()
+                        .configure(self.settings.account_fill.clone(), self.settings.theme);
                     self.update_organizer_timer();
                     self.update_path_monitor();
                     self.retheme();
@@ -3288,6 +3334,7 @@ impl App {
             Some(crate::settings_ui::Page::Hub(group)) => self.settings_group(group),
             Some(crate::settings_ui::Page::Memory) => self.show_harness_memory(),
             Some(crate::settings_ui::Page::Review) => self.review_organizer(),
+            Some(crate::settings_ui::Page::Accounts) => self.open_accounts(false),
             None => {
                 self.cancel_semantic();
                 self.restore_after_modal(true);
@@ -3401,6 +3448,9 @@ impl App {
         Ok(())
     }
     unsafe fn accept_settings(&mut self, next: Settings) {
+        self.accounts
+            .borrow_mut()
+            .configure(next.account_fill.clone(), next.theme);
         self.cancel_organizer_for_settings(&next);
         if self.settings.embedding != next.embedding {
             self.cancel_semantic();
@@ -3513,6 +3563,9 @@ impl App {
             let _ = SetWindowTextW(self.edit, w!(""));
         }
         match function {
+            Function::AccountFill => self.open_accounts(true),
+            Function::AccountManage => self.open_accounts(false),
+            Function::AccountLock => self.accounts.borrow_mut().lock(),
             Function::Screenshot => self.begin_screenshot(),
             Function::ScreenshotSettings => self.screenshot_settings(),
             Function::Settings => self.settings(),
@@ -3539,6 +3592,39 @@ impl App {
             Function::Documents => self.command(303),
             Function::Exit => self.command(EXIT),
             _ => {}
+        }
+    }
+    unsafe fn open_accounts(&mut self, fill: bool) {
+        if self.state.lifecycle != Lifecycle::Running {
+            return;
+        }
+        self.open_settings_page(crate::settings_ui::Page::Accounts);
+        self.accounts.borrow_mut().queue_read();
+        self.state.modal_open = true;
+        self.effects.push_back(UiEffect::Accounts {
+            owner: self.hwnd,
+            fill,
+        });
+    }
+    unsafe fn account_tick(&mut self) {
+        let engine = self.engine.as_ref();
+        self.accounts.borrow_mut().tick(|command| {
+            engine
+                .ok_or_else(|| "存储尚未就绪".to_string())?
+                .send(command)
+        });
+        if let Some(message) = self.accounts.borrow_mut().take_attention() {
+            self.effects.push_back(UiEffect::AccountResult {
+                owner: self.hwnd,
+                message,
+            });
+        }
+        let failed = self.accounts.borrow().shutdown_failed;
+        if failed && !self.state.modal_open {
+            self.accounts.borrow_mut().shutdown_failed = false;
+            self.state.modal_open = true;
+            self.effects
+                .push_back(UiEffect::AccountExitFailure { owner: self.hwnd });
         }
     }
     unsafe fn command(&mut self, id: usize) {
@@ -3637,6 +3723,7 @@ impl App {
             223 => self.add(true),
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
+                self.accounts.borrow_mut().exit();
                 let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
                 self.organizer_session.cancel();
                 if let Some(worker) = &self.organizer_worker
@@ -3723,10 +3810,28 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Err(_) => {
                 match msg {
                     WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
-                    ENGINE_WAKE | WORK_WAKE | ORGANIZER_UI_WAKE | SHOW_EXISTING
-                    | WM_CLIPBOARDUPDATE | WM_HOTKEY | WM_CLOSE | WM_ACTIVATE | WM_SIZE
-                    | WM_SETTINGCHANGE | WM_COMMAND | WM_THEMECHANGED | WM_CONTEXTMENU | TRAY
-                    | WM_DROPFILES | WM_ENDSESSION | WM_DESTROY | WM_DISPLAYCHANGE => {
+                    ENGINE_WAKE
+                    | WORK_WAKE
+                    | ORGANIZER_UI_WAKE
+                    | SHOW_EXISTING
+                    | WM_CLIPBOARDUPDATE
+                    | WM_HOTKEY
+                    | WM_CLOSE
+                    | WM_ACTIVATE
+                    | WM_SIZE
+                    | WM_SETTINGCHANGE
+                    | WM_COMMAND
+                    | WM_THEMECHANGED
+                    | WM_CONTEXTMENU
+                    | TRAY
+                    | WM_DROPFILES
+                    | WM_ENDSESSION
+                    | WM_DESTROY
+                    | WM_DISPLAYCHANGE
+                    | WM_POWERBROADCAST
+                    | WM_WTSSESSION_CHANGE
+                    | WM_TIMER
+                    | super::account_hint::CANCEL_TARGET => {
                         host.defer(Deferred::Message(msg, wp, lp))
                     }
                     WM_QUERYENDSESSION => return LRESULT(1),
@@ -3748,6 +3853,26 @@ unsafe fn app_message(
     lp: LPARAM,
 ) -> Option<LRESULT> {
     match msg {
+        WM_TIMER if wp.0 == super::account_ui::TIMER => {
+            app.account_tick();
+            return Some(LRESULT(0));
+        }
+        super::account_hint::CANCEL_TARGET => {
+            app.accounts.borrow_mut().target_cancelled(wp.0 as u64);
+            return Some(LRESULT(0));
+        }
+        super::account_hint::HINT_CLICK => {
+            app.accounts.borrow_mut().hint_click();
+            return Some(LRESULT(0));
+        }
+        WM_WTSSESSION_CHANGE if wp.0 == 7 => {
+            app.accounts.borrow_mut().lock();
+            return Some(LRESULT(0));
+        }
+        WM_POWERBROADCAST if wp.0 == 4 => {
+            app.accounts.borrow_mut().lock();
+            return Some(LRESULT(1));
+        }
         SHOW_EXISTING => {
             if app.state.lifecycle == Lifecycle::Running && app.state.modal_open {
                 let popup = GetLastActivePopup(app.hwnd);
@@ -3840,6 +3965,7 @@ unsafe fn app_message(
             return Some(LRESULT(0));
         }
         WM_DISPLAYCHANGE => {
+            app.accounts.borrow_mut().revoke();
             app.screenshot_gate.cancel();
             return Some(LRESULT(0));
         }
@@ -3852,6 +3978,7 @@ unsafe fn app_message(
             return Some(LRESULT(0));
         }
         WM_DPICHANGED => {
+            app.accounts.borrow_mut().revoke();
             app.dpi = (wp.0 & 0xffff) as u32;
             let rect = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(
@@ -4234,7 +4361,7 @@ impl Host {
         use crate::settings_ui::Action as Edit;
         let settings = self.app.borrow().settings.clone();
         match action {
-            Edit::General | Edit::Data | Edit::Smart => {
+            Edit::General | Edit::Data | Edit::Smart | Edit::Accounts => {
                 dialogs::settings_form(
                     owner,
                     &settings,
@@ -4326,7 +4453,8 @@ impl Host {
                     }),
                 );
             }
-            Edit::Review | Edit::Memory => (),
+            Edit::AccountLock => self.app.borrow_mut().accounts.borrow_mut().lock(),
+            Edit::AccountManage | Edit::Review | Edit::Memory => (),
         }
     }
 
@@ -4468,6 +4596,7 @@ impl Host {
     unsafe fn end_session(&self, hwnd: HWND) {
         {
             let mut app = self.app.borrow_mut();
+            app.accounts.borrow_mut().exit();
             app.stop_path_monitor();
             app.screenshot_gate.close();
             app.cancel_index();
@@ -4487,12 +4616,11 @@ impl Host {
             let finished = {
                 let mut app = self.app.borrow_mut();
                 app.work_done();
-                matches!(
-                    app.engine
-                        .as_ref()
-                        .and_then(|engine| engine.try_recv().ok()),
-                    Some(Event::ExitReady | Event::Error { .. })
-                )
+                app.account_tick();
+                app.events();
+                app.effects.iter().any(|effect| {
+                    matches!(effect, UiEffect::Destroy(_) | UiEffect::ExitError { .. })
+                })
             };
             if finished {
                 break;
@@ -4525,6 +4653,7 @@ impl Host {
                         && !matches!(
                             effect,
                             UiEffect::ExitError { .. }
+                                | UiEffect::AccountExitFailure { .. }
                                 | UiEffect::Message { .. }
                                 | UiEffect::Destroy(_)
                         )
@@ -4820,6 +4949,9 @@ impl Host {
                     app.state.modal_open = false;
                     if app.state.lifecycle == Lifecycle::Running {
                         match management {
+                            Some(crate::settings_ui::Action::AccountManage) => {
+                                app.open_accounts(false)
+                            }
                             Some(crate::settings_ui::Action::Review) => app.review_organizer(),
                             Some(crate::settings_ui::Action::Memory) => app.show_harness_memory(),
                             _ => {
@@ -4863,6 +4995,47 @@ impl Host {
                         Ok(Some(input)) => app.send(Command::EditClipboardMetadata(input)),
                         Ok(None) => (),
                         Err(message) => app.status(&message),
+                    }
+                }
+                UiEffect::AccountResult { owner, message } => {
+                    MessageBoxW(
+                        Some(owner),
+                        PCWSTR(wide(&message).as_ptr()),
+                        w!("账号填入结果"),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    self.app.borrow_mut().state.modal_open = false;
+                }
+                UiEffect::Accounts { owner, fill } => {
+                    let runtime = self.app.borrow().accounts.clone();
+                    super::account_ui::show(owner, runtime, fill);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    app.close_settings_page();
+                    if app.settings_navigation.current().is_some() {
+                        app.resume_settings_navigation();
+                    } else {
+                        app.state.visible = IsWindowVisible(app.hwnd).as_bool();
+                        if app.state.visible {
+                            app.search();
+                        }
+                    }
+                }
+                UiEffect::AccountExitFailure { owner } => {
+                    let runtime = self.app.borrow().accounts.clone();
+                    let message = runtime.borrow().notice.clone();
+                    let answer=MessageBoxW(Some(owner),PCWSTR(wide(&format!("账号修改尚未保存：{message}\n\n重试原保存请求，或取消退出后处理失败修改？")).as_ptr()),w!("账号保存失败"),MB_RETRYCANCEL|MB_ICONERROR);
+                    let mut app = self.app.borrow_mut();
+                    app.state.modal_open = false;
+                    if answer == IDRETRY {
+                        runtime.borrow_mut().retry();
+                    } else {
+                        runtime.borrow_mut().cancel_exit();
+                        app.state.cancel_exit();
+                        app.update_organizer_timer();
+                        app.screenshot_gate.resume();
+                        app.update_path_monitor();
+                        app.open_accounts(false);
                     }
                 }
                 UiEffect::ExitError { owner, message } => {

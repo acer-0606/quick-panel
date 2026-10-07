@@ -12,15 +12,17 @@ pub enum Group {
     Smart,
     Organizer,
     Services,
+    Accounts,
 }
 impl Group {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::General,
         Self::Data,
         Self::Paths,
         Self::Smart,
         Self::Organizer,
         Self::Services,
+        Self::Accounts,
     ];
     pub fn title(self) -> &'static str {
         match self {
@@ -30,6 +32,7 @@ impl Group {
             Self::Smart => "智能查找",
             Self::Organizer => "AI 管家",
             Self::Services => "服务连接",
+            Self::Accounts => "账号填充",
         }
     }
     pub fn actions(self) -> &'static [Action] {
@@ -45,11 +48,15 @@ impl Group {
                 Action::Memory,
             ],
             Self::Services => &[Action::Claude, Action::Embedding],
+            Self::Accounts => &[Action::Accounts, Action::AccountManage, Action::AccountLock],
         }
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
+    Accounts,
+    AccountManage,
+    AccountLock,
     General,
     Data,
     Paths,
@@ -64,6 +71,9 @@ pub enum Action {
 impl Action {
     pub fn title(self) -> &'static str {
         match self {
+            Self::Accounts => "编辑启用、提示与闲置锁定",
+            Self::AccountManage => "管理账号保险箱",
+            Self::AccountLock => "立即锁定账号保险箱",
             Self::General => "编辑主题与三个快捷键",
             Self::Data => "编辑记录、排除与保留",
             Self::Paths => "编辑观察与排除",
@@ -117,6 +127,12 @@ fn count(v: &[String], n: usize) -> Result<(), FormError> {
 pub fn edit(current: &Settings, action: Action, v: &[String]) -> Result<Settings, FormError> {
     let mut next = current.clone();
     match action {
+        Action::Accounts => {
+            count(v, 3)?;
+            next.account_fill.enabled = v[0] == "1";
+            next.account_fill.show_hint = v[1] == "1";
+            next.account_fill.lock_minutes = positive(&v[2], 60, 2)? as u32;
+        }
         Action::General => {
             count(v, 4)?;
             next.theme = match v[0].as_str() {
@@ -191,6 +207,7 @@ pub fn edit(current: &Settings, action: Action, v: &[String]) -> Result<Settings
 pub fn description(group: Group, s: &Settings, index: &str, query: Option<&str>) -> String {
     let enabled = |v| if v { "已启用" } else { "已停用" };
     match group {
+        Group::Accounts => format!("账号填充{}；前台提示{}。\r\n闲置{}分钟锁定。\r\n\r\n关闭后仍可管理保险箱，但不能填入。主密码无法找回，请保管好主密码和数据库密文备份。提示仅用于已解锁且核验通过的前台密码框；点击后才填入，不提交登录。",enabled(s.account_fill.enabled),enabled(s.account_fill.show_hint),s.account_fill.lock_minutes),
         Group::General => {
             let key=|m,k| {let value=crate::hotkeys::format_hotkey(m,k);if value.is_empty(){"已关闭".into()}else{value}};
             format!("主题：{}\r\n面板：{}\r\n剪贴板：{}\r\n区域截图：{}\r\n\r\n三个快捷键集中配置。留空关闭对应快捷键；已启用的组合须互不相同。",match s.theme {Theme::System=>"跟随系统",Theme::Light=>"浅色",Theme::Dark=>"深色"},key(s.hotkey_modifiers,s.hotkey_key),key(s.clipboard_hotkey_modifiers,s.clipboard_hotkey_key),key(s.screenshot_hotkey_modifiers,s.screenshot_hotkey_key))
@@ -309,6 +326,7 @@ pub fn submit_paths(current: &Settings, values: &[String]) -> Result<PathSubmiss
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
+    Accounts,
     Hub(Group),
     Memory,
     Review,
@@ -370,6 +388,7 @@ impl Navigation {
     }
     pub fn back_label(&self) -> &'static str {
         match self.frames.iter().rev().nth(1) {
+            Some(Page::Accounts) => "返回账号",
             Some(Page::Memory) => "返回记忆",
             Some(Page::Review) => "返回建议",
             Some(Page::Hub(_)) => "返回设置",

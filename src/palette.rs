@@ -17,6 +17,9 @@ pub struct RowDetail {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Function {
+    AccountFill,
+    AccountManage,
+    AccountLock,
     Screenshot,
     ScreenshotSettings,
     Settings,
@@ -46,6 +49,9 @@ pub enum Function {
 impl Function {
     fn id(self) -> &'static str {
         match self {
+            Self::AccountFill => "function:account-fill",
+            Self::AccountManage => "function:account-manage",
+            Self::AccountLock => "function:account-lock",
             Self::Screenshot => "function:screenshot",
             Self::ScreenshotSettings => "function:screenshot-settings",
             Self::Settings => "function:settings",
@@ -388,6 +394,27 @@ struct Spec {
 }
 const CATALOG: &[Spec] = &[
     Spec {
+        action: Function::AccountFill,
+        title: "账号填充",
+        description: "在独立账号窗口选择账号并确认目标；需启用账号填充",
+        alias: "填密码",
+        keywords: &["账号", "密码填充", "account"],
+    },
+    Spec {
+        action: Function::AccountManage,
+        title: "管理账号",
+        description: "创建或解锁独立保险箱，编辑账号与关联",
+        alias: "密码保险箱",
+        keywords: &["账号", "主密码", "vault"],
+    },
+    Spec {
+        action: Function::AccountLock,
+        title: "锁定账号保险箱",
+        description: "立即清空账号显示并撤销填入许可",
+        alias: "锁定账号",
+        keywords: &["账号", "密码", "lock"],
+    },
+    Spec {
         action: Function::Screenshot,
         title: "区域截图",
         description: "拖动选区，将 PNG 图片复制到剪贴板",
@@ -487,7 +514,7 @@ const CATALOG: &[Spec] = &[
     Spec {
         action: Function::Settings,
         title: "设置",
-        description: "打开六组设置中心：快捷键、数据、路径、智能查找、管家与服务连接",
+        description: "打开七组设置中心：快捷键、数据、路径、智能查找、管家、服务连接与账号填充",
         alias: "快捷键",
         keywords: &["打开设置", "热键", "外观", "主题", "settings", "hotkey"],
     },
@@ -587,8 +614,14 @@ pub fn ai_catalog(context: Context) -> Vec<FunctionDescriptor> {
     CATALOG
         .iter()
         .filter(|spec| {
-            !matches!(spec.action, Function::AiSearch | Function::SmartSearch)
-                && available(spec.action, context)
+            !matches!(
+                spec.action,
+                Function::AiSearch
+                    | Function::SmartSearch
+                    | Function::AccountFill
+                    | Function::AccountManage
+                    | Function::AccountLock
+            ) && available(spec.action, context)
         })
         .map(|spec| FunctionDescriptor {
             id: spec.action.id().into(),
@@ -602,8 +635,14 @@ pub fn ai_results(plan: &AiPlan, saved: Vec<ItemSummary>, context: Context) -> V
     let mut rows = Vec::new();
     for id in &plan.functions {
         if let Some(spec) = CATALOG.iter().find(|spec| {
-            !matches!(spec.action, Function::AiSearch | Function::SmartSearch)
-                && spec.action.id() == id
+            !matches!(
+                spec.action,
+                Function::AiSearch
+                    | Function::SmartSearch
+                    | Function::AccountFill
+                    | Function::AccountManage
+                    | Function::AccountLock
+            ) && spec.action.id() == id
                 && available(spec.action, context)
         }) && !rows.iter().any(|row: &Entry| row.id() == id)
         {
