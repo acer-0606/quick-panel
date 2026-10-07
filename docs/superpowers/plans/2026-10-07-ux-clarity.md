@@ -32,8 +32,8 @@
 
 **Requirements:** 完成UX02/03/04/18。所有基础表单关闭前做可执行本地校验，错误保持raw输入/选择/IME，明确错误字段并滚入；不要把原值重新填入来覆盖草稿。Embedding验证地址/模型/启用时已有或新key、互斥清除及格式，保存不调用API。关闭AI跳过仅运行需要的effort支持校验；开启或手动测试继续校验。后续hotkey注册/DPAPI错误保留本次草稿可继续修正，敏感key不进日志/存储草稿、不带入Node。管家依赖提示/保存错误/测试结果分层，轮询只更新测试区域，不覆盖错误。路径选项文案明确“清空访问统计及不再推荐名单”，保留存储语义。
 
-- [ ] 先读上述函数和调用者，写失败用例覆盖：(a)已知unsupported effort但关闭AI可保存；(b)开启仍拒绝；(c)基础/Embedding错误保留raw和错误字段；(d)runtime health不得覆盖配置/保存错误；(e)native提交失败可恢复相同草稿。
-- [ ] 为复杂状态新增实际生产使用的便携策略，最小合同示例（最终可采用既有等价类型）：
+- [x] 先读上述函数和调用者，写失败用例覆盖：(a)已知unsupported effort但关闭AI可保存；(b)开启仍拒绝；(c)基础/Embedding错误保留raw和错误字段；(d)runtime health不得覆盖配置/保存错误；(e)native提交失败可恢复相同草稿。
+- [x] 为复杂状态新增实际生产使用的便携策略，最小合同示例（最终可采用既有等价类型）：
 
 ```rust
 #[test]
@@ -53,9 +53,9 @@ fn disabling_ai_does_not_require_a_supported_effort() {
 
 `validate_ai_form` 是本任务新增并由native保存实际使用的共享校验（可采用相同职责的现有helper），调用真实 `parse_ai_fields` 并仅在返回配置enabled时阻断 `effort_warning`。RED先以旧无条件effort行为可编译接线，再验证以上用户关停流程失败；不能把缺函数编译错误当作行为RED。
 
-- [ ] 先运行定点用例得到行为RED，实施最小校验/状态/草稿生命周期变更，再运行GREEN；不为文案单独写镜像测试。测试应实际调用native消费的共享校验，不另造平行实现。
-- [ ] 命令：`cargo test --test form_validation --test organizer_ui --test hotkeys --test connection_test`（若未新增文件去掉对应target）；全部exit0后 `cargo fmt --all -- --check`、host严格Clippy和Windows all-target严格Clippy/check。Cargo严格串行。此阶段不跑完整suite/Release。
-- [ ] 自审窗口取消、关闭、测试busy、OS失败与回执恢复；只提交owned文件，写task-1-report.md包含变更/精确接口/RED→GREEN命令输出/平台边界，返回DONE或具体疑问。
+- [x] 先运行定点用例得到行为RED，实施最小校验/状态/草稿生命周期变更，再运行GREEN；不为文案单独写镜像测试。测试应实际调用native消费的共享校验，不另造平行实现。
+- [x] 命令：`cargo test --test form_validation --test organizer_ui --test hotkeys --test connection_test`（若未新增文件去掉对应target）；全部exit0后 `cargo fmt --all -- --check`、host严格Clippy和Windows all-target严格Clippy/check。Cargo严格串行。此阶段不跑完整suite/Release。
+- [x] 自审窗口取消、关闭、测试busy、OS失败与回执恢复；只提交owned文件，写task-1-report.md包含变更/精确接口/RED→GREEN命令输出/平台边界，返回DONE或具体疑问。
 
 ### Task 2: 管家与记忆的状态、操作及影响说明
 
@@ -65,9 +65,9 @@ fn disabling_ai_does_not_require_a_supported_effort() {
 
 **Requirements:** 完成UX01/05/06/08/09/19/20。反馈模式去掉不生效的启用/确认控件并明确保存即启用/所见拒绝名/范围；真实记忆管理的checkbox必须保留并读值。所有类型、alias/tags在详情可完整阅读，Rejected扩大范围显示实际影响。记忆总开关或管家关闭要显著说明，已有管理可用，反馈未启用时先引导设置而非允许填完再拒绝。Attention主入口计数及逐条阶段可见，详情展示原因/来源/恢复方式，不能按Ready应用。“忽略建议”准确说明当前版本与不学习语义。人工别名/标签校验返回字段错误与上限，支持原始草稿；新增标签/模式文案准确表达追加。
 
-- [ ] 在真实生产状态模型写RED：Attention-only Progress不应暂无待办；Attention详情包含完整原因；记忆关闭时实际生效为false且明确banner；反馈模式字段不会虚构可切换确认；拒绝记忆详情含alias；人工错误指向字段。
-- [ ] 延伸既有真实SQLite用例验证只读projection不脏写、关闭记忆不使用负向规则、管理记录不丢失；不要重写已正确authority合同或新增AI权限。
-- [ ] 生产实现遵循已有字段和读取方式，示例状态选择必须被native消费：
+- [x] 在真实生产状态模型写RED：Attention-only Progress不应暂无待办；Attention详情包含完整原因；记忆关闭时实际生效为false且明确banner；反馈模式字段不会虚构可切换确认；拒绝记忆详情含alias；人工错误指向字段。
+- [x] 延伸既有真实SQLite用例验证只读projection不脏写、关闭记忆不使用负向规则、管理记录不丢失；不要重写已正确authority合同或新增AI权限。
+- [x] 生产实现遵循已有字段和读取方式，示例状态选择必须被native消费：
 
 ```rust
 // 将Attention纳入Stage/Progress；footer优先显示待处理而不伪报空。
@@ -77,8 +77,8 @@ if attention > 0 { text.push_str(&format!(" · 需处理 {attention} 条")); }
 if alias.chars().count() > 48 { return Err("别名最多48字符，请缩短后再应用".into()); }
 ```
 
-- [ ] 定点运行 `cargo test --test organizer_display --test organizer_ui --test harness_engine --test organizer_engine`，先限定新增用例再必要覆盖本组已有回归；含actor用例固定串行。随后host/Windows严格检查，fmt/diff，无完整suite/Release。
-- [ ] 自审scope/metadata不可修改错对象、显示原文仅本地已有投影、失败保存保留草稿、关闭后管理及设置返回；提交owned文件，完整task-2-report.md，接口供Task3/4消费。
+- [x] 定点运行 `cargo test --test organizer_display --test organizer_ui --test harness_engine --test organizer_engine`，先限定新增用例再必要覆盖本组已有回归；含actor用例固定串行。随后host/Windows严格检查，fmt/diff，无完整suite/Release。
+- [x] 自审scope/metadata不可修改错对象、显示原文仅本地已有投影、失败保存保留草稿、关闭后管理及设置返回；提交owned文件，完整task-2-report.md，接口供Task3/4消费。
 
 ### Task 3: 主操作、智能检索与索引的持续状态
 
@@ -88,8 +88,8 @@ if alias.chars().count() > 48 { return Err("别名最多48字符，请缩短后�
 
 **Requirements:** 完成UX10/11/12/13/14/15/16/17/21。暂停记录有持久标识和状态化托盘菜单；不能被selection/Saved覆盖。收起预览调用完整清理并让所有异步入口拒绝隐藏预览结果，内存释放而实际worker占用规则不变。Claude显式绕过索引预检；Auto/Semantic保持有效索引/无索引引导。确定实际能力后2048/4096校验，保留实际能力标识直到新查询或取消。失败一次安静状态、不含原服务错误，提供设置可达路径；本地结果保持可操作。index停止三态分开，取消刷新当前profile状态并显示保留数；空范围/0完成解释可索引内容条件。截图以不抢焦点的原生可见反馈报告处理中/完成/未入历史，并不覆盖新剪贴板或误宣称复制成功。
 
-- [ ] 为生产状态写行为RED：Claude+Embedding缺status仍能选择Claude；取消index后刷新并保留accepted count；0完成不要求无限重建；raw API错误不泄漏且可见neutral status；选择项不抹掉会话/暂停；关闭preview迟到结果无副作用。
-- [ ] 样例期望（使用实际当前SmartView构造器/字段）：
+- [x] 为生产状态写行为RED：Claude+Embedding缺status仍能选择Claude；取消index后刷新并保留accepted count；0完成不要求无限重建；raw API错误不泄漏且可见neutral status；选择项不抹掉会话/暂停；关闭preview迟到结果无副作用。
+- [x] 样例期望（使用实际当前SmartView构造器/字段）：
 
 ```rust
 let mut preflight = SmartPreflight::default();
@@ -100,9 +100,9 @@ preflight.begin(view.clone());
 assert_eq!(preflight.finish(&view, true, None), Some(SmartAction::Claude));
 ```
 
-- [ ] 实施并定点GREEN；新增状态生命周期调用必须来自实际native路径，不能只测helper而漏接线。截图通知仅用户主动操作，不新增后台提示风暴。
-- [ ] `cargo test --test query_feedback --test smart_search --test semantic_ui --test ui_state --test preview --test screenshot --test palette`；随后host/Windows严格检查、fmt/diff。此阶段不重复完整suite/Release、Node suite或基准。
-- [ ] 自审重复点击、已完成智能结果、新查询/隐藏/修改配置、index后台运行、取消后迟到返回、退出状态优先级；提交并写task-3-report.md。
+- [x] 实施并定点GREEN；新增状态生命周期调用必须来自实际native路径，不能只测helper而漏接线。截图通知仅用户主动操作，不新增后台提示风暴。
+- [x] `cargo test --test query_feedback --test smart_search --test semantic_ui --test ui_state --test preview --test screenshot --test palette`；随后host/Windows严格检查、fmt/diff。此阶段不重复完整suite/Release、Node suite或基准。
+- [x] 自审重复点击、已完成智能结果、新查询/隐藏/修改配置、index后台运行、取消后迟到返回、退出状态优先级；提交并写task-3-report.md。
 
 ### Task 4: 统一设置中心、数据保留、分组与最终交付
 
@@ -116,8 +116,8 @@ assert_eq!(preflight.finish(&view, true, None), Some(SmartAction::Claude));
 
 原生中心视觉完全遵循spec的theme/Segoe UI/左分组右详情与固定footer。采用可滚动内容/焦点滚入，不让长中文、关闭状态说明或高DPI挤掉动作。复用叶子编辑时有明确返回路径及上下文，不创建web模拟UI充数。
 
-- [ ] 先写生产分组/路由与状态策略RED：三个设置入口同hub；6类互不混操作；关功能显示准确说明并保持配置可达；热键跨三组冲突保留旧值；保留输入边界/SQLite既有固定免清理。布局测试只对真实native消费的geometry做DPI96/144/192、小屏360×480及800×600可达检查。
-- [ ] 保留数值校验最小实现逻辑（复用T1 FieldError）：
+- [x] 先写生产分组/路由与状态策略RED：三个设置入口同hub；6类互不混操作；关功能显示准确说明并保持配置可达；热键跨三组冲突保留旧值；保留输入边界/SQLite既有固定免清理。布局测试只对真实native消费的geometry做DPI96/144/192、小屏360×480及800×600可达检查。
+- [x] 保留数值校验最小实现逻辑（复用T1 FieldError）：
 
 ```rust
 fn positive(value: &str, max: usize) -> Result<usize, String> {
@@ -133,7 +133,13 @@ fn invalid_retention_does_not_become_zero() {
 }
 ```
 
-- [ ] 定点GREEN后复核全22项source/消费方映射及模块启用/禁用矩阵，更新README实际使用导航。完整共享测试前冻结生产源码。
-- [ ] 串行执行最终 `cargo test --locked -- --test-threads=1`（QP_TEST_NODE固定），读取完整输出确认exit0；host/Windows all-target strictClippy及check、fmt/diff；`cargo build --release --locked --target x86_64-pc-windows-gnu`、`cargo run --release --locked -- --core-check`。每条明确完成后才启动下一条。Node源码不变不重跑30项Node suite。
-- [ ] 从本轮scratch/node-assets使用已验证node.exe+LICENSE，`python3 scripts/package-portable.py --node-assets .superpowers/sdd/2026-10-07-ux-clarity/node-assets`，fresh ZIP/manifest/canonicalchecksums需与最后源码文档一致，不含scratch。记录实际ZIP/EXE/BUNDLE/Node bytes+SHA/CRC/member对齐及Windows实际0边界。
-- [ ] 自审导航返回、modal/输入法、DPI、小屏、生命周期、状态错误优先级及22项完成表；提交所有owned实现+文档，完整task-4-report.md记录每次定点/完整命令、exit、输出、产物。root随后派任务审查及一次最终全功能审查。
+- [x] 定点GREEN后复核全22项source/消费方映射及模块启用/禁用矩阵，更新README实际使用导航。完整共享测试前冻结生产源码。
+- [x] 串行执行最终 `cargo test --locked -- --test-threads=1`（QP_TEST_NODE固定），读取完整输出确认exit0；host/Windows all-target strictClippy及check、fmt/diff；`cargo build --release --locked --target x86_64-pc-windows-gnu`、`cargo run --release --locked -- --core-check`。每条明确完成后才启动下一条。Node源码不变不重跑30项Node suite。
+- [x] 从本轮scratch/node-assets使用已验证node.exe+LICENSE，`python3 scripts/package-portable.py --node-assets .superpowers/sdd/2026-10-07-ux-clarity/node-assets`，fresh ZIP/manifest/canonicalchecksums需与最后源码文档一致，不含scratch。记录实际ZIP/EXE/BUNDLE/Node bytes+SHA/CRC/member对齐及Windows实际0边界。
+- [x] 自审导航返回、modal/输入法、DPI、小屏、生命周期、状态错误优先级及22项完成表；提交所有owned实现+文档，完整task-4-report.md记录每次定点/完整命令、exit、输出、产物。root随后派任务审查及一次最终全功能审查。
+
+## 完成记录
+
+四个任务均通过分项审查；完整变更审查提出的两项 Important 和两项 Minor 已合并修复，并在一次范围复审中全部关闭。UX01–UX22 的最终验收映射、实施报告、RED/GREEN 与复审证据保存在 `target/verification-2026-10-07-ux-clarity/`。
+
+最终产品源码为 `677fa828bd1d2eb19b5267354a38d718bb65a340`。验证采用499/0/2共享全套基线、后续42+1及65项相应增量覆盖，最终host/Windows严格检查和Windows Release通过；Windows GUI/中文IME/多屏DPI实机仍未执行。交付收尾只更新文档与便携包，六项产品取舍保持设计文档原约定。

@@ -8,17 +8,27 @@
 - 原生中心在窄屏使用顶部六组选项，详情可键盘滚动，打开/返回动作固定；生产 geometry 在 96/144/192 DPI 和 360×480、800×600 客户区验证可达。叶子固定动作复用相同几何，长标签换行，连接状态可滚动阅读。
 - 设置提交只说明“更改已接收”，不把不关联的旧 Saved 当作本次落盘。后台错误在中心显示；正常退出的保存失败重试合同保持。
 
+## 最终审查与交付收尾
+
+最终产品源码为 `677fa828bd1d2eb19b5267354a38d718bb65a340`。四个任务分项审查完成；一次全变更审查提出的跨页面草稿、完整错误阅读、DPI 非字段焦点和旧名称四项，在同一修复提交后经一次范围复审全部关闭。UX01–UX22 已完成最终映射，开放审查问题为0；原 Task4 deferred Minor 也已关闭。
+
+主控独立核对了499/0/2全套基线、42+1补修与最后65项的各自源码范围、实际日志和退出码；最后源码的host/Windows all-target严格Clippy/check、Windows Release、fmt/diff通过。正常退出保存的三项core-check证据来自未改变存储行为的前一阶段。Windows GUI、中文IME、多屏DPI、通知和API实机执行仍为0，不将共享测试或交叉编译当成实机验收。
+
+计划、22项验收矩阵、六项裁定、全部实施/审查/复审报告、RED/GREEN、构建及独立产物核验证据归档于 `target/verification-2026-10-07-ux-clarity/`。准确ZIP体积、成员与SHA-256以 `dist/package-manifest.json` 和 `dist/SHA256SUMS` 为准；25个成员的source/stage/ZIP逐字节、CRC和SHA核验一致。本文与计划勾选状态的收尾修改仅需重新打包和核对文档成员，未变更产品源码或重复运行测试。六项取舍及代价见[设计说明](superpowers/specs/2026-10-07-ux-clarity-design.md#实施取舍)。
+
+改动和便携包保留在原目录与 `codex/quick-panel` 分支，无推送；仅清理本计划的临时工作目录，保留其他计划及归档证据。
+
 ## 最终复审修复（I1、I2、M1、M2，当前增量）
 
 本波从 `d09ea4a` 修复跨管理页的未提交草稿所有权：真实 Navigation push/pop 同步暂停/恢复当前帧的 MemoryNavigationDraft，切组或重显不创建新帧；Memory 页选择只清当前草稿，成功回执只清提交所属帧。pending command、request ID、semantic admission 和提交 raw 仍唯一共享，已接纳操作优先原请求重试。反馈仍按精确来源/所见版本/别名恢复；嵌套 Memory 页保留原记录、raw、scope 与开关，不增加 I/O。
 
 所有叶子的错误区改成固定 footer 内的原生只读多行 EDIT，支持 Tab、选取/复制及垂直滚动；创建和 DPI 重排共用错误区几何。保留原输入控件、焦点与 IME，重复状态更新不重置相同错误的阅读位置。360px/192DPI 下真实保留天数错误超过固定高度的回归核对完整滚读样式及保存/取消位置。结果区、测试连接/获取模型按钮与字段一同参与焦点滚入。README 同步“忽略建议”和“启用整理记忆（使用规则并记录反馈）”及实际停用含义。
 
-本波定点 RED 后，最终 `cargo test --locked --test organizer_ui --test settings_ui --test form_validation` **65 passed / 0 failed / 0 ignored**（43 + 13 + 9）；覆盖 A→Hub→B→A、嵌套草稿原记录、暂停帧迟到回执、原请求重试和导航清理，以及错误阅读与跨 DPI 非字段焦点。host/Windows all-targets strict Clippy/check 全部 exit0，无 warning；Windows Release exit0（43.278s）。完整命令日志、每次失败及独立 metadata 见本轮 `final-fix-report.md` 引用的 scratch 证据；fresh ZIP 的准确成员、字节、CRC、SHA 与 source/stage 校验见外置 `dist/package-manifest.json`、`dist/SHA256SUMS` 和 `final-fix-artifact-audit.json`。
+本波定点 RED 后，最终 `cargo test --locked --test organizer_ui --test settings_ui --test form_validation` **65 passed / 0 failed / 0 ignored**（43 + 13 + 9）；覆盖 A→Hub→B→A、嵌套草稿原记录、暂停帧迟到回执、原请求重试和导航清理，以及错误阅读与跨 DPI 非字段焦点。host/Windows all-targets strict Clippy/check 全部 exit0，无 warning；Windows Release exit0（43.278s）。完整命令日志、每次失败及独立 metadata 见 `target/verification-2026-10-07-ux-clarity/final-fix-report.md` 及同目录归档证据；fresh ZIP 的准确成员、字节、CRC、SHA 与 source/stage 校验见外置 `dist/package-manifest.json`、`dist/SHA256SUMS` 和 `final-fix-artifact-audit.json`。
 
 历史 **499/0/2** 全套属于 `94a6e5a` 阶段；`d09ea4a` 另有 42 + 1 增量覆盖，本波仅记录上述 65 项，不冒称最终源码重跑完整套件。未变的 Node suite、core-check 不重跑。Windows GUI/中文 IME/多屏 DPI 实机执行数仍为 **0**；原生接线及 Win32 样式核对与交叉编译不能替代实机验收。无真实 API、密钥、用户数据库、剪贴板或屏幕访问。
 
-## Task 4 gate 修复 round 1
+## Task 4 gate 修复 round 1（94a6e5a阶段历史）
 
 本轮修复路径叶子及其异步保存/清理通知提前发起面板检索、跨管理页丢失原设置来源，以及宽96DPI→窄192DPI叶子说明裁切三项。路径提交命令策略只返回实际 SaveSettings / 明确 ClearPathActivity；导航栈同时保存各层分组与记忆/建议来源，后台 Changed / PathActivityChanged / Saved 经同一门禁延迟面板检索。已启动索引的终态刷新许可不扩张也不移除。
 
@@ -28,7 +38,7 @@
 
 修后最终host/Windows all-targets strict Clippy/check、fmt/diff均exit0。Windows Release exit0（44.466s）；共享Release core-check exit0（34.494s），内存可见、保存前磁盘为空、退出恢复三项true。所有Cargo串行、固定环境和本机Node路径不变。fresh ZIP采用本轮最终源码/文档及原已核验Node/bundle，准确字节/SHA/CRC和成员以外置manifest/SHA256SUMS及修后实施报告为准。
 
-### 同轮 I1 自审补修（当前源码增量）
+### 同轮 I1 自审补修（d09ea4a阶段历史）
 
 进一步修复stale SemanticStatus回包绕过导航门禁的竞态：所有native状态请求进入StatusCache::request_for_view；普通旧回包只留dirty。真实索引终态按当前profile保留一次许可，在旧slot释放后可补发一次；实际发出、完成、匹配失败、配置失效或profile改变都会消费/撤销许可，补发自身失效不无限重试。导航退出只恢复普通Search，不附加索引状态扫描；dirty由之后已有显式路径处理。
 
