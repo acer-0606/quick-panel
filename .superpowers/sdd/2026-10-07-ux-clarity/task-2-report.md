@@ -190,3 +190,95 @@ cargo test --test organizer_ui -- --test-threads=1
 Owned 文件：`src/organizer_display.rs`、`src/organizer_store.rs`、`src/organizer_ui.rs`、`src/organizer.rs`、`src/harness_tools.rs`、`src/harness_store.rs`、`src/engine.rs`、`src/platform/windows/organizer_ui.rs`、`src/platform/windows/harness_memory_ui.rs`、`src/platform/windows/ui.rs`、`src/platform/windows/dialogs.rs`、`tests/organizer_display.rs`、`tests/organizer_ui.rs`、`tests/harness_engine.rs` 和本报告。`tests/organizer_engine.rs` 只运行，未改。root docs/scratch 未编辑。未创建子代理/reviewer；独立复审由 root 发起。
 
 最终落盘检查：`cargo fmt --all -- --check` exit **0**，无输出；`git diff --check` exit **0**，无输出。报告与 owned 代码一起提交。
+
+## Fix round 1 / 5：I1 失败 pending 下的设置入口与返回草稿
+
+FIX_BASE：`bdc574acc546b877f92b519bf3ce0b490e8f475e`。修复主题：`fix: keep disabled feedback settings reachable after failure`。读取完整 `task-2-review.md` 后核对 I1：`receipt(Err)` 保留 pending，native 唯一设置槽被 pending 改成 retry；父开关关闭时输入/Save 禁用，页内只有重发原失败 command，确实缺少 banner 承诺的设置路径。
+
+本轮修复：
+
+- 抽出 native 实际消费的四槽 footer 模型及 route，先保持原行为运行 RED；随后让反馈模式的 slot 1 保持 retry，slot 2（原隐藏删除位置）独立显示“管家设置”。render 的标签/显隐/可用性、点击 route、停用首焦点均消费同一策略，不在测试另写一套 native 分支。
+- 未接受失败的反馈 retry 明确为“重试上次提交”；已接受待落盘为“重试保存”。设置路由不清空 pending、不改变原 command，不把新编辑作为 retry 的原参数；正在执行 retry 时入口禁用，完成失败回执后再次可达。原真实管理模式的删除与设置/retry 行为保持。
+- 复用原 `MemoryLayout.buttons: [MemoryRect; 4]` 与控件 7–10；移除反馈 resize 时强制隐藏 slot 2 的旧代码。没有增加按钮或改变 footer/viewport 几何。
+- 新设置路径直接暴露的返回边界也修复：只有未接受失败、非 saving、非 pending_save、从未 semantic_admitted 且 pending 是**精确同一 FeedbackTarget** 的反馈时，才能恢复导航里的新未提交 raw/范围。原 command/raw 仍独立保存，可重试上次提交。已接受操作即使后来得到 Err(false) 也不解除绑定。
+- native 显式先取得合格 navigation draft，仅没有合格 draft 时回填原 pending；随后一次应用选中的 draft，避免旧 pending 覆盖新草稿。开启父开关后，正常 Save 可以用新 request ID 提交当前新草稿。管理对象与不同所见版本/alias/source 不获得新增恢复通路。
+
+### 本轮实际 RED/GREEN
+
+仍用报告前述固定环境前缀、固定 `QP_TEST_NODE`，Cargo 严格串行。预期行为 RED 先记录 exit 101，修复或下一独立 RED 再继续；普通检查以明确 exit 0 为下一命令前提。
+
+I1 RED：从生产 `MemoryUiState::submit → receipt(Err(false/true)) → request_snapshot/adopt(父开关关闭)` 构造真实状态，调用已经由 native 消费、保留原行为的 footer 策略：
+
+```sh
+cargo test --test organizer_ui failed_feedback_with_disabled_parent_keeps_settings_and_original_retry_reachable -- --exact --test-threads=1
+```
+
+编译成功，实际输出 `停用反馈的失败 pending 仍需独立设置入口`；`0 passed; 1 failed; 37 filtered out`，exit **101**。修复后同命令 `1 passed; 0 failed; 37 filtered out`，exit **0**。覆盖 Err(false/true) × 管家关/记忆关/同时关闭六种状态；设置与 retry 独立可见可达、Save 被禁用；原 request ID/source/version/rejected_alias/reason/scope 和 raw/pending_save 不变。
+
+直接相关设置返回 RED（已向 root 说明并获准纳入）：
+
+```sh
+cargo test --test organizer_ui settings_return_restores_only_unaccepted_feedback_edits_without_changing_retry -- --exact --test-threads=1
+```
+
+原 helper 一律排除 pending，实际输出 `未接受失败的新编辑应跨设置往返保留`；`0 passed; 1 failed; 39 filtered out`，exit **101**。加入限定恢复后同 exact 命令 `1 passed; 0 failed; 39 filtered out`，exit **0**。
+
+root 补充要求明确 retry 的旧提交语义后，同 exact 用例添加真实 footer label 与新草稿 Save 断言。再次实际 RED：left `重试保存`、right `重试上次提交`，`0 passed; 1 failed; 39 filtered out`，exit **101**。修正生产 label 并显式调整 native 恢复优先级后，最终运行：
+
+```sh
+cargo test --test organizer_ui -- --test-threads=1
+```
+
+最终输出 `Finished test profile ... 5.63s`，**40 passed; 0 failed**，exit **0**，无警告。此前本轮 39 项及中间 40 项也通过；这里只以最后源码 40 项为最终证据，没有重跑或声称重跑其他 actor/full 目标。
+
+测试矩阵：
+
+| 状态/触发 | 覆盖结果 |
+|---|---|
+| Err(false) + 每一种父开关停用 | 独立设置、重试上次提交；原 command/raw 保留，新 Save 暂不可用 |
+| Err(true) + 每一种父开关停用 | 独立设置、原 ID/签名参数的保存 retry，pending_save 保留 |
+| 未接受失败后编辑 raw/范围，再经设置返回 | 精确目标恢复新未提交草稿；retry 仍为原提交；恢复父开关后正常 Save 可提交新 raw/Global 范围和新 ID |
+| 已接受 Err(true) 后又收到 Err(false) | semantic_admitted 不被撤销；忽略伪造的新导航草稿，继续绑定原 command/raw |
+| 导航草稿改为另一所见版本 | helper 拒绝恢复，原 retry 目标不变 |
+| 正在实际 retry | 设置/retry 不重复进入；关闭仍可用 |
+| 真实管理模式 | 原 Save、设置、删除仍可达；pending_save 时保留 retry、禁用删除 |
+| 新反馈尚无 pending | retry 不虚构可执行命令，独立设置仍可达 |
+| DPI 96/144/192，320×280、640×360、1000×620 | 用实际 `memory_layout` 验证 settings/retry 所在 slot 有正尺寸、留在 footer、屏幕边界内；已有小屏/反向焦点/滚动/IME 回归继续通过 |
+
+### 新增接口与合同差异
+
+`src/organizer_ui.rs` 新增（公开、仅内存读取，不请求 actor、不写存储）：
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryFooterAction { Save, Retry, Settings, Delete, Close }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryFooterButton {
+    pub action: MemoryFooterAction,
+    pub label: &'static str,
+    pub enabled: bool,
+    pub visible: bool,
+}
+impl MemoryUiState {
+    pub fn footer_buttons(&self, feedback: bool) -> [MemoryFooterButton; 4];
+    pub fn footer_action(&self, feedback: bool, slot: usize) -> Option<MemoryFooterAction>;
+}
+```
+
+slot 0–3 与 native 控件 7–10、`memory_layout.buttons` 一一对应。反馈 slot 1 固定 retry（无 pending 则不可用），slot 2 固定 Settings；实际管理 slot 2 仍为 Delete。footer_action 对隐藏/禁用/越界返回 None，返回 owned Copy action，native 在释放借用后执行同步窗口调用或原 `retry()`。Task 4 必须保留两个独立反馈动作，不能重新将 pending 与唯一设置入口合并。
+
+`navigation_draft_for` 的签名不变，合同从“只在无 pending 恢复”扩展为上述限定的未接受失败反馈情形。`MemorySnapshot`、`MemoryRecord`、公开 native show/feedback bool 返回、设置返回目的地、Command、receipt、actor human_seen/签名/来源所见版本守卫均没有新增差异。
+
+自审：Settings 路由只存 navigation_draft 和关闭/返回请求，不调用 submit，不改 pending/raw/pending_save/semantic_admitted。Retry 先取 owned command、结束 RefMut 再 submit；footer/focus/route 先取 Copy/owned 模型后才 SetWindowText/EnableWindow/ShowWindow/SetFocus/SendMessage。pending fallback 的 command/raw 为独立块 clone，恢复控件时没有 RefCell guard。合格 draft 优先于 fallback；已接受或不匹配目标的路径仍按原 pending 恢复，不弱化对象身份。
+
+本轮修改只包括 `src/organizer_ui.rs`、`src/platform/windows/harness_memory_ui.rs`、`tests/organizer_ui.rs` 与本报告。未改其他 Task2/Task3/Task4 模块；不派子代理/reviewer，不访问真实 API/密钥/用户数据/屏幕/剪贴板，不执行 full/Release/Node suite。Windows 实机边界仍保留，独立复审由 root 发起。
+
+本轮最终严格检查（最后 40 项源码）：
+
+- `cargo clippy --lib --test organizer_ui -- -D warnings`：exit **0**，`Finished dev profile ... 2.87s`，无警告。首次针对 39 项的严格检查仅报测试断言 `cloned_ref_to_slice_refs`，改为 `sources.as_slice()`/`std::slice::from_ref` 后通过；该 lint exit 101 不是行为 RED。
+- `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`：exit **0**，`Finished dev profile ... 10.66s`，无警告。
+- `cargo check --target x86_64-pc-windows-gnu --all-targets`：exit **0**，`Finished dev profile ... 8.33s`，无警告。
+- `cargo fmt --all -- --check`：exit **0**，无输出。
+- `git diff --check`：exit **0**，无输出。
+
+以上是最新草稿/重试说明/native 优先级代码的结果；39 项阶段的 host/Win 检查和初次报告的 105 unique 不能代替这些最终证据。本轮只执行上述受影响范围，无其他 suite。待 root 独立复核 I1 与本 fix diff，未宣称复审已通过。

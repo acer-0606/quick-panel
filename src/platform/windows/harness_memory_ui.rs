@@ -7,7 +7,7 @@ use super::{
 use crate::{
     harness_tools::*,
     model::{Command, Theme},
-    organizer_ui::{MemoryUiState, memory_request_id},
+    organizer_ui::{MemoryFooterAction, MemoryUiState, memory_request_id},
 };
 use std::{cell::RefCell, rc::Rc};
 use windows::{
@@ -190,17 +190,12 @@ unsafe fn render(ptr: *const RefCell<View>) {
     for c in &controls[3..8] {
         let _ = EnableWindow(*c, !saving && !pending_save && available);
     }
-    let has_pending = state.borrow().pending.is_some();
-    set(
-        controls[8],
-        if has_pending {
-            "重试保存"
-        } else {
-            "管家设置"
-        },
-    );
-    let _ = EnableWindow(controls[8], !saving);
-    let _ = EnableWindow(controls[9], !saving && !pending_save && !feedback);
+    let footer = state.borrow().footer_buttons(feedback);
+    for (control, button) in controls[7..].iter().zip(footer) {
+        set(*control, button.label);
+        let _ = EnableWindow(*control, button.enabled);
+        let _ = ShowWindow(*control, if button.visible { SW_SHOW } else { SW_HIDE });
+    }
     scope_preview(ptr);
     (*ptr).borrow_mut().availability = Some(availability);
     (*ptr).borrow_mut().revision = revision;
@@ -216,31 +211,36 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
             v.shown.clone(),
         )
     };
-    if id == 10 {
+    let route = id
+        .checked_sub(7)
+        .and_then(|slot| state.borrow().footer_action(target.is_some(), slot));
+    let Some(route) = route else {
+        return;
+    };
+    if route == MemoryFooterAction::Close {
         (*ptr).borrow_mut().done = true;
         return;
     }
-    if id == 8 {
-        let has_pending = state.borrow().pending.is_some();
-        if has_pending {
-            let command = state.borrow_mut().retry();
-            if let Some(command) = command {
-                submit(command);
-            }
-        } else {
-            let draft = crate::organizer_ui::MemoryNavigationDraft {
-                target: target.as_ref().map(|(_, target)| target.clone()),
-                record: shown,
-                raw_input: text(controls[3]),
-                scope_choice: SendMessageW(controls[4], CB_GETCURSEL, None, None).0.max(0) as usize,
-                enabled: SendMessageW(controls[5], BM_GETCHECK, None, None).0 == 1,
-                confirmed: SendMessageW(controls[6], BM_GETCHECK, None, None).0 == 1,
-            };
-            state.borrow_mut().navigation_draft = Some(draft);
-            let mut v = (*ptr).borrow_mut();
-            v.open_settings = true;
-            v.done = true;
+    if route == MemoryFooterAction::Retry {
+        let command = state.borrow_mut().retry();
+        if let Some(command) = command {
+            submit(command);
         }
+        return;
+    }
+    if route == MemoryFooterAction::Settings {
+        let draft = crate::organizer_ui::MemoryNavigationDraft {
+            target: target.as_ref().map(|(_, target)| target.clone()),
+            record: shown,
+            raw_input: text(controls[3]),
+            scope_choice: SendMessageW(controls[4], CB_GETCURSEL, None, None).0.max(0) as usize,
+            enabled: SendMessageW(controls[5], BM_GETCHECK, None, None).0 == 1,
+            confirmed: SendMessageW(controls[6], BM_GETCHECK, None, None).0 == 1,
+        };
+        state.borrow_mut().navigation_draft = Some(draft);
+        let mut v = (*ptr).borrow_mut();
+        v.open_settings = true;
+        v.done = true;
         return;
     }
     if state.borrow().saving || state.borrow().pending_save {
@@ -249,7 +249,7 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
     if target.is_some() && !state.borrow().snapshot.feedback_available() {
         return;
     }
-    let command = if id == 9 {
+    let command = if route == MemoryFooterAction::Delete {
         let Some(record) = shown else {
             return;
         };
@@ -595,9 +595,6 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
     }
     for (index, r) in geometry.buttons.iter().enumerate() {
         let _ = MoveWindow(controls[index + 7], r.x, r.y, r.width, r.height, true);
-    }
-    if feedback {
-        let _ = ShowWindow(controls[9], SW_HIDE);
     }
     {
         let mut v = (*ptr).borrow_mut();
@@ -953,37 +950,44 @@ unsafe fn show_form(
         Some(WPARAM(input_limit * 2)),
         None,
     );
+    // Prefer a matching unsubmitted navigation draft; accepted operations fall back
+    // to their immutable submitted command/raw input instead.
+    let draft = state
+        .borrow()
+        .navigation_draft_for(target.as_ref().map(|(_, target)| target));
     if let Some((title, target)) = &target {
         set(
             controls[2],
             &crate::organizer_ui::feedback_intro(title, target),
         );
-        let (pending, raw) = {
-            let s = state.borrow();
-            (s.pending.clone(), s.raw_input.clone())
-        };
-        if let Some(Command::HarnessFeedback {
-            sources,
-            reason,
-            scope,
-            ..
-        }) = &pending
-            && sources == &vec![target.clone()]
-        {
-            set(controls[3], if raw.is_empty() { reason } else { &raw });
-            SendMessageW(
-                controls[4],
-                CB_SETCURSEL,
-                Some(WPARAM(match scope {
-                    FeedbackScope::Item => 0,
-                    FeedbackScope::Directory => 1,
-                    FeedbackScope::Global => 2,
-                })),
-                None,
-            );
+        if draft.is_none() {
+            let (pending, raw) = {
+                let s = state.borrow();
+                (s.pending.clone(), s.raw_input.clone())
+            };
+            if let Some(Command::HarnessFeedback {
+                sources,
+                reason,
+                scope,
+                ..
+            }) = &pending
+                && sources == &vec![target.clone()]
+            {
+                set(controls[3], if raw.is_empty() { reason } else { &raw });
+                SendMessageW(
+                    controls[4],
+                    CB_SETCURSEL,
+                    Some(WPARAM(match scope {
+                        FeedbackScope::Item => 0,
+                        FeedbackScope::Directory => 1,
+                        FeedbackScope::Global => 2,
+                    })),
+                    None,
+                );
+            }
         }
     }
-    if target.is_none() {
+    if target.is_none() && draft.is_none() {
         let (pending, raw, snapshot) = {
             let memory = state.borrow();
             (
@@ -1026,9 +1030,6 @@ unsafe fn show_form(
             );
         }
     }
-    let draft = state
-        .borrow()
-        .navigation_draft_for(target.as_ref().map(|(_, target)| target));
     if let Some(draft) = draft {
         view.borrow_mut().shown = draft.record;
         set(controls[3], &draft.raw_input);
@@ -1059,7 +1060,14 @@ unsafe fn show_form(
     }
     let feedback_available = state.borrow().snapshot.feedback_available();
     let focus = if target.is_some() && !feedback_available {
-        controls[8]
+        let buttons = state.borrow().footer_buttons(true);
+        let settings = buttons
+            .iter()
+            .position(|button| {
+                button.action == MemoryFooterAction::Settings && button.enabled && button.visible
+            })
+            .unwrap_or(3);
+        controls[settings + 7]
     } else if target.is_some() {
         controls[3]
     } else {

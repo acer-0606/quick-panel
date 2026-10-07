@@ -1052,3 +1052,275 @@ fn clarity_settings_navigation_keeps_raw_feedback_bound_to_exact_seen_target() {
     assert!(state.receipt(5, Ok(()), false));
     assert!(state.navigation_draft.is_none());
 }
+
+#[test]
+fn failed_feedback_with_disabled_parent_keeps_settings_and_original_retry_reachable() {
+    use quick_panel::{
+        harness_tools::{FeedbackScope, MemorySnapshot},
+        model::Command,
+    };
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    let raw = "  原始拒绝原因\r\n保留  ";
+    for pending_save in [false, true] {
+        for (organizer_enabled, memory_enabled) in [(false, true), (true, false), (false, false)] {
+            let mut state = MemoryUiState::default();
+            state.snapshot.organizer_enabled = true;
+            state.snapshot.memory_enabled = true;
+            state.raw_input = raw.into();
+            let original = Command::HarnessFeedback {
+                request_id: 42,
+                sources: vec![target.clone()],
+                reason: "原始拒绝原因 保留".into(),
+                scope: FeedbackScope::Directory,
+            };
+            state.submit(original).unwrap();
+            assert!(state.receipt(42, Err("同目录不可用或磁盘未落盘".into()), pending_save));
+            let Command::HarnessMemorySnapshot { request_id } = state.request_snapshot().unwrap()
+            else {
+                panic!()
+            };
+            state.adopt(
+                request_id,
+                MemorySnapshot {
+                    organizer_enabled,
+                    memory_enabled,
+                    ..Default::default()
+                },
+            );
+            assert!(!state.snapshot.feedback_available());
+            let buttons = state.footer_buttons(true);
+            let settings = buttons
+                .iter()
+                .position(|button| {
+                    button.action == MemoryFooterAction::Settings
+                        && button.visible
+                        && button.enabled
+                })
+                .expect("停用反馈的失败 pending 仍需独立设置入口");
+            let retry = buttons
+                .iter()
+                .position(|button| {
+                    button.action == MemoryFooterAction::Retry && button.visible && button.enabled
+                })
+                .expect("必须保留原命令重试");
+            assert_ne!(settings, retry);
+            assert_eq!(buttons[settings].label, "管家设置");
+            assert_eq!(
+                buttons[retry].label,
+                if pending_save {
+                    "重试保存"
+                } else {
+                    "重试上次提交"
+                }
+            );
+            assert_eq!(state.footer_action(true, 0), None);
+            assert_eq!(
+                state.footer_action(true, settings),
+                Some(MemoryFooterAction::Settings)
+            );
+            assert!(state.pending.is_some());
+            assert!(!state.saving);
+            assert_eq!(state.pending_save, pending_save);
+            assert_eq!(state.raw_input, raw);
+            assert_eq!(
+                state.footer_action(true, retry),
+                Some(MemoryFooterAction::Retry)
+            );
+            let Command::HarnessFeedback {
+                request_id,
+                sources,
+                reason,
+                scope,
+            } = state.retry().unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(request_id, 42);
+            assert_eq!(sources.as_slice(), std::slice::from_ref(&target));
+            assert_eq!(reason, "原始拒绝原因 保留");
+            assert_eq!(scope, FeedbackScope::Directory);
+            assert_eq!(state.raw_input, raw);
+            assert_eq!(
+                state.footer_action(true, settings),
+                None,
+                "实际重试期间不重复发起导航"
+            );
+            for dpi in [96, 144, 192] {
+                for (width, height) in [(320, 280), (640, 360), (1000, 620)] {
+                    let layout = memory_layout(width, height, dpi, true);
+                    for index in [settings, retry] {
+                        let rect = layout.buttons[index];
+                        assert!(
+                            rect.x >= 0
+                                && rect.right() <= width
+                                && rect.y >= layout.viewport_height
+                                && rect.bottom() <= height
+                                && rect.width > 0
+                                && rect.height > 0
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn memory_footer_keeps_management_delete_and_disables_empty_feedback_retry() {
+    use quick_panel::model::Command;
+    let mut state = MemoryUiState::default();
+    assert_eq!(
+        state.footer_action(false, 0),
+        Some(MemoryFooterAction::Save)
+    );
+    assert_eq!(
+        state.footer_action(false, 1),
+        Some(MemoryFooterAction::Settings)
+    );
+    assert_eq!(
+        state.footer_action(false, 2),
+        Some(MemoryFooterAction::Delete)
+    );
+    assert_eq!(state.footer_action(true, 1), None);
+    assert_eq!(
+        state.footer_action(true, 2),
+        Some(MemoryFooterAction::Settings)
+    );
+    assert_eq!(state.footer_action(true, 4), None);
+    state
+        .submit(Command::HarnessMemoryDelete {
+            request_id: 7,
+            ids: vec![1],
+        })
+        .unwrap();
+    assert_eq!(state.footer_action(false, 1), None);
+    assert_eq!(state.footer_action(false, 2), None);
+    assert_eq!(
+        state.footer_action(false, 3),
+        Some(MemoryFooterAction::Close)
+    );
+    assert!(state.receipt(7, Err("合成磁盘错误".into()), true));
+    assert_eq!(
+        state.footer_action(false, 1),
+        Some(MemoryFooterAction::Retry)
+    );
+    assert_eq!(state.footer_action(false, 2), None);
+}
+
+#[test]
+fn settings_return_restores_only_unaccepted_feedback_edits_without_changing_retry() {
+    use quick_panel::{harness_tools::FeedbackScope, model::Command};
+    let target = displayed_feedback(&Snapshot {
+        proposals: vec![proposal()],
+        ..Default::default()
+    })
+    .remove(0)
+    .1;
+    for accepted in [false, true] {
+        let mut state = MemoryUiState::default();
+        state.raw_input = "  原提交草稿  ".into();
+        state
+            .submit(Command::HarnessFeedback {
+                request_id: 52,
+                sources: vec![target.clone()],
+                reason: "原提交原因".into(),
+                scope: FeedbackScope::Directory,
+            })
+            .unwrap();
+        assert!(state.receipt(52, Err("未保存".into()), accepted));
+        // A later failed receipt must not revoke earlier semantic admission.
+        if accepted {
+            assert!(state.receipt(52, Err("仍未保存".into()), false));
+        }
+        state.navigation_draft = Some(MemoryNavigationDraft {
+            target: Some(target.clone()),
+            record: None,
+            raw_input: "  新未提交草稿\r\n  ".into(),
+            scope_choice: 2,
+            enabled: false,
+            confirmed: false,
+        });
+        assert_eq!(
+            state.footer_buttons(true)[1].label,
+            if accepted {
+                "重试保存"
+            } else {
+                "重试上次提交"
+            }
+        );
+        let restored = state.navigation_draft_for(Some(&target));
+        if accepted {
+            assert!(restored.is_none());
+        } else {
+            let draft = restored.expect("未接受失败的新编辑应跨设置往返保留");
+            assert_eq!(draft.raw_input, "  新未提交草稿\r\n  ");
+            assert_eq!(draft.scope_choice, 2);
+            let mut different = target.clone();
+            different.expected_version = "另一版本".into();
+            state.navigation_draft.as_mut().unwrap().target = Some(different.clone());
+            assert!(
+                state.navigation_draft_for(Some(&different)).is_none(),
+                "不能将 pending 的导航草稿绑定到另一所见版本"
+            );
+            state.navigation_draft.as_mut().unwrap().target = Some(target.clone());
+        }
+        assert_eq!(state.raw_input, "  原提交草稿  ");
+        let Command::HarnessFeedback {
+            request_id,
+            sources,
+            reason,
+            scope,
+        } = state.retry().unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(request_id, 52);
+        assert_eq!(sources.as_slice(), std::slice::from_ref(&target));
+        assert_eq!(reason, "原提交原因");
+        assert_eq!(scope, FeedbackScope::Directory);
+        assert!(state.navigation_draft_for(Some(&target)).is_none());
+        if !accepted {
+            assert!(state.receipt(52, Err("原提交仍失败".into()), false));
+            let Command::HarnessMemorySnapshot { request_id } = state.request_snapshot().unwrap()
+            else {
+                panic!()
+            };
+            state.adopt(
+                request_id,
+                quick_panel::harness_tools::MemorySnapshot {
+                    organizer_enabled: true,
+                    memory_enabled: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(state.footer_action(true, 0), Some(MemoryFooterAction::Save));
+            let draft = state.navigation_draft_for(Some(&target)).unwrap();
+            let reason = memory_text_input(&draft.raw_input, true).unwrap();
+            state.raw_input = draft.raw_input;
+            let Command::HarnessFeedback {
+                request_id,
+                reason,
+                scope,
+                ..
+            } = state
+                .submit(Command::HarnessFeedback {
+                    request_id: 53,
+                    sources: vec![target.clone()],
+                    reason,
+                    scope: FeedbackScope::Global,
+                })
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(request_id, 53);
+            assert_eq!(reason, "新未提交草稿");
+            assert_eq!(scope, FeedbackScope::Global);
+        }
+    }
+}

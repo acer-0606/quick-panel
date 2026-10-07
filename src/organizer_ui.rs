@@ -665,6 +665,22 @@ impl ReviewState {
     }
 }
 
+/// Footer slots map directly to native controls 7–10 and memory_layout.buttons.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryFooterAction {
+    Save,
+    Retry,
+    Settings,
+    Delete,
+    Close,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryFooterButton {
+    pub action: MemoryFooterAction,
+    pub label: &'static str,
+    pub enabled: bool,
+    pub visible: bool,
+}
 /// In-memory draft carried through a settings round trip; never a submitted command.
 #[derive(Clone, Debug)]
 pub struct MemoryNavigationDraft {
@@ -710,13 +726,74 @@ pub fn memory_request_id() -> u64 {
     h.finish().max(1)
 }
 impl MemoryUiState {
+    pub fn footer_buttons(&self, feedback: bool) -> [MemoryFooterButton; 4] {
+        use MemoryFooterAction::*;
+        let idle = !self.saving;
+        let editable =
+            idle && !self.pending_save && (!feedback || self.snapshot.feedback_available());
+        let pending = self.pending.is_some();
+        let retry_label = if feedback && pending && !self.semantic_admitted {
+            "重试上次提交"
+        } else {
+            "重试保存"
+        };
+        [
+            MemoryFooterButton {
+                action: Save,
+                label: if feedback {
+                    "保存反馈并重做"
+                } else {
+                    "保存所选规则"
+                },
+                enabled: editable,
+                visible: true,
+            },
+            MemoryFooterButton {
+                action: if feedback || pending { Retry } else { Settings },
+                label: if feedback || pending {
+                    retry_label
+                } else {
+                    "管家设置"
+                },
+                enabled: idle && (!feedback || pending),
+                visible: true,
+            },
+            MemoryFooterButton {
+                action: if feedback { Settings } else { Delete },
+                label: if feedback { "管家设置" } else { "删除" },
+                enabled: idle && (feedback || !self.pending_save),
+                visible: true,
+            },
+            MemoryFooterButton {
+                action: Close,
+                label: "关闭",
+                enabled: true,
+                visible: true,
+            },
+        ]
+    }
+    pub fn footer_action(&self, feedback: bool, slot: usize) -> Option<MemoryFooterAction> {
+        self.footer_buttons(feedback)
+            .get(slot)
+            .filter(|button| button.enabled && button.visible)
+            .map(|button| button.action)
+    }
     pub fn navigation_draft_for(
         &self,
         target: Option<&crate::harness_tools::FeedbackTarget>,
     ) -> Option<MemoryNavigationDraft> {
+        let restore = match &self.pending {
+            None => true,
+            Some(crate::model::Command::HarnessFeedback { sources, .. })
+                if !self.saving && !self.pending_save && !self.semantic_admitted =>
+            {
+                target.is_some_and(|target| sources.as_slice() == std::slice::from_ref(target))
+            }
+            _ => false,
+        };
         self.navigation_draft
             .as_ref()
-            .filter(|draft| self.pending.is_none() && draft.target.as_ref() == target)
+            .filter(|draft| restore && draft.target.as_ref() == target)
             .cloned()
     }
     /// Bind each not-yet-admitted attempt to the job present when sent to the actor.
