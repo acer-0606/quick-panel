@@ -12,19 +12,21 @@ fn read(connection: &rusqlite::Connection) -> Result<Option<VaultSnapshot>, Stri
     }
     let snapshot = connection
         .query_row(
-            "SELECT revision,length(envelope),envelope FROM account_vault WHERE id=1",
-            [],
+            // CASE is lazy: type rejection must precede length(TEXT), and the
+            // full BLOB column must only execute after its size is known safe.
+            // One statement keeps validation and payload in the same snapshot.
+            // A rejected row yields NULL (an error below), never a missing row.
+            "SELECT revision, CASE WHEN typeof(envelope)='blob' THEN
+                CASE WHEN length(envelope) BETWEEN 96 AND ?1 THEN envelope END
+             END FROM account_vault WHERE id=1",
+            [crate::account_vault::MAX_ENVELOPE_BYTES as i64],
             |r| {
-                let length: i64 = r.get(1)?;
-                if !(96..=crate::account_vault::MAX_ENVELOPE_BYTES as i64).contains(&length) {
-                    return Err(rusqlite::Error::InvalidQuery);
-                }
                 Ok(VaultSnapshot {
                     revision: r
                         .get::<_, i64>(0)?
                         .try_into()
                         .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                    envelope: r.get(2)?,
+                    envelope: r.get(1)?,
                 })
             },
         )
@@ -74,5 +76,115 @@ impl Repository {
         tx.execute("INSERT INTO account_vault(id,revision,envelope) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,envelope=excluded.envelope",params![next as i64,envelope]).map_err(|_|STORE_ERROR)?;
         tx.commit().map_err(|_| STORE_ERROR)?;
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::{Connection, ffi};
+    use std::path::Path;
+
+    fn cold_reader(path: &Path) -> Connection {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("PRAGMA mmap_size=0; PRAGMA cache_size=-64;")
+            .unwrap();
+        db
+    }
+    fn memory_status(reset: bool) -> (i64, i64) {
+        let mut current = 0;
+        let mut highwater = 0;
+        // SAFETY: these output pointers remain valid for the synchronous call.
+        // The probe runs alone in a child, since SQLite's counters are global.
+        let status = unsafe {
+            ffi::sqlite3_status64(
+                ffi::SQLITE_STATUS_MEMORY_USED,
+                &mut current,
+                &mut highwater,
+                i32::from(reset),
+            )
+        };
+        assert_eq!(status, ffi::SQLITE_OK);
+        (current, highwater)
+    }
+    fn isolated_probe(kind: &str) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "account_vault_store::tests::sqlite_materialization_probe",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("QP_VAULT_MATERIALIZATION_KIND", kind)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{stdout}");
+        assert!(
+            output.status.success(),
+            "isolated {kind} probe failed: {stdout} {stderr}"
+        );
+    }
+    #[test]
+    fn oversized_blob_rejected_before_sqlite_materialization() {
+        isolated_probe("BLOB");
+    }
+    #[test]
+    fn wrong_type_text_rejected_before_sqlite_materialization() {
+        isolated_probe("TEXT");
+    }
+    #[test]
+    #[ignore = "run by the bounded-reader tests in an isolated child process"]
+    fn sqlite_materialization_probe() {
+        let kind = std::env::var("QP_VAULT_MATERIALIZATION_KIND").unwrap_or_else(|_| "BLOB".into());
+        let expression = match kind.as_str() {
+            "BLOB" => "zeroblob(?1)",
+            "TEXT" => "CAST(zeroblob(?1) AS TEXT)",
+            _ => panic!("unknown synthetic fixture"),
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed-vault.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA page_size=4096; CREATE TABLE account_vault(id INTEGER PRIMARY KEY,revision INTEGER,envelope BLOB);").unwrap();
+        writer
+            .execute(
+                &format!("INSERT INTO account_vault VALUES(1,1,{expression})"),
+                [32 * 1024 * 1024],
+            )
+            .unwrap();
+        drop(writer);
+
+        let db = cold_reader(&path);
+        let baseline = memory_status(true).0;
+        assert!(read(&db).is_err(), "invalid record must not become None");
+        let guarded_peak = memory_status(false).1 - baseline;
+        drop(db);
+
+        // Real bundled-SQLite control: SELECT materializes the column even
+        // though the Rust callback never requests it. This calibrates the
+        // resource counter instead of assuming its platform/build behavior.
+        let control = cold_reader(&path);
+        let baseline = memory_status(true).0;
+        control
+            .query_row("SELECT envelope FROM account_vault WHERE id=1", [], |_| {
+                Ok(())
+            })
+            .unwrap();
+        let full_peak = memory_status(false).1 - baseline;
+        let version: String = control
+            .query_row("SELECT sqlite_version()", [], |r| r.get(0))
+            .unwrap();
+        println!(
+            "bundled SQLite {version}, {kind}, payload=33554432 bytes: guarded peak growth={guarded_peak}; full-column control={full_peak}"
+        );
+        assert!(
+            full_peak > 24 * 1024 * 1024,
+            "measurement must detect full payload allocation"
+        );
+        assert!(
+            guarded_peak < 1024 * 1024,
+            "reject before SQLite materializes payload: peak growth={guarded_peak}"
+        );
     }
 }
