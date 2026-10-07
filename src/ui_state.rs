@@ -57,6 +57,10 @@ impl Default for UiState {
     }
 }
 impl UiState {
+    pub fn preview_current(&self, open: bool, generation: u64, current: u64) -> bool {
+        open && generation == current && self.visible && self.lifecycle == Lifecycle::Running
+    }
+
     pub fn replace_ids(&mut self, ids: Vec<String>) {
         let previous = self.selected_index().unwrap_or(0);
         if !self.selected.as_ref().is_some_and(|id| ids.contains(id)) {

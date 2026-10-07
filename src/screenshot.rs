@@ -132,3 +132,14 @@ impl ScreenshotGate {
         false
     }
 }
+
+/// Reports only clipboard publication and history admission, not disk durability.
+pub fn completion_notice(copied: bool, history_queued: bool) -> &'static str {
+    if !copied {
+        "截图未复制；剪贴板内容以当前状态为准"
+    } else if history_queued {
+        "截图已复制，可粘贴"
+    } else {
+        "截图已复制，可粘贴；本次未记录历史"
+    }
+}

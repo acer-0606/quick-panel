@@ -430,8 +430,8 @@ const CATALOG: &[Spec] = &[
     },
     Spec {
         action: Function::SemanticSearch,
-        title: "语义查找（已建索引）",
-        description: "发送本次查询，检索已建立的语义索引",
+        title: "语义查找",
+        description: "按内容相似度查找；需要当前范围的可用索引",
         alias: "语义搜索",
         keywords: &["向量检索"],
     },

@@ -591,3 +591,81 @@ fn modal_completion_guards_do_not_revoke_claude_plan() {
         assert!(!state.modal_open);
     }
 }
+
+#[test]
+fn cancelled_index_retains_receipts_and_requests_exactly_one_refresh() {
+    use quick_panel::semantic_ui::IndexOutcome;
+    let mut session = IndexSession::default();
+    let id = token(session.begin("p"));
+    session.accept_batch(batch(id, "p", false, false));
+    session.network_started(9);
+    session.network_result(9, "p", vec![vec![1., 0.]]).unwrap();
+    session.acknowledge(id, 1).unwrap();
+    session.cancel();
+    assert_eq!(session.outcome(), IndexOutcome::Cancelled);
+    assert_eq!(session.accepted(), 1);
+    assert!(session.take_status_refresh());
+    session.cancel();
+    assert!(!session.take_status_refresh());
+    let current = quick_panel::model::SemanticIndexStatus {
+        profile: "p".into(),
+        indexed: 4,
+        needs_update: true,
+    };
+    assert!(
+        session
+            .label(Some(&current))
+            .contains("已取消 · 保留可用 4 条")
+    );
+    assert!(session.acknowledge(id, 99).is_none());
+    assert_eq!(session.accepted(), 1);
+}
+
+#[test]
+fn zero_completion_explains_eligible_content_and_failure_is_distinct() {
+    use quick_panel::semantic_ui::IndexOutcome;
+    let mut session = IndexSession::default();
+    let id = token(session.begin("p"));
+    session.accept_batch(batch(id, "p", true, true));
+    assert!(session.empty_page().is_none());
+    assert_eq!(session.outcome(), IndexOutcome::Completed);
+    let empty = quick_panel::model::SemanticIndexStatus {
+        profile: "p".into(),
+        indexed: 0,
+        needs_update: false,
+    };
+    let label = session.label(Some(&empty));
+    assert!(label.contains("没有可索引内容"));
+    assert!(label.contains("固定文本") && label.contains("索引范围"));
+    assert!(session.needs_content_guidance(Some(&empty)));
+    let changed = quick_panel::model::SemanticIndexStatus {
+        needs_update: true,
+        ..empty.clone()
+    };
+    let changed_label = session.label(Some(&changed));
+    assert!(changed_label.contains("内容待更新"));
+    assert!(!changed_label.contains("没有可索引内容"));
+    session.begin("p");
+    session.fail();
+    assert_eq!(session.outcome(), IndexOutcome::Failed);
+    assert!(session.label(Some(&empty)).contains("已停止"));
+}
+
+#[test]
+fn zero_new_embeddings_with_existing_vectors_reports_up_to_date_not_empty() {
+    let mut session = IndexSession::default();
+    let id = token(session.begin("p"));
+    session.accept_batch(batch(id, "p", true, true));
+    assert!(session.empty_page().is_none());
+    assert_eq!(session.accepted(), 0);
+    let status = quick_panel::model::SemanticIndexStatus {
+        profile: "p".into(),
+        indexed: 12,
+        needs_update: false,
+    };
+    let label = session.label(Some(&status));
+    assert!(label.contains("已是最新"));
+    assert!(label.contains("可用 12 条"));
+    assert!(!label.contains("没有可索引内容"));
+    assert!(!label.contains("固定文本"));
+}

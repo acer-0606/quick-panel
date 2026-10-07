@@ -96,3 +96,20 @@ fn failed_inflight_preview_keeps_a_latest_retry_of_the_same_target() {
     assert!(gate.select(Some(item("a")), 4).is_none());
     assert!(gate.complete(3).0);
 }
+
+#[test]
+fn collapsed_preview_revokes_load_and_decode_display_but_retains_actual_load_slot() {
+    let mut loads = PreviewLoads::default();
+    let mut state = quick_panel::ui_state::UiState::default();
+    state.visible = true;
+    loads.select(Some(item("old")), 7).unwrap();
+    // Native close clears the displayed image/text and calls cancel, without releasing Load.
+    loads.cancel();
+    assert!(!state.preview_current(false, 7, 7));
+    assert!(loads.select(Some(item("new")), 8).is_none());
+    let (display, next) = loads.complete(7);
+    assert!(!display);
+    assert_eq!(next.unwrap().0, 8);
+    assert!(!state.preview_current(true, 7, 8));
+    assert!(loads.complete(8).0);
+}

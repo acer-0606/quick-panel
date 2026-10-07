@@ -147,3 +147,14 @@ fn controlled_encoder_keeps_occupied_until_cancelled_failure_receipt_is_consumed
     assert!(!worker.busy());
     assert!(gate.begin(8).is_some());
 }
+
+#[test]
+fn completion_feedback_never_claims_copy_or_history_without_admission() {
+    use quick_panel::screenshot::completion_notice;
+    assert!(completion_notice(true, true).contains("可粘贴"));
+    assert!(completion_notice(true, false).contains("本次未记录历史"));
+    for history in [true, false] {
+        assert!(!completion_notice(false, history).contains("已复制"));
+        assert!(completion_notice(false, history).contains("未复制"));
+    }
+}

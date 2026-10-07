@@ -210,3 +210,22 @@ fn metadata_form_uses_engine_limits_and_rejects_controls() {
         assert!(form.finish(Some(fields), true).is_err());
     }
 }
+
+#[test]
+fn explicit_claude_does_not_wait_for_embedding_status() {
+    let mut current = view();
+    current.preferred = SmartSearchMode::Claude;
+    assert!(!current.needs_index_status());
+    let mut preflight = SmartPreflight::default();
+    preflight.begin(current.clone());
+    assert_eq!(
+        preflight.finish(&current, true, None),
+        Some(SmartAction::Claude)
+    );
+    current.ai_enabled = false;
+    preflight.begin(current.clone());
+    assert_eq!(
+        preflight.finish(&current, true, None),
+        Some(SmartAction::ConfigureClaude)
+    );
+}

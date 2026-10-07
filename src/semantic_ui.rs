@@ -83,12 +83,25 @@ pub fn cancel_semantic_view<T>(
     *ready = false;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexOutcome {
+    #[default]
+    Idle,
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
 #[derive(Default)]
 pub struct IndexSession {
     serial: u64,
     profile: Option<String>,
     pending: Option<IndexPending>,
     accepted: usize,
+    outcome: IndexOutcome,
+    outcome_profile: String,
+    refresh_needed: bool,
 }
 enum IndexPending {
     Page(u64),
@@ -96,6 +109,98 @@ enum IndexPending {
     Store(IndexBatch),
 }
 impl IndexSession {
+    pub fn outcome(&self) -> IndexOutcome {
+        self.outcome
+    }
+    pub fn needs_content_guidance(
+        &self,
+        status: Option<&crate::model::SemanticIndexStatus>,
+    ) -> bool {
+        self.outcome == IndexOutcome::Completed
+            && status.is_some_and(|s| s.profile == self.outcome_profile && s.indexed == 0)
+    }
+
+    pub fn clear_display(&mut self) {
+        self.outcome = IndexOutcome::Idle;
+        self.outcome_profile.clear();
+        self.refresh_needed = false;
+    }
+    pub fn take_status_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.refresh_needed)
+    }
+    fn stop(&mut self, outcome: IndexOutcome) {
+        if let Some(profile) = self.profile.take() {
+            self.outcome_profile = profile;
+            self.outcome = outcome;
+            self.refresh_needed = true;
+        }
+        self.pending = None;
+    }
+    pub fn fail(&mut self) {
+        self.stop(IndexOutcome::Failed);
+    }
+    pub fn label(&self, status: Option<&crate::model::SemanticIndexStatus>) -> String {
+        if self.active() {
+            return format!("索引更新中 · 已接收 {} 条 · 点击取消", self.accepted);
+        }
+        let outcome = if status.is_some_and(|s| s.profile != self.outcome_profile) {
+            IndexOutcome::Idle
+        } else {
+            self.outcome
+        };
+        let prefix = match outcome {
+            IndexOutcome::Completed => "索引已完成",
+            IndexOutcome::Cancelled => "索引已取消",
+            IndexOutcome::Failed => "索引已停止",
+            _ => "索引",
+        };
+        if let Some(status) = status {
+            if status.indexed == 0 && outcome == IndexOutcome::Completed {
+                return if status.needs_update {
+                    "本次未生成可用索引 · 内容待更新 · 点击检查语义检索设置"
+                } else {
+                    "当前范围没有可索引内容 · 固定文本/添加收藏，或点击调整索引范围"
+                }
+                .into();
+            }
+            if matches!(outcome, IndexOutcome::Cancelled | IndexOutcome::Failed) {
+                return format!(
+                    "{prefix} · 保留可用 {} 条 · {}",
+                    status.indexed,
+                    if outcome == IndexOutcome::Failed {
+                        "点击检查语义检索设置"
+                    } else {
+                        "继续更新索引"
+                    },
+                );
+            }
+            if status.indexed == 0 {
+                return "暂无可用索引 · 固定文本/添加收藏后建立，或调整索引范围".into();
+            }
+            let prefix = if outcome == IndexOutcome::Completed && !status.needs_update {
+                "索引已是最新"
+            } else {
+                prefix
+            };
+            return format!(
+                "{prefix} · 可用 {} 条{} · 更新索引",
+                status.indexed,
+                if status.needs_update {
+                    " · 待更新"
+                } else {
+                    ""
+                }
+            );
+        }
+        if outcome == IndexOutcome::Idle {
+            "索引状态待刷新 · 建立/更新索引".into()
+        } else {
+            format!(
+                "{prefix} · 本次已接收 {} 条 · 可用数量待刷新",
+                self.accepted
+            )
+        }
+    }
     pub fn active(&self) -> bool {
         self.profile.is_some()
     }
@@ -103,12 +208,14 @@ impl IndexSession {
         self.accepted
     }
     pub fn cancel(&mut self) {
-        self.profile = None;
-        self.pending = None;
+        self.stop(IndexOutcome::Cancelled);
     }
     pub fn begin(&mut self, profile: &str) -> Command {
         self.cancel();
         self.profile = Some(profile.into());
+        self.outcome_profile = profile.into();
+        self.outcome = IndexOutcome::Running;
+        self.refresh_needed = false;
         self.accepted = 0;
         self.page(IndexCursor::default())
     }
@@ -154,7 +261,7 @@ impl IndexSession {
         if vectors.len() != batch.candidates.len()
             || crate::semantic::validate_vectors(&vectors).is_err()
         {
-            self.cancel();
+            self.fail();
             return None;
         }
         let items = batch
@@ -178,7 +285,7 @@ impl IndexSession {
     }
     fn advance(&mut self, batch: IndexBatch) -> Option<Command> {
         if batch.done {
-            self.cancel();
+            self.stop(IndexOutcome::Completed);
             None
         } else {
             Some(self.page(batch.cursor))

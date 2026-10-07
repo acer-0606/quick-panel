@@ -1,4 +1,5 @@
 //! Shared data, persistence and search for the native Windows panel.
+pub mod activity_status;
 pub mod ai;
 pub mod ai_jobs;
 pub mod ai_models;

@@ -8,6 +8,7 @@ use super::{
     screenshot, theme,
 };
 use crate::{
+    activity_status::{self, Capability, QueryActivity},
     ai::{AiPlan, AiSettings},
     ai_jobs::{AiRequest, AiResultGate, AiWorker, revoke_adopted_plan},
     background_job::{ActionLoads, ActionPermit, ActionTicket, BackgroundWorker},
@@ -115,6 +116,31 @@ struct PreviewResult {
     text: String,
     image: Option<Result<Image, String>>,
 }
+/// Non-activating, quiet-time-aware feedback only for explicit screenshot work.
+/// REALTIME discards unavailable notifications instead of queuing stale processing tips.
+unsafe fn screenshot_notice(owner: HWND, message: &str) {
+    let mut data = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: owner,
+        uID: 1,
+        uFlags: NIF_INFO | NIF_REALTIME,
+        dwInfoFlags: NIIF_INFO | NIIF_NOSOUND | NIIF_RESPECT_QUIET_TIME,
+        ..Default::default()
+    };
+    for (to, from) in data
+        .szInfoTitle
+        .iter_mut()
+        .take(63)
+        .zip("快捷面板 · 截图".encode_utf16())
+    {
+        *to = from;
+    }
+    for (to, from) in data.szInfo.iter_mut().take(255).zip(message.encode_utf16()) {
+        *to = from;
+    }
+    let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+}
+
 struct ScreenshotJob {
     ticket: ScreenshotTicket,
     pixels: screenshot::Pixels,
@@ -491,6 +517,7 @@ struct App {
     ai_worker: Option<AiWorker>,
     ai_gate: AiResultGate,
     ai_plan: Option<AiPlan>,
+    query_activity: QueryActivity,
     semantic_query: QuerySession,
     semantic_index: IndexSession,
     semantic_status: StatusCache,
@@ -619,6 +646,7 @@ pub fn run() -> Result<(), String> {
             ai_worker: None,
             ai_gate: AiResultGate::default(),
             ai_plan: None,
+            query_activity: QueryActivity::default(),
             semantic_query: QuerySession::default(),
             semantic_index: IndexSession::default(),
             semantic_status: StatusCache::default(),
@@ -1116,22 +1144,9 @@ impl App {
     }
     unsafe fn update_index_label(&self) {
         let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
-        let message = if self.semantic_index.active() {
-            format!(
-                "索引更新中 · 已接收 {} 条 · 点击取消",
-                self.semantic_index.accepted()
-            )
-        } else if let Some(status) = self.semantic_status.ready(&profile) {
-            if status.indexed == 0 {
-                "未建立可用索引 · 建立索引".into()
-            } else if status.needs_update {
-                format!("已索引 {} 条 · 待更新 · 更新索引", status.indexed)
-            } else {
-                format!("已索引 {} 条 · 更新索引", status.indexed)
-            }
-        } else {
-            "索引状态待刷新 · 建立/更新索引".into()
-        };
+        let message = self
+            .semantic_index
+            .label(self.semantic_status.ready(&profile));
         let text = wide(&message);
         let _ = SetWindowTextW(self.index_label, PCWSTR(text.as_ptr()));
     }
@@ -1162,7 +1177,9 @@ impl App {
     }
     unsafe fn index_guidance(&self) {
         self.update_index_label();
-        self.status("尚未建立可用索引；点击“建立索引”后再智能查找");
+        self.status(
+            "暂无可用索引；可固定文本/添加收藏后建立，或到“更多 → 语义检索设置”调整索引范围",
+        );
         let _ = SetFocus(Some(self.index_label));
     }
     unsafe fn begin_smart(&mut self, preferred: Option<SmartSearchMode>) {
@@ -1188,7 +1205,7 @@ impl App {
         }
         self.smart_mode = preferred;
         let view = self.smart_view();
-        if !view.embedding_enabled {
+        if !view.needs_index_status() {
             let action = crate::smart_search::choose(&view, None);
             if !matches!(action, SmartAction::Claude) {
                 self.run_smart_action(action);
@@ -1216,11 +1233,16 @@ impl App {
             });
             return;
         }
-        if view.query.trim().is_empty() || view.query.chars().count() > semantic::MAX_INPUT_CHARS {
-            self.status("请输入不超过 4096 字的检索描述");
+        if view.query.trim().is_empty() {
+            self.status("请输入想查找的内容");
             return;
         }
-        if view.embedding_enabled && view.profile.is_empty() {
+        if !view.needs_index_status() {
+            self.run_smart_action(crate::smart_search::choose(&view, None));
+            self.smart_mode = None;
+            return;
+        }
+        if view.profile.is_empty() {
             if view.preferred != SmartSearchMode::Semantic && view.ai_enabled {
                 self.begin_ai();
             } else {
@@ -1276,6 +1298,9 @@ impl App {
         }
     }
     unsafe fn stop_ai_request(&mut self) {
+        if self.ai_gate.busy() {
+            self.query_activity.cancel_capability(Capability::Claude);
+        }
         if let Some(worker) = self.ai_worker.as_ref() {
             worker.cancel();
         }
@@ -1283,6 +1308,7 @@ impl App {
         self.smart_button_label();
     }
     unsafe fn cancel_ai(&mut self) {
+        self.query_activity.cancel_capability(Capability::Claude);
         self.stop_ai_request();
         if revoke_adopted_plan(
             &mut self.ai_plan,
@@ -1311,8 +1337,8 @@ impl App {
             return;
         }
         let query = dialogs::text(self.edit);
-        if query.trim().is_empty() || query.chars().count() > 2048 {
-            self.status("请输入不超过 2048 字的检索描述");
+        if let Err(message) = Capability::Claude.validate(&query) {
+            self.status(message);
             return;
         }
         // Switching from adopted semantic rows also refreshes ordinary results.
@@ -1351,8 +1377,15 @@ impl App {
         match self.ai_worker.as_ref().unwrap().submit(request) {
             Ok(id) => {
                 self.ai_gate.begin(id, &query, self.scope);
+                self.query_activity.begin(
+                    id,
+                    Capability::Claude,
+                    &query,
+                    self.scope,
+                    &self.smart_view().profile,
+                );
                 self.smart_button_label();
-                self.status("智能查找正在理解查询…本地结果仍可使用");
+                self.activity_status("");
             }
             Err(_) => self.local_search_status(),
         }
@@ -1378,8 +1411,17 @@ impl App {
             &mut self.saved_items,
             &mut self.saved_ready,
         ) {
-            QueryReply::Applied => self.search(),
-            QueryReply::LocalFallback => self.local_search_status(),
+            QueryReply::Applied => {
+                self.query_activity
+                    .finish(completion.id, Capability::Claude, true);
+                self.search();
+                self.activity_status("");
+            }
+            QueryReply::LocalFallback => {
+                self.query_activity
+                    .finish(completion.id, Capability::Claude, false);
+                self.activity_status("");
+            }
             QueryReply::Ignored => {}
         }
         self.smart_button_label();
@@ -1388,6 +1430,9 @@ impl App {
         self.prepare_semantic_effect(false);
     }
     unsafe fn prepare_semantic_effect(&mut self, preserve_results: bool) -> bool {
+        if !preserve_results || self.semantic_query.busy() {
+            self.query_activity.cancel_capability(Capability::Semantic);
+        }
         if let Some(worker) = &self.query_worker {
             worker.cancel();
         }
@@ -1420,6 +1465,7 @@ impl App {
             },
         ) {
             self.stop_ai_request();
+            self.query_activity.cancel();
             self.query = text;
             self.result_scope = self.scope;
             self.cancel_actions();
@@ -1450,8 +1496,8 @@ impl App {
             return;
         }
         let query = dialogs::text(self.edit);
-        if query.trim().is_empty() || query.chars().count() > semantic::MAX_INPUT_CHARS {
-            self.status("请输入不超过 4096 字的语义查询");
+        if let Err(message) = Capability::Semantic.validate(&query) {
+            self.status(message);
             return;
         }
         let profile = match semantic::profile_id(&self.settings.embedding) {
@@ -1484,8 +1530,10 @@ impl App {
             }) {
             Ok(id) => {
                 self.semantic_query.begin(id, &query, self.scope, &profile);
+                self.query_activity
+                    .begin(id, Capability::Semantic, &query, self.scope, &profile);
                 self.smart_button_label();
-                self.status("语义查询处理中…普通结果仍可使用");
+                self.activity_status("");
             }
             Err(_) => self.local_search_status(),
         }
@@ -1509,6 +1557,8 @@ impl App {
                 (&query, self.scope, &profile, active),
             ) {
                 QueryReply::Applied => {
+                    self.query_activity
+                        .finish(completion.id, Capability::Semantic, true);
                     self.saved_items.clear();
                     self.saved_ready = false;
                     self.clear_preview();
@@ -1516,8 +1566,10 @@ impl App {
                     self.smart_button_label();
                 }
                 QueryReply::LocalFallback => {
+                    self.query_activity
+                        .finish(completion.id, Capability::Semantic, false);
                     self.smart_button_label();
-                    self.local_search_status();
+                    self.activity_status("");
                 }
                 QueryReply::Ignored => {}
             }
@@ -1535,8 +1587,7 @@ impl App {
             ) {
                 IndexReply::Store(command) => self.send_index(*command),
                 IndexReply::LocalFallback => {
-                    self.cancel_index();
-                    self.local_search_status();
+                    self.index_status();
                 }
                 IndexReply::Ignored => {}
             }
@@ -1546,7 +1597,7 @@ impl App {
         if let Some(engine) = &self.engine
             && let Err(message) = engine.send(command)
         {
-            self.cancel_index();
+            self.fail_index();
             self.status(&message);
         }
     }
@@ -1569,33 +1620,39 @@ impl App {
         }
         let command = self.semantic_index.begin(&profile);
         self.send_index(command);
+        if !self.semantic_index.active() {
+            return;
+        }
         self.update_index_label();
         self.rebuild_results();
-        self.status("正在建立语义索引…仅发送选定范围的保存文本和元数据");
+        self.activity_status("正在建立语义索引…仅发送选定范围的保存文本和元数据");
     }
     unsafe fn cancel_index(&mut self) {
         if let Some(worker) = &self.index_worker {
             worker.cancel();
         }
         self.semantic_index.cancel();
-        self.update_index_label();
-        self.rebuild_results();
+        self.index_status();
+    }
+    unsafe fn fail_index(&mut self) {
+        if let Some(worker) = &self.index_worker {
+            worker.cancel();
+        }
+        self.semantic_index.fail();
+        self.index_status();
     }
     unsafe fn index_status(&mut self) {
-        if !self.semantic_index.active() {
-            self.refresh_semantic_status();
+        let refresh = self.semantic_index.take_status_refresh();
+        if refresh {
+            self.semantic_status.mark_dirty();
         }
         self.update_index_label();
         self.rebuild_results();
-        self.status(&format!(
-            "语义索引{} · 已接收 {} 条",
-            if self.semantic_index.active() {
-                "更新中"
-            } else {
-                "完成"
-            },
-            self.semantic_index.accepted()
-        ));
+        // The dedicated index label owns this status; selection owns ordinary footer hints.
+        // A local scan/send failure must be the final message, not overwritten by progress.
+        if refresh {
+            self.refresh_semantic_status();
+        }
     }
     unsafe fn index_batch(&mut self, batch: semantic::IndexBatch) {
         if self.state.lifecycle != Lifecycle::Running || !self.settings.embedding.enabled {
@@ -1613,7 +1670,7 @@ impl App {
             return;
         }
         let Some(worker) = &self.index_worker else {
-            self.cancel_index();
+            self.fail_index();
             return;
         };
         match worker.submit(EmbeddingRequest {
@@ -1622,8 +1679,7 @@ impl App {
         }) {
             Ok(id) => self.semantic_index.network_started(id),
             Err(_) => {
-                self.cancel_index();
-                self.local_search_status();
+                self.fail_index();
             }
         }
     }
@@ -1653,6 +1709,8 @@ impl App {
         self.cancel_preflight();
         self.semantic_status.mark_dirty();
         self.settings.embedding = next;
+        self.semantic_index.clear_display();
+        self.query_activity.cancel();
         self.send(Command::SaveSettings(self.settings.clone()));
         self.retheme();
         Ok(())
@@ -1946,11 +2004,24 @@ impl App {
         );
     }
     unsafe fn status(&self, message: &str) {
-        let text = wide(message);
+        let message = if self.settings.capture_paused {
+            format!("记录已暂停 · {message}")
+        } else {
+            message.into()
+        };
+        let text = wide(&message);
+        let _ = SetWindowTextW(self.footer, PCWSTR(text.as_ptr()));
+    }
+    unsafe fn activity_status(&self, message: &str) {
+        let text = wide(&activity_status::panel_status(
+            self.settings.capture_paused,
+            &self.query_activity,
+            message,
+        ));
         let _ = SetWindowTextW(self.footer, PCWSTR(text.as_ptr()));
     }
     unsafe fn local_search_status(&self) {
-        self.status("本地检索 · ↑↓ 选择  Enter 打开/粘贴");
+        self.activity_status("本地检索 · ↑↓ 选择  Enter 打开/粘贴");
     }
     unsafe fn tray(&self, operation: NOTIFY_ICON_MESSAGE) {
         let mut data = NOTIFYICONDATAW {
@@ -1967,10 +2038,15 @@ impl App {
             ..Default::default()
         };
         let key = format_hotkey(self.settings.hotkey_modifiers, self.settings.hotkey_key);
-        let title = wide(&if key.is_empty() {
-            "快捷面板 · 点击打开".into()
+        let pause = if self.settings.capture_paused {
+            " · 记录已暂停"
         } else {
-            format!("快捷面板 · {key}")
+            ""
+        };
+        let title = wide(&if key.is_empty() {
+            format!("快捷面板{pause} · 点击打开")
+        } else {
+            format!("快捷面板{pause} · {key}")
         });
         data.szTip[..title.len()].copy_from_slice(&title);
         let _ = Shell_NotifyIconW(operation, &data);
@@ -2080,6 +2156,12 @@ impl App {
         }
         let query = dialogs::text(self.edit);
         let profile = semantic::profile_id(&self.settings.embedding).unwrap_or_default();
+        self.query_activity.sync(
+            &query,
+            self.scope,
+            &profile,
+            self.state.visible && !self.state.modal_open,
+        );
         let active =
             self.settings.embedding.enabled && self.state.visible && !self.state.modal_open;
         if sync_semantic_view(
@@ -2326,9 +2408,9 @@ impl App {
             .preview_worker
             .as_ref()
             .and_then(BackgroundWorker::try_result)
-            && result.generation == self.preview_id
-            && self.state.visible
-            && self.state.lifecycle == Lifecycle::Running
+            && self
+                .state
+                .preview_current(self.preview_open, result.generation, self.preview_id)
         {
             self.image = None;
             self.preview_loading = false;
@@ -2336,7 +2418,7 @@ impl App {
             if let Some(image) = result.image {
                 match image {
                     Ok(image) => {
-                        self.status(&format!(
+                        self.activity_status(&format!(
                             "图片：{} × {} · ↑↓ 选择 · Enter 粘贴",
                             image.source_width, image.source_height
                         ));
@@ -2344,7 +2426,7 @@ impl App {
                     }
                     Err(error) => {
                         text = error;
-                        self.status("图片预览不可用；仍可复制原图");
+                        self.activity_status("图片预览不可用；仍可复制原图");
                     }
                 }
             }
@@ -2596,11 +2678,13 @@ impl App {
                         self.send_index(command);
                     }
                     if was_active {
+                        if self.semantic_index.outcome() == crate::semantic_ui::IndexOutcome::Failed
+                        {
+                            // send_index already reported a storage/send failure; don't overwrite it.
+                            continue;
+                        }
                         self.semantic_status.mark_dirty();
                         self.index_status();
-                        if !self.semantic_index.active() {
-                            self.refresh_semantic_status();
-                        }
                     }
                     if self.state.visible && self.semantic_query.adopted() {
                         self.search();
@@ -2657,6 +2741,7 @@ impl App {
                             self.cancel_actions();
                         }
                     } else if preview_current
+                        && self.preview_open
                         && self.state.visible
                         && self.state.lifecycle == Lifecycle::Running
                     {
@@ -2672,6 +2757,10 @@ impl App {
                     message,
                 } => {
                     self.action_loads.complete(request_id);
+                    let action_current = self
+                        .pending_action
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == request_id);
                     if self
                         .pending_action
                         .as_ref()
@@ -2683,6 +2772,7 @@ impl App {
                     let (preview_current, next) = self.preview_loads.fail(request_id);
                     let preview_retrying = next.is_some();
                     if preview_current
+                        && self.preview_open
                         && !preview_retrying
                         && self.state.visible
                         && self.state.lifecycle == Lifecycle::Running
@@ -2696,9 +2786,9 @@ impl App {
                         });
                     }
                     // Storage errors remain visible; unrelated generic errors never release Load slots.
-                    if self.preview_open && self.preview_loading {
+                    if preview_current && self.preview_open && self.preview_loading {
                         self.status(&format!("{message} · 正在加载所选内容预览…"));
-                    } else {
+                    } else if preview_current && self.preview_open || action_current {
                         self.status(&message);
                     }
                 }
@@ -2722,7 +2812,7 @@ impl App {
                     if self.state.lifecycle == Lifecycle::Running
                         && !self.organizer_review.borrow().pending()
                     {
-                        self.status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
+                        self.activity_status("已保存 · ↑↓ 选择  Enter 打开/粘贴");
                     }
                 }
                 Event::Error { message, exiting } => {
@@ -2743,7 +2833,7 @@ impl App {
                             continue;
                         }
                         // Admission/profile failures have no store acknowledgement.
-                        self.cancel_index();
+                        self.fail_index();
                         self.status(&message);
                     }
                 }
@@ -2767,7 +2857,7 @@ impl App {
                 self.cancel_actions();
                 self.clear_preview();
             }
-            self.status(if self.saved_ready {
+            self.activity_status(if self.saved_ready {
                 "没有匹配结果 · 可换个关键词或添加收藏"
             } else {
                 "正在检索保存内容…"
@@ -2782,7 +2872,7 @@ impl App {
         let clipboard = selected
             .and_then(PaletteEntry::saved)
             .is_some_and(|item| item.kind == ItemKind::Clipboard);
-        self.status(if function {
+        self.activity_status(if function {
             "Enter 执行功能 · Esc 关闭"
         } else if clipboard {
             "Enter 粘贴 · Esc 关闭 · 右键更多"
@@ -2797,12 +2887,12 @@ impl App {
             }
         }
         if self.preview_open && self.preview_loading {
-            self.status("正在加载所选内容预览…");
+            self.activity_status("正在加载所选内容预览…");
         }
         if self.smart_preflight.busy() {
-            self.status("正在检查本地索引…点击智能查找可取消");
+            self.activity_status("正在检查本地索引…点击智能查找可取消");
         } else if self.ai_gate.busy() || self.semantic_query.busy() {
-            self.status("智能查找处理中…可点击取消");
+            self.activity_status("智能查找处理中…可点击取消");
         }
     }
     unsafe fn request(&mut self, action: Action) {
@@ -3020,7 +3110,10 @@ impl App {
                 });
             }
             Action::Preview => {
-                if let Some(worker) = &self.preview_worker {
+                if self.preview_open
+                    && self.state.visible
+                    && let Some(worker) = &self.preview_worker
+                {
                     worker.replace((self.preview_id, item));
                 }
             }
@@ -3314,6 +3407,7 @@ impl App {
         }
         self.cancel_ai();
         self.cancel_preflight();
+        self.query_activity.cancel();
         let mut settings = self.settings.clone();
         settings.ai = next;
         self.cancel_organizer_for_settings(&settings);
@@ -3355,6 +3449,7 @@ impl App {
             .collect();
         self.replace_hotkeys(&settings)?;
         self.cancel_preflight();
+        self.query_activity.cancel();
         self.settings = settings.clone();
         self.retheme();
         self.tray(NIM_MODIFY);
@@ -3373,7 +3468,10 @@ impl App {
                 (ORGANIZER_SETTINGS, "AI 管家设置…"),
                 (ORGANIZER_REVIEW, "整理建议…"),
                 (EMBEDDING_SETTINGS, "语义检索设置…"),
-                (222, "暂停 / 恢复剪贴板记录"),
+                (
+                    222,
+                    activity_status::capture_action(self.settings.capture_paused),
+                ),
                 (EXIT, "保存后退出"),
             ]
         } else if add {
@@ -3494,6 +3592,9 @@ impl App {
             }
             PREVIEW => {
                 self.preview_open = !self.preview_open;
+                if !self.preview_open {
+                    self.clear_preview();
+                }
                 let _ = ShowWindow(
                     self.preview,
                     if self.preview_open { SW_SHOW } else { SW_HIDE },
@@ -3521,6 +3622,18 @@ impl App {
             ORGANIZER_REVIEW => self.review_organizer(),
             SMART_FIND => self.begin_smart(None),
             INDEX_STATUS if self.semantic_index.active() => self.cancel_index(),
+            INDEX_STATUS
+                if self.semantic_index.outcome() == crate::semantic_ui::IndexOutcome::Failed =>
+            {
+                self.embedding_settings()
+            }
+            INDEX_STATUS
+                if self.semantic_index.needs_content_guidance(
+                    self.semantic_status.ready(&self.smart_view().profile),
+                ) =>
+            {
+                self.embedding_settings()
+            }
             INDEX_STATUS => self.begin_index(),
             EMBEDDING_SETTINGS => self.embedding_settings(),
             INDEX_START => self.begin_index(),
@@ -3549,8 +3662,10 @@ impl App {
             221 => self.show(None),
             222 => {
                 self.settings.capture_paused = !self.settings.capture_paused;
+                self.tray(NIM_MODIFY);
                 self.send(Command::SaveSettings(self.settings.clone()));
-                self.status(if self.settings.capture_paused {
+                self.rebuild_results();
+                self.activity_status(if self.settings.capture_paused {
                     "已暂停剪贴板记录"
                 } else {
                     "已恢复剪贴板记录"
@@ -4528,6 +4643,7 @@ impl Host {
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     semantic_revoked = false;
+                    let mut notice = None;
                     if !ticket.current() || app.state.lifecycle != Lifecycle::Running {
                         app.screenshot_gate.finish(&ticket);
                     } else {
@@ -4544,6 +4660,8 @@ impl Host {
                                         owner,
                                         message: "无法启动截图编码，请重试；剪贴板保持原样".into(),
                                     });
+                                } else {
+                                    notice = Some("截图处理中…完成后可直接粘贴");
                                 }
                             }
                             Ok(_) => {
@@ -4554,6 +4672,10 @@ impl Host {
                                 app.effects.push_back(UiEffect::Message { owner, message });
                             }
                         }
+                    }
+                    drop(app);
+                    if let Some(message) = notice {
+                        screenshot_notice(owner, message);
                     }
                 }
                 UiEffect::ScreenshotDeliver {
@@ -4566,6 +4688,7 @@ impl Host {
                     app.state.modal_open = false;
                     semantic_revoked = false;
                     app.screenshot_gate.finish(&ticket);
+                    let mut notice = None;
                     match result {
                         clipboard::ScreenshotWrite::Copied {
                             sequence,
@@ -4580,12 +4703,14 @@ impl Host {
                                     && !app.settings.excluded_apps.iter().any(|name| {
                                         name.eq_ignore_ascii_case(&snapshot.source_app)
                                     });
+                            let mut history_queued = false;
                             if allowed {
                                 let queued = app
                                     .engine
                                     .as_ref()
                                     .ok_or_else(|| "历史引擎不可用".to_owned())
                                     .and_then(|engine| engine.send(Command::Capture(snapshot)));
+                                history_queued = queued.is_ok();
                                 if let Err(error) = queued {
                                     let message = format!("截图已复制，但历史未入队：{error}");
                                     warning = Some(warning.map_or(message.clone(), |old| {
@@ -4593,11 +4718,10 @@ impl Host {
                                     }));
                                 }
                             }
-                            app.status(if allowed {
-                                "截图已复制"
-                            } else {
-                                "截图已复制；本次未记录历史"
-                            });
+                            let message =
+                                crate::screenshot::completion_notice(true, history_queued);
+                            app.status(message);
+                            notice = Some(message);
                             if let Some(message) = warning {
                                 app.effects.push_back(UiEffect::Message { owner, message });
                             }
@@ -4611,9 +4735,14 @@ impl Host {
                                 app.last_capture_sequence = sequence;
                             }
                             if let Some(message) = message {
+                                notice = Some(crate::screenshot::completion_notice(false, false));
                                 app.effects.push_back(UiEffect::Message { owner, message });
                             }
                         }
+                    }
+                    drop(app);
+                    if let Some(message) = notice {
+                        screenshot_notice(owner, message);
                     }
                 }
                 UiEffect::ScreenshotSettings { owner, settings } => {

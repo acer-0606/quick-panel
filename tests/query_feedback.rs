@@ -164,3 +164,69 @@ fn successful_index_reply_still_requires_storage_acknowledgement() {
     }
     assert!(session.active());
 }
+
+#[test]
+fn activity_failure_is_neutral_and_survives_selection_and_saved_feedback() {
+    use quick_panel::activity_status::{Capability, QueryActivity, capture_action, panel_status};
+    let mut activity = QueryActivity::default();
+    activity.begin(7, Capability::Claude, "查找", Scope::All, "p");
+    let mut adopted = None;
+    let mut saved = vec![local_item()];
+    let mut ready = true;
+    let reply = claude_reply(
+        Err("secret provider response".into()),
+        &mut adopted,
+        &mut saved,
+        &mut ready,
+    );
+    assert!(activity.finish(7, Capability::Claude, reply == QueryReply::Applied));
+    assert_eq!(saved[0].id, "local:report");
+    for message in ["Enter 打开", "已保存"] {
+        let displayed = panel_status(true, &activity, message);
+        assert!(displayed.contains("记录已暂停"));
+        assert!(displayed.contains("Claude · 未完成，已保留本地结果"));
+        assert!(displayed.contains("AI 检索设置"));
+        assert!(!displayed.contains("secret provider response"));
+    }
+    assert_eq!(capture_action(true), "恢复剪贴板记录");
+    assert_eq!(capture_action(false), "暂停剪贴板记录");
+}
+
+#[test]
+fn activity_rejects_stale_reply_and_new_view_clears_even_completed_status() {
+    use quick_panel::activity_status::{Capability, QueryActivity};
+    for (query, scope, profile, active) in [
+        ("新查询", Scope::All, "p", true),
+        ("查找", Scope::Clipboard, "p", true),
+        ("查找", Scope::All, "changed", true),
+        ("查找", Scope::All, "p", false),
+    ] {
+        let mut activity = QueryActivity::default();
+        activity.begin(7, Capability::Semantic, "查找", Scope::All, "p");
+        assert!(!activity.finish(6, Capability::Semantic, false));
+        assert!(activity.finish(7, Capability::Semantic, true));
+        assert!(activity.label().unwrap().contains("语义 · 已完成"));
+        activity.sync(query, scope, profile, active);
+        assert!(activity.label().is_none());
+        assert!(!activity.finish(7, Capability::Semantic, false));
+    }
+}
+
+#[test]
+fn selected_capability_validates_its_own_character_limit() {
+    use quick_panel::activity_status::Capability;
+    assert!(Capability::Claude.validate(&"字".repeat(2048)).is_ok());
+    assert!(
+        Capability::Claude
+            .validate(&"字".repeat(2049))
+            .unwrap_err()
+            .contains("Claude")
+    );
+    assert!(Capability::Semantic.validate(&"字".repeat(4096)).is_ok());
+    assert!(
+        Capability::Semantic
+            .validate(&"字".repeat(4097))
+            .unwrap_err()
+            .contains("4096")
+    );
+}

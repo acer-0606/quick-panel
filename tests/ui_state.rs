@@ -330,3 +330,14 @@ fn automatic_identity_refresh_preserves_menu_and_action_then_removal_revokes_bot
     assert!(!state.action_current(12));
     assert!(!state.menu_target_current(&menu));
 }
+
+#[test]
+fn collapsed_preview_rejects_a_matching_decode_while_panel_is_visible() {
+    let mut state = UiState::default();
+    state.visible = true;
+    assert!(state.preview_current(true, 7, 7));
+    assert!(!state.preview_current(false, 7, 7));
+    assert!(!state.preview_current(true, 6, 7));
+    state.hide();
+    assert!(!state.preview_current(true, 7, 7));
+}

@@ -11,6 +11,12 @@ pub struct SmartView {
     pub ai_enabled: bool,
     pub embedding_enabled: bool,
 }
+impl SmartView {
+    /// Explicit Claude requests never scan or wait for unrelated embeddings.
+    pub fn needs_index_status(&self) -> bool {
+        self.preferred != SmartSearchMode::Claude && self.embedding_enabled
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmartAction {
     Semantic,
@@ -124,7 +130,7 @@ impl SmartPreflight {
             self.cancel();
             return None;
         }
-        if view.embedding_enabled && status.is_none_or(|s| s.profile != view.profile) {
+        if view.needs_index_status() && status.is_none_or(|s| s.profile != view.profile) {
             return None;
         }
         self.cancel();

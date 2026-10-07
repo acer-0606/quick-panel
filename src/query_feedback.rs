@@ -68,6 +68,6 @@ pub fn index_reply(
     {
         return IndexReply::Store(Box::new(command));
     }
-    session.cancel();
+    session.fail();
     IndexReply::LocalFallback
 }
