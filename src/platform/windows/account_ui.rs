@@ -340,7 +340,7 @@ impl Runtime {
         if self.flow.vault.state() == SaveState::Ready
             && let Err(message) = self.flow.vault.dispatch_save(&mut send)
         {
-            self.notice = message;
+            self.notice = format!("{message}。{}", failed_save_guidance());
             self.shutdown_failed = self.flow.exiting;
             self.changed();
         }
