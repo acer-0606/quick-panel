@@ -267,7 +267,6 @@ fn inspection(
     password_bounds: Option<super::account_target::PasswordBounds>,
 ) -> Inspection {
     let passwords: Vec<_> = snapshot.fields.iter().filter(|f| f.is_password).collect();
-    let usernames: Vec<_> = snapshot.fields.iter().filter(|f| !f.is_password).collect();
     let eligible = |f: &&LiveField| {
         f.visible
             && f.enabled
@@ -283,11 +282,8 @@ fn inspection(
         .then(|| passwords[0])
         .filter(|f| eligible(f))
         .map(|f| f.field_id);
-    let suggested_username = (usernames.len() == 1)
-        .then(|| usernames[0])
-        .filter(|f| eligible(f))
-        .map(|f| f.field_id);
-    let teaching_required = suggested_password.is_none() || usernames.len() > 1;
+    let suggested_username = crate::account_fill::suggested_username(&snapshot);
+    let teaching_required = suggested_password.is_none() || suggested_username.is_none();
     Inspection {
         password_bounds,
         manual_only: manual_only

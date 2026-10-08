@@ -272,3 +272,150 @@ impl HintChecks {
         permit.current().then_some(permit)
     }
 }
+
+/// Reconcile native list selection and account authorization together.
+pub fn reconcile_selection(selected: &mut Option<String>, visible: &[String]) -> bool {
+    if selected.as_ref().is_some_and(|id| !visible.contains(id)) {
+        *selected = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UsernameChoice {
+    #[default]
+    Unresolved,
+    Selected(u64),
+    Skipped,
+}
+impl UsernameChoice {
+    pub fn suggested(field: Option<u64>) -> Self {
+        field.map(Self::Selected).unwrap_or(Self::Unresolved)
+    }
+    pub fn resolve(self, account_has_username: bool) -> Result<Option<u64>, &'static str> {
+        if !account_has_username {
+            return Ok(None);
+        }
+        match self {
+            Self::Selected(id) => Ok(Some(id)),
+            Self::Skipped => Ok(None),
+            Self::Unresolved => {
+                Err("用户名框尚未确定：请指定用户名框，或明确选择“跳过用户名，只填密码”")
+            }
+        }
+    }
+}
+
+/// Presentation consumed by the dedicated vault's scrollable status control.
+pub fn target_presentation(
+    scene: &crate::account_fill::SceneSnapshot,
+    binding: Option<&crate::account_fill::Binding>,
+    selected: Option<&crate::account_fill::FieldSelector>,
+) -> String {
+    use crate::account_fill::{SceneOrigin, SceneScope};
+    let app = scene
+        .app
+        .canonical_path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("目标应用");
+    let selector =
+        selected.or_else(|| binding.and_then(|b| b.target.as_ref().map(|t| &t.selector)));
+    let observed = selector.and_then(|selector| {
+        let mut targets = scene
+            .targets
+            .iter()
+            .filter(|t| selector.matches(&t.selector));
+        let first = targets.next()?;
+        targets.next().is_none().then_some(first)
+    });
+    let verified = scene.complete
+        && scene.origin == SceneOrigin::NativeDesktop
+        && scene.scope == SceneScope::Window
+        && binding.is_some_and(|b| {
+            b.app == scene.app
+                && b.scene_key == scene.scene_key
+                && b.target
+                    .as_ref()
+                    .is_some_and(|t| observed.is_some_and(|o| o.value.trim() == t.expected.trim()))
+        });
+    let context = if let Some(target) = observed {
+        // UIA already bounds target input; cap presentation too, preserving Unicode boundaries.
+        let value: String = target
+            .value
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(crate::account_fill::MAX_TARGET_BYTES)
+            .collect();
+        format!(
+            "{}：{}",
+            if verified {
+                "已核验保存目标"
+            } else {
+                "当前选定目标（未保存或未核验，请确认）"
+            },
+            value
+        )
+    } else {
+        "当前连接未核验；请确认页面，或指定服务器 / 连接名".into()
+    };
+    format!("将填入：{app}\r\n{context}")
+}
+
+/// Selection generation also binds queued inspections and accepted-save continuations.
+#[derive(Default)]
+pub struct AccountSelection {
+    pub current: Option<String>,
+    version: u64,
+}
+impl AccountSelection {
+    pub fn set(&mut self, id: Option<String>) -> bool {
+        if self.current == id {
+            return false;
+        }
+        self.current = id;
+        self.version = self.version.wrapping_add(1);
+        true
+    }
+    pub fn reconcile(&mut self, visible: &[String]) -> bool {
+        if reconcile_selection(&mut self.current, visible) {
+            self.version = self.version.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+    pub fn token(&self) -> Option<(String, u64)> {
+        self.current.clone().map(|id| (id, self.version))
+    }
+    pub fn permits(&self, token: &(String, u64)) -> bool {
+        self.current.as_ref() == Some(&token.0) && self.version == token.1
+    }
+}
+
+pub fn failed_save_guidance() -> &'static str {
+    "保存失败；请从“账号与位置…”重试原保存，或明确放弃失败修改并重新解锁后再填入"
+}
+/// Final native fill boundary shared by manual, saved continuations and hints.
+pub fn fill_gate(
+    enabled: bool,
+    vault: &VaultController,
+    pending: bool,
+) -> Result<(), &'static str> {
+    use crate::account_vault_jobs::SaveState;
+    if matches!(
+        vault.state(),
+        SaveState::FailedWrite | SaveState::FailedPreparation
+    ) {
+        return Err(failed_save_guidance());
+    }
+    if !enabled || !vault.session().is_unlocked() {
+        Err("保险箱已锁定或填充已停用")
+    } else if pending || vault.busy() || !vault.can_shutdown() {
+        Err("请等待当前识别或保险箱保存完成")
+    } else {
+        Ok(())
+    }
+}

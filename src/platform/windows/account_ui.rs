@@ -10,7 +10,9 @@ use super::{
 use crate::{
     account_fill::*,
     account_fill_execution::*,
-    account_fill_ui::{AccountFlow, HintPermit},
+    account_fill_ui::{
+        AccountFlow, AccountSelection, HintPermit, UsernameChoice, failed_save_guidance, fill_gate,
+    },
     account_vault::{AccountDraft, Secret, VaultDocument},
     account_vault_jobs::{SaveState, VaultNotice},
     model::{Command, Event, Theme},
@@ -50,6 +52,7 @@ struct AfterSave {
     inspection: u64,
     generation: u64,
     epoch: u64,
+    selection: (String, u64),
 }
 pub struct Runtime {
     pub flow: AccountFlow,
@@ -72,10 +75,11 @@ pub struct Runtime {
     pending: Option<u64>,
     queued_inspect: Option<Purpose>,
     last_fill: Option<(u64, u64)>,
-    selected: Option<String>,
+    selection: AccountSelection,
+    filter: String,
     binding: Option<Binding>,
     password: Option<u64>,
-    username: Option<u64>,
+    username: UsernameChoice,
     target_selector: Option<FieldSelector>,
     picker: Option<Picker>,
     transfer: bool,
@@ -110,10 +114,11 @@ impl Runtime {
             pending: None,
             queued_inspect: None,
             last_fill: None,
-            selected: None,
+            selection: AccountSelection::default(),
+            filter: String::new(),
             binding: None,
             password: None,
-            username: None,
+            username: UsernameChoice::Unresolved,
             target_selector: None,
             picker: None,
             transfer: false,
@@ -173,7 +178,7 @@ impl Runtime {
         self.pending = None;
         self.queued_inspect = None;
         self.password = None;
-        self.username = None;
+        self.username = UsernameChoice::Unresolved;
         self.target_selector = None;
         self.binding = None;
         self.after_save = None;
@@ -183,14 +188,16 @@ impl Runtime {
         self.changed();
     }
     pub fn dismiss(&mut self) {
+        self.filter.clear();
         self.hint.request_check();
         self.revoke();
         self.flow.dismiss();
-        self.selected = None;
+        self.selection.set(None);
         self.open = false;
         self.changed();
     }
     pub fn lock(&mut self) {
+        self.filter.clear();
         self.flow.lock();
         unsafe {
             if !self.view.is_invalid() {
@@ -203,7 +210,7 @@ impl Runtime {
             }
         }
         self.revoke();
-        self.selected = None;
+        self.selection.set(None);
         self.hint.stop();
         self.notice = "保险箱已锁定".into();
         self.changed();
@@ -282,6 +289,9 @@ impl Runtime {
                 self.last_active = Instant::now();
                 self.notice = "已保存".into();
                 if let Some(continuation) = self.after_save.take()
+                    && self.selection.permits(&continuation.selection)
+                    && self.selected_account().as_deref()
+                        == Some(continuation.binding.account_id.as_str())
                     && self.flow.vault.session().is_unlocked()
                     && self.flow.vault.session().epoch() == continuation.epoch
                     && self
@@ -298,13 +308,17 @@ impl Runtime {
                         UserFillAction::SelectedAccount,
                         None,
                     );
-                } else if self.fill_mode && self.open && self.inspection.is_none() {
+                } else if self.fill_mode
+                    && self.open
+                    && self.selected_account().is_some()
+                    && self.inspection.is_none()
+                {
                     self.start_inspect(Purpose::Manual);
                 }
             }
             VaultNotice::Failed(message) => {
                 self.operation_error = Some(message.clone());
-                self.notice = message;
+                self.notice = format!("{message}。{}", failed_save_guidance());
                 self.shutdown_failed = self.flow.exiting;
             }
             VaultNotice::Prepared | VaultNotice::Stale => (),
@@ -353,8 +367,9 @@ impl Runtime {
                     self.revoke();
                     if outcome.error.is_none() && outcome.password_written {
                         self.open = false;
+                        self.filter.clear();
                         self.flow.target = None;
-                        self.selected = None;
+                        self.selection.set(None);
                     } else {
                         self.transfer = false;
                     }
@@ -377,7 +392,7 @@ impl Runtime {
                     self.inspection = None;
                     self.binding = None;
                     self.password = None;
-                    self.username = None;
+                    self.username = UsernameChoice::Unresolved;
                     self.notice = error.message().into();
                     self.transfer = false;
                 }
@@ -438,7 +453,12 @@ impl Runtime {
         let observing = self
             .settings
             .observe_enabled(self.flow.vault.session().is_unlocked())
-            && !self.flow.exiting;
+            && !self.flow.exiting
+            && fill_gate(self.settings.enabled, &self.flow.vault, false).is_ok();
+        if !observing {
+            self.hint.hide();
+            self.hint_binding = None;
+        }
         let watching = self.settings.enabled
             && self.flow.vault.session().is_unlocked()
             && !self.flow.exiting
@@ -493,6 +513,11 @@ impl Runtime {
         true
     }
     fn start_inspect(&mut self, purpose: Purpose) {
+        if let Purpose::Saved(binding) = &purpose
+            && self.selected_account().as_deref() != Some(binding.account_id.as_str())
+        {
+            return;
+        }
         if purpose
             .hint_version()
             .is_some_and(|v| !self.hint.current(v))
@@ -534,7 +559,7 @@ impl Runtime {
                 self.inspection = None;
                 self.teaching_context = None;
                 self.password = None;
-                self.username = None;
+                self.username = UsernameChoice::Unresolved;
                 self.binding = None;
                 self.pending = Some(id);
                 self.purpose = purpose;
@@ -574,12 +599,18 @@ impl Runtime {
             match role {
                 PickRole::Password => {
                     self.password = Some(field);
-                    self.username = inspection.suggested_username;
+                    self.username = UsernameChoice::suggested(inspection.suggested_username);
                     self.target_selector = None;
                     self.binding = None;
                 }
-                PickRole::Username => self.username = Some(field),
+                PickRole::Username => {
+                    self.username = UsernameChoice::Selected(field);
+                    self.binding = None;
+                    self.after_save = None;
+                }
                 PickRole::Target => {
+                    self.username = UsernameChoice::suggested(inspection.suggested_username);
+                    self.binding = None;
                     self.target_selector = inspection
                         .snapshot
                         .targets
@@ -589,7 +620,7 @@ impl Runtime {
             }
         } else {
             self.password = inspection.suggested_password;
-            self.username = inspection.suggested_username;
+            self.username = UsernameChoice::suggested(inspection.suggested_username);
             self.target_selector = None;
         }
         self.notice = crate::account_fill_ui::scene_message(&inspection.snapshot).into();
@@ -597,21 +628,46 @@ impl Runtime {
         self.inspection = Some((id, generation, inspection.clone()));
         self.transfer = false;
         if picked.is_some() {
+            self.username_guidance();
             return;
         }
         match self.purpose.clone() {
-            Purpose::Manual => {}
+            Purpose::Manual => {
+                if let Some(account) = self.selected_account()
+                    && let Ok(document) = self.flow.vault.session().document()
+                {
+                    let candidates: Vec<_> = document
+                        .bindings
+                        .iter()
+                        .filter(|b| {
+                            b.account_id == account
+                                && b.app == inspection.snapshot.app
+                                && b.scene_key == inspection.snapshot.scene_key
+                        })
+                        .collect();
+                    if let [binding] = candidates.as_slice() {
+                        self.start_inspect(Purpose::Saved(Box::new((*binding).clone())));
+                        return;
+                    }
+                }
+            }
             Purpose::Saved(binding) => match match_binding(&binding, &inspection.snapshot) {
                 MatchDecision::Exact(fields) => {
                     self.password = Some(fields.password_id);
-                    self.username = fields.username_id;
+                    self.username = fields
+                        .username_id
+                        .map(UsernameChoice::Selected)
+                        .unwrap_or(UsernameChoice::Skipped);
                     self.notice = "已核验应用与目标".into();
                     self.target_selector = binding.target.as_ref().map(|t| t.selector.clone());
                     self.binding = Some(*binding);
                 }
                 MatchDecision::ApplicationOnly(fields) => {
                     self.password = Some(fields.password_id);
-                    self.username = fields.username_id;
+                    self.username = fields
+                        .username_id
+                        .map(UsernameChoice::Selected)
+                        .unwrap_or(UsernameChoice::Skipped);
                     self.notice = "仅按应用推荐，请确认当前连接".into();
                     self.target_selector = binding.target.as_ref().map(|t| t.selector.clone());
                     self.binding = Some(*binding);
@@ -646,12 +702,20 @@ impl Runtime {
                     && self
                         .settings
                         .observe_enabled(self.flow.vault.session().is_unlocked())
+                    && fill_gate(self.settings.enabled, &self.flow.vault, false).is_ok()
                     && account_target::foreground_matches(inspection.snapshot.window)
                     && self.hint.show(bounds, self.appearance, version)
                 {
                     self.hint_binding = Some(binding.clone());
                 }
             }
+        }
+        self.username_guidance();
+    }
+    fn username_guidance(&mut self) {
+        if self.username == UsernameChoice::Unresolved && self.account_has_username() == Ok(true) {
+            self.notice
+                .push_str("；用户名框尚未确定，请指定用户名框，或选择“跳过用户名，只填密码”");
         }
     }
     pub fn take_attention(&mut self) -> Option<String> {
@@ -704,7 +768,7 @@ impl Runtime {
                     )
             })
         {
-            self.selected = Some(binding.account_id.clone());
+            self.selection.set(Some(binding.account_id.clone()));
             self.do_fill(
                 FillChoice::Saved(binding),
                 UserFillAction::ConfirmedHint,
@@ -712,30 +776,89 @@ impl Runtime {
             );
         }
     }
+    fn visible_accounts(&self) -> Vec<crate::account_vault::AccountSummary> {
+        self.flow
+            .vault
+            .session()
+            .summaries()
+            .into_iter()
+            .filter(|a| {
+                a.name.to_lowercase().contains(&self.filter)
+                    || a.username.to_lowercase().contains(&self.filter)
+            })
+            .collect()
+    }
+    fn selected_account(&self) -> Option<String> {
+        let id = self.selection.current.as_ref()?;
+        self.visible_accounts()
+            .iter()
+            .any(|a| &a.id == id)
+            .then(|| id.clone())
+    }
+    fn filter_accounts(&mut self, query: &str) {
+        self.filter = query.to_lowercase();
+        let visible: Vec<_> = self
+            .visible_accounts()
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        if self.selection.reconcile(&visible) {
+            // Accepted vault save belongs to the controller; revoke only its fill continuation.
+            self.revoke();
+            self.notice = "所选账号已不在列表中；请选择账号".into();
+        }
+    }
+    fn clear_selection(&mut self) {
+        self.selection.set(None);
+        self.revoke();
+        self.notice = "请选择账号".into();
+    }
     fn select(&mut self, id: String) {
+        if !self.visible_accounts().iter().any(|a| a.id == id) {
+            return;
+        }
+        if self.selection.current.as_ref() == Some(&id) {
+            return;
+        }
         self.last_active = Instant::now();
-        self.selected = Some(id.clone());
-        self.binding = None;
-        if let Some((_, _, inspection)) = &self.inspection
-            && let Ok(document) = self.flow.vault.session().document()
-        {
-            let candidates: Vec<_> = document
-                .bindings
-                .iter()
-                .filter(|b| {
-                    b.account_id == id
-                        && b.app == inspection.snapshot.app
-                        && b.scene_key == inspection.snapshot.scene_key
-                })
-                .cloned()
-                .collect();
-            if let [binding] = candidates.as_slice() {
-                self.start_inspect(Purpose::Saved(Box::new(binding.clone())));
-            } else {
-                self.notice = crate::account_fill_ui::scene_message(&inspection.snapshot).into();
-            }
+        let purpose = self
+            .inspection
+            .as_ref()
+            .and_then(|(_, _, inspection)| {
+                let document = self.flow.vault.session().document().ok()?;
+                let candidates: Vec<_> = document
+                    .bindings
+                    .iter()
+                    .filter(|b| {
+                        b.account_id == id
+                            && b.app == inspection.snapshot.app
+                            && b.scene_key == inspection.snapshot.scene_key
+                    })
+                    .collect();
+                if let [binding] = candidates.as_slice() {
+                    Some(Purpose::Saved(Box::new((*binding).clone())))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(Purpose::Manual);
+        self.revoke();
+        self.selection.set(Some(id));
+        if self.fill_mode {
+            self.start_inspect(purpose);
         }
         self.changed();
+    }
+    fn account_has_username(&self) -> Result<bool, String> {
+        let id = self.selected_account().ok_or("请选择当前列表中的账号")?;
+        let document = self.flow.vault.session().document()?;
+        Ok(!document
+            .accounts
+            .iter()
+            .find(|a| a.id == id)
+            .ok_or("账号已删除")?
+            .username
+            .is_empty())
     }
     fn teaching(&self) -> Result<TeachingSession, String> {
         let (_, _, inspection) = self.inspection.as_ref().ok_or("请先指定密码框")?;
@@ -745,7 +868,11 @@ impl Runtime {
             .select_password(self.password.ok_or("请先指定密码框")?)
             .map_err(|_| "密码框不唯一，请重新指定")?;
         teaching
-            .select_username(self.username)
+            .select_username(
+                self.username
+                    .resolve(self.account_has_username()?)
+                    .map_err(str::to_owned)?,
+            )
             .map_err(|_| "用户名框已改变，请重新指定")?;
         teaching
             .select_target(self.target_selector.as_ref())
@@ -754,14 +881,13 @@ impl Runtime {
     }
     fn fill(&mut self, remember: bool) {
         let result = (|| -> Result<(), String> {
-            if !self.settings.enabled
-                || !self.flow.vault.session().is_unlocked()
-                || self.pending.is_some()
-                || !self.flow.vault.can_shutdown()
-            {
-                return Err("请先启用、解锁并等待当前操作完成".into());
-            }
-            let account = self.selected.clone().ok_or("请选择账号")?;
+            fill_gate(
+                self.settings.enabled,
+                &self.flow.vault,
+                self.pending.is_some(),
+            )
+            .map_err(str::to_owned)?;
+            let account = self.selected_account().ok_or("请选择当前列表中的账号")?;
             let id = self
                 .binding
                 .as_ref()
@@ -797,6 +923,7 @@ impl Runtime {
                     inspection: *inspection,
                     generation: *generation,
                     epoch: self.flow.vault.session().epoch(),
+                    selection: self.selection.token().ok_or("请选择账号")?,
                 });
                 self.notice = "正在保存关联；保存成功后填入仍有效的目标…".into();
             } else {
@@ -820,15 +947,18 @@ impl Runtime {
     }
     fn do_fill(&mut self, choice: FillChoice, action: UserFillAction, permit: Option<HintPermit>) {
         let result = (|| -> Result<(), String> {
-            if !self.settings.enabled || !self.flow.vault.session().is_unlocked() {
-                return Err("保险箱已锁定或填充已停用".into());
+            fill_gate(
+                self.settings.enabled,
+                &self.flow.vault,
+                self.pending.is_some(),
+            )
+            .map_err(str::to_owned)?;
+            let account = self.selected_account().ok_or("请选择当前列表中的账号")?;
+            if choice.binding().account_id != account {
+                return Err("账号选择已改变，请重新确认".into());
             }
             let (id, _, inspection) = self.inspection.as_ref().ok_or("目标已失效")?;
-            let (username, password) = self
-                .flow
-                .vault
-                .session()
-                .credentials(self.selected.as_deref().ok_or("请选择账号")?)?;
+            let (username, password) = self.flow.vault.session().credentials(&account)?;
             self.hint.hide();
             self.transfer = true;
             if action != UserFillAction::ConfirmedHint {
@@ -965,20 +1095,10 @@ impl Runtime {
     }
     fn title(&self) -> String {
         if let Some((_, _, i)) = &self.inspection {
-            let app = i
-                .snapshot
-                .app
-                .canonical_path
-                .rsplit(['\\', '/'])
-                .next()
-                .unwrap_or("目标应用");
-            format!(
-                "将填入：{app} / {}",
-                if self.binding.as_ref().is_some_and(|b| b.target.is_some()) {
-                    "已核验目标"
-                } else {
-                    "请确认当前页面"
-                }
+            crate::account_fill_ui::target_presentation(
+                &i.snapshot,
+                self.binding.as_ref(),
+                self.target_selector.as_ref(),
             )
         } else if self.flow.target.is_some() {
             "将填入：已捕获的应用 / 正在确认目标".into()
@@ -1008,6 +1128,11 @@ fn operation(
     let mut r = runtime.borrow_mut();
     r.last_active = Instant::now();
     r.operation_error = None;
+    if let EditKind::Account(Some(id)) = kind
+        && r.selected_account().as_ref() != Some(id)
+    {
+        return Err("账号选择已改变，请重新选择后编辑".into());
+    }
     if r.flow.exiting {
         return Err("正在退出，未接收新修改".into());
     }
@@ -1074,9 +1199,14 @@ fn operation(
 }
 unsafe fn edit(runtime: &Rc<RefCell<Runtime>>, owner: HWND, kind: EditKind) {
     unsafe {
-        let (appearance, epoch, completed) = {
+        let (appearance, epoch, completed, selection) = {
             let r = runtime.borrow();
-            (r.appearance, r.flow.vault.session().epoch(), r.completed)
+            (
+                r.appearance,
+                r.flow.vault.session().epoch(),
+                r.completed,
+                r.selection.token(),
+            )
         };
         let mut fields: Vec<(&str, String, bool)> = match &kind {
             EditKind::Unlock => vec![("主密码", String::new(), true)],
@@ -1116,6 +1246,13 @@ unsafe fn edit(runtime: &Rc<RefCell<Runtime>>, owner: HWND, kind: EditKind) {
         };
         let mut submitted = false;
         dialogs::account_form(owner, title, &fields, appearance, |signal| {
+            if matches!(kind, EditKind::Account(Some(_)))
+                && selection
+                    .as_ref()
+                    .is_none_or(|token| !runtime.borrow().selection.permits(token))
+            {
+                return AccountFormProgress::Cancelled;
+            }
             if runtime.borrow().flow.vault.session().epoch() != epoch {
                 return AccountFormProgress::Cancelled;
             }
@@ -1432,6 +1569,7 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
             if changed {
                 state.borrow_mut().changed = false;
                 let query = text(search).to_lowercase();
+                runtime.borrow_mut().filter_accounts(&query);
                 let (
                     title,
                     notice,
@@ -1445,30 +1583,21 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                     rev,
                 ) = {
                     let r = runtime.borrow();
-                    let rows = r
-                        .flow
-                        .vault
-                        .session()
-                        .summaries()
-                        .into_iter()
-                        .filter(|a| {
-                            a.name.to_lowercase().contains(&query)
-                                || a.username.to_lowercase().contains(&query)
-                        })
-                        .collect::<Vec<_>>();
+                    let rows = r.visible_accounts();
                     (
-                        r.title(),
+                        String::from("账号保险箱：请选择账号并核对下方目标"),
                         format!(
-                            "{}{}",
+                            "{}{}\r\n{}",
                             if !r.settings.enabled {
                                 "账号填充已停用；可管理保险箱。\r\n"
                             } else {
                                 ""
                             },
+                            r.title(),
                             r.notice
                         ),
                         rows,
-                        r.selected.clone(),
+                        r.selected_account(),
                         r.flow.vault.session().is_unlocked(),
                         r.settings.enabled,
                         r.pending.is_some() || !r.flow.vault.can_shutdown() || r.flow.vault.busy(),
@@ -1499,10 +1628,13 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                 }
                 let _ = EnableWindow(search, unlocked);
                 let _ = EnableWindow(list, unlocked && !busy);
-                let _ = EnableWindow(once, fill_mode && enabled && unlocked && !busy);
+                let _ = EnableWindow(
+                    once,
+                    fill_mode && enabled && unlocked && !busy && selected.is_some(),
+                );
                 let _ = EnableWindow(
                     remember,
-                    fill_mode && enabled && unlocked && !busy && can_remember,
+                    fill_mode && enabled && unlocked && !busy && selected.is_some() && can_remember,
                 );
                 let _ = EnableWindow(unlock, !unlocked && !busy);
                 let _ = EnableWindow(
@@ -1596,7 +1728,8 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                             r.flow.vault.session().is_unlocked()
                                 && r.flow.vault.can_shutdown()
                                 && r.pending.is_none()
-                                && (!matches!(id, 21 | 22 | 23 | 29) || r.selected.is_some())
+                                && (!matches!(id, 21 | 22 | 23 | 29)
+                                    || r.selected_account().is_some())
                                 && (!(25..=28).contains(&id) || (r.settings.enabled && fill_mode))
                         };
                         let flags = if allowed {
@@ -1623,23 +1756,45 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                     match choice {
                         20 => edit(&runtime, hwnd, EditKind::Account(None)),
                         21 => {
-                            let id = runtime.borrow().selected.clone();
+                            let id = runtime.borrow().selected_account();
                             if let Some(id) = id {
                                 edit(&runtime, hwnd, EditKind::Account(Some(id)));
                             }
                         }
                         22 | 23 => {
-                            let selected_id = runtime.borrow().selected.clone();
+                            let selected_id = runtime.borrow().selected_account();
                             if let Some(id) = selected_id {
+                                let token = runtime.borrow().selection.token();
+                                let name = runtime
+                                    .borrow()
+                                    .visible_accounts()
+                                    .iter()
+                                    .find(|a| a.id == id)
+                                    .map(|a| a.name.clone())
+                                    .unwrap_or_default();
+                                let prompt = format!(
+                                    "确认{}“{}”？保存成功后生效。",
+                                    if choice == 22 {
+                                        "删除账号及其全部关联："
+                                    } else {
+                                        "仅移除账号的全部关联，保留账号："
+                                    },
+                                    name
+                                );
                                 let answer = MessageBoxW(
                                     Some(hwnd),
-                                    w!("确认对当前选中的账号执行此删除操作？保存成功后生效。"),
+                                    PCWSTR(wide(&prompt).as_ptr()),
                                     w!("确认删除"),
                                     MB_YESNO | MB_ICONWARNING,
                                 );
                                 if answer == IDYES {
                                     let mut r = runtime.borrow_mut();
                                     let result = (|| -> Result<(), String> {
+                                        if token.as_ref().is_none_or(|t| !r.selection.permits(t))
+                                            || r.selected_account().as_ref() != Some(&id)
+                                        {
+                                            return Err("账号选择已改变，已取消删除".into());
+                                        }
                                         let mut document =
                                             r.flow.vault.session().document()?.clone();
                                         if choice == 22 {
@@ -1656,7 +1811,9 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                                             }
                                         }
                                         let request = r.flow.next_id();
-                                        r.flow.vault.accept_save(request, document)
+                                        r.flow.vault.accept_save(request, document)?;
+                                        r.clear_selection();
+                                        Ok(())
                                     })();
                                     r.notice =
                                         result.err().unwrap_or_else(|| "正在保存删除…".into());
@@ -1670,16 +1827,15 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                         27 => runtime.borrow_mut().pick(PickRole::Target),
                         28 => {
                             let mut r = runtime.borrow_mut();
-                            r.username = None;
+                            r.username = UsernameChoice::Skipped;
+                            r.after_save = None;
                             r.binding = None;
                             r.notice = "仅填写密码；用户名保持原样".into();
                             r.changed();
                         }
                         29 => {
                             let mut r = runtime.borrow_mut();
-                            r.selected = None;
-                            r.binding = None;
-                            r.changed();
+                            r.clear_selection();
                         }
                         30 => runtime.borrow_mut().retry(),
                         31 if MessageBoxW(
@@ -1831,6 +1987,33 @@ mod tests {
                 }
             }
         }
+        unsafe fn deep(depth: usize) -> Self {
+            unsafe {
+                let fixture = Self::new(0);
+                let mut parent = fixture.root;
+                for i in 0..depth {
+                    parent = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("STATIC"),
+                        w!("synthetic-parent"),
+                        WS_CHILD | WS_VISIBLE,
+                        0,
+                        0,
+                        420,
+                        180,
+                        Some(parent),
+                        Some(HMENU((300 + i) as *mut _)),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                }
+                SetParent(fixture.password, Some(parent)).unwrap();
+                let _ = SetForegroundWindow(fixture.root);
+                let _ = SetFocus(Some(fixture.password));
+                fixture
+            }
+        }
         fn identity(&self) -> WindowIdentity {
             account_target::window_identity(self.root.0 as u64).unwrap()
         }
@@ -1915,7 +2098,7 @@ mod tests {
             .accept_create(create_id, master.clone(), master, document)
             .unwrap();
         pump_runtime(&mut runtime);
-        runtime.selected = Some("account".into());
+        runtime.selection.set(Some("account".into()));
         runtime
     }
     #[test]
@@ -2056,7 +2239,7 @@ mod tests {
             assert_eq!(document.bindings[0].binding_id, "stable-id");
             runtime.open = true;
             runtime.flow.target = Some(fixture.identity());
-            runtime.selected = Some("account".into());
+            runtime.selection.set(Some("account".into()));
             runtime.start_inspect(Purpose::Manual);
             pump_runtime(&mut runtime);
             let request = runtime.flow.next_id();
@@ -2088,6 +2271,14 @@ mod tests {
             assert!(runtime.pending.is_none());
             assert!(runtime.after_save.is_none());
             assert!(!runtime.flow.vault.can_shutdown());
+            assert!(runtime.notice.contains("重试原保存") && runtime.notice.contains("重新解锁"));
+            runtime.do_fill(
+                FillChoice::Saved(binding),
+                UserFillAction::ConfirmedHint,
+                None,
+            );
+            assert!(runtime.pending.is_none());
+            assert!(runtime.notice.contains("重试原保存") && runtime.notice.contains("重新解锁"));
         }
     }
     #[test]
@@ -2217,5 +2408,199 @@ mod tests {
         assert_eq!(runtime.notice, "新目标正在识别");
         assert_eq!(runtime.flow.target, Some(target));
         assert!(!runtime.flow.vault.session().is_unlocked());
+    }
+    #[test]
+    fn runtime_filter_revokes_fill_and_preserves_an_accepted_binding_save() {
+        unsafe {
+            let fixture = Synthetic::new(0);
+            let mut runtime = unlocked_runtime(&fixture);
+            runtime.fill_mode = true;
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            runtime.filter_accounts("synthetic");
+            assert_eq!(runtime.selected_account().as_deref(), Some("account"));
+            runtime.fill(true);
+            assert!(runtime.after_save.is_some());
+            assert!(runtime.flow.vault.pending_document().is_some());
+            runtime.queued_inspect = Some(Purpose::Saved(Box::new(
+                runtime.after_save.as_ref().unwrap().binding.clone(),
+            )));
+            runtime.filter_accounts("no-visible-account");
+            assert!(runtime.selected_account().is_none());
+            assert!(runtime.selection.current.is_none());
+            assert!(runtime.after_save.is_none());
+            assert!(runtime.queued_inspect.is_none());
+            assert!(runtime.flow.vault.pending_document().is_some());
+            pump_runtime(&mut runtime);
+            assert_eq!(
+                runtime
+                    .flow
+                    .vault
+                    .session()
+                    .document()
+                    .unwrap()
+                    .bindings
+                    .len(),
+                1
+            );
+            assert!(runtime.pending.is_none() && runtime.inspection.is_none());
+            assert!(runtime.last_fill.is_none());
+            let mut value = [0u16; 64];
+            assert_eq!(GetWindowTextW(fixture.password, &mut value), 0);
+            runtime.filter_accounts("");
+            assert!(runtime.selected_account().is_none());
+            runtime.fill(false);
+            assert!(runtime.notice.contains("请选择"));
+            assert!(
+                operation(
+                    &Rc::new(RefCell::new(runtime)),
+                    &EditKind::Account(Some("account".into())),
+                    &["synthetic".into(), String::new(), String::new()]
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn runtime_deep_actual_hierarchy_can_teach_complete_local_once_scope() {
+        unsafe {
+            let fixture = Synthetic::deep(12);
+            let mut runtime = unlocked_runtime(&fixture);
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            assert!(runtime.inspection.is_none());
+            assert!(runtime.teaching_context.is_some());
+            runtime.picked(fixture.point());
+            pump_runtime(&mut runtime);
+            let scene = &runtime.inspection.as_ref().unwrap().2.snapshot;
+            assert!(scene.complete);
+            assert_eq!(scene.scope, SceneScope::SelectedContext);
+            assert!(scene.max_depth <= MAX_SCENE_DEPTH && scene.node_count <= MAX_SCENE_NODES);
+            assert_eq!(
+                runtime
+                    .teaching()
+                    .unwrap()
+                    .finish("b".into(), "account".into()),
+                Err(PolicyError::OneTimeOnly)
+            );
+            let once = runtime
+                .teaching()
+                .unwrap()
+                .finish_once("once".into(), "account".into())
+                .unwrap()
+                .into_binding();
+            assert!(matches!(
+                match_binding(&once, scene),
+                MatchDecision::ApplicationOnly(_)
+            ));
+            assert!(crate::account_fill_ui::hint_candidates(&[once], scene).is_empty());
+            // Fill performs SelectedContext resampling through the same ancestry helper.
+            runtime.fill(false);
+            pump_runtime(&mut runtime);
+            let mut value = [0u16; 64];
+            let count = GetWindowTextW(fixture.password, &mut value);
+            assert_eq!(
+                String::from_utf16_lossy(&value[..count as usize]),
+                "synthetic-password"
+            );
+        }
+    }
+    #[test]
+    fn runtime_username_requires_explicit_choice_and_resets_unrelated_decisions() {
+        unsafe {
+            let fixture = Synthetic::new(0);
+            let mut ordinary = Vec::new();
+            for i in 0..2 {
+                ordinary.push(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("EDIT"),
+                        w!(""),
+                        WS_CHILD | WS_VISIBLE | WS_BORDER,
+                        20,
+                        80 + i * 35,
+                        280,
+                        30,
+                        Some(fixture.root),
+                        Some(HMENU((101 + i) as usize as *mut _)),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+            let mut runtime = unlocked_runtime(&fixture);
+            runtime.fill_mode = true;
+            let mut document = runtime.flow.vault.session().document().unwrap().clone();
+            document.accounts[0].username = "synthetic-user".into();
+            document
+                .upsert_account(AccountDraft {
+                    id: "other".into(),
+                    name: "other".into(),
+                    username: "other-user".into(),
+                    password: Secret::new("other-password".into()),
+                })
+                .unwrap();
+            let request = runtime.flow.next_id();
+            runtime.flow.vault.accept_save(request, document).unwrap();
+            pump_runtime(&mut runtime);
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            assert_eq!(runtime.username, UsernameChoice::Unresolved);
+            assert!(runtime.notice.contains("用户名框尚未确定"));
+            runtime.fill(false);
+            assert!(runtime.notice.contains("跳过用户名"));
+            runtime.fill(true);
+            assert!(runtime.after_save.is_none() && runtime.pending.is_none());
+            runtime.username = UsernameChoice::Skipped;
+            let saved_skip = runtime
+                .teaching()
+                .unwrap()
+                .finish("skip".into(), "account".into())
+                .unwrap();
+            assert!(saved_skip.username.is_none());
+            runtime.start_inspect(Purpose::Manual);
+            pump_runtime(&mut runtime);
+            assert_eq!(runtime.username, UsernameChoice::Unresolved);
+            let mut rect = RECT::default();
+            GetWindowRect(ordinary[0], &mut rect).unwrap();
+            runtime.picked(account_picker::PickPoint {
+                window: fixture.identity(),
+                x: rect.left + 5,
+                y: rect.top + 5,
+                role: PickRole::Username,
+            });
+            pump_runtime(&mut runtime);
+            assert!(matches!(runtime.username, UsernameChoice::Selected(_)));
+            assert!(runtime.teaching().is_ok());
+            runtime.picked(fixture.point());
+            pump_runtime(&mut runtime);
+            assert_eq!(runtime.username, UsernameChoice::Unresolved);
+            runtime.username = UsernameChoice::Skipped;
+            runtime.select("other".into());
+            pump_runtime(&mut runtime);
+            assert_eq!(runtime.username, UsernameChoice::Unresolved);
+            runtime.select("account".into());
+            pump_runtime(&mut runtime);
+            let mut document = runtime.flow.vault.session().document().unwrap().clone();
+            document.upsert_binding(saved_skip.clone()).unwrap();
+            let request = runtime.flow.next_id();
+            runtime.flow.vault.accept_save(request, document).unwrap();
+            pump_runtime(&mut runtime);
+            runtime.start_inspect(Purpose::Saved(Box::new(saved_skip)));
+            pump_runtime(&mut runtime);
+            assert_eq!(runtime.username, UsernameChoice::Skipped);
+            assert!(runtime.teaching().is_ok());
+            runtime.filter_accounts("hidden");
+            runtime.dismiss();
+            assert!(runtime.filter.is_empty());
+            assert!(runtime.selection.current.is_none());
+            // A hidden panel's old search cannot deny an independent hint account.
+            runtime.selection.set(Some("other".into()));
+            assert_eq!(runtime.selected_account().as_deref(), Some("other"));
+            runtime.filter = "hidden".into();
+            runtime.lock();
+            assert!(runtime.filter.is_empty());
+        }
     }
 }

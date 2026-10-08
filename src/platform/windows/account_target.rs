@@ -357,18 +357,7 @@ impl Automation {
             let id = self.identity(deadline, &hit)?;
             // Ancestry, not PID alone, binds points to one of two windows in a process.
             let walker = self.query(deadline, || self.uia.RawViewWalker())?;
-            let mut ancestor = hit.clone();
-            let mut in_target = false;
-            for _ in 0..MAX_SCENE_DEPTH {
-                if self.identity(deadline, &ancestor)? == context.window_root_id {
-                    in_target = true;
-                    break;
-                }
-                ancestor = self.query(deadline, || walker.GetParentElement(&ancestor))?;
-            }
-            if !in_target {
-                return Err(FillError::TargetChanged);
-            }
+            self.validate_window_ancestry(&hit, context, &walker, deadline)?;
             let password = self.query(deadline, || hit.CurrentIsPassword())?.as_bool();
             if (role == super::account_picker::PickRole::Password) != password {
                 return Err(FillError::Unsupported);
@@ -436,6 +425,35 @@ impl Automation {
             Ok((field_id, snapshot))
         }
     }
+    fn validate_window_ancestry(
+        &self,
+        element: &IUIAutomationElement,
+        context: &Context,
+        walker: &IUIAutomationTreeWalker,
+        deadline: Instant,
+    ) -> Result<(), FillError> {
+        validate_ancestry(
+            element.clone(),
+            &context.window_root_id,
+            |ancestor| {
+                if self.query(deadline, || unsafe { ancestor.CurrentProcessId() })? as u32
+                    != context.target.pid
+                {
+                    return Err(FillError::TargetChanged);
+                }
+                self.identity(deadline, ancestor)
+            },
+            |ancestor| self.query(deadline, || unsafe { walker.GetParentElement(ancestor) }),
+            || {
+                if Instant::now() >= deadline {
+                    Err(FillError::BudgetExceeded)
+                } else {
+                    Ok(())
+                }
+            },
+            FillError::TargetChanged,
+        )
+    }
     pub fn sample(
         &self,
         context: &mut Context,
@@ -452,18 +470,7 @@ impl Automation {
             }
             let walker = self.query(deadline, || self.uia.RawViewWalker())?;
             if context.scope == SceneScope::SelectedContext {
-                let mut ancestor = context.root.clone();
-                let mut found = false;
-                for _ in 0..MAX_SCENE_DEPTH {
-                    if self.identity(deadline, &ancestor)? == context.window_root_id {
-                        found = true;
-                        break;
-                    }
-                    ancestor = self.query(deadline, || walker.GetParentElement(&ancestor))?;
-                }
-                if !found {
-                    return Err(FillError::TargetChanged);
-                }
+                self.validate_window_ancestry(&context.root, context, &walker, deadline)?;
             }
             let mut scene = SceneSnapshot {
                 complete: false,

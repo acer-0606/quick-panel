@@ -138,6 +138,8 @@ fn closing_unlocked_panel_preserves_session_but_lock_clears_rows_and_read() {
     let epoch = ui.vault.session().epoch();
     ui.dismiss();
     assert!(ui.vault.session().is_unlocked());
+    assert!(quick_panel::account_fill_ui::fill_gate(true, &ui.vault, false).is_ok());
+    assert!(quick_panel::account_fill_ui::fill_gate(true, &ui.vault, true).is_err());
     assert_eq!(ui.vault.session().epoch(), epoch);
     assert_eq!(ui.access(true), Access::Ready);
     ui.lock();
@@ -161,6 +163,10 @@ fn failed_save_preserves_candidate_and_exit_retry_sends_identical_ciphertext() {
         .unwrap();
     let id = ui.next_id();
     ui.vault.accept_save(id, document).unwrap();
+    assert!(
+        quick_panel::account_fill_ui::fill_gate(true, &ui.vault, false).is_err(),
+        "hint/manual boundary must deny accepted save"
+    );
     let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !matches!(ui.vault.poll(), Some(VaultNotice::Prepared)) {
         assert!(std::time::Instant::now() < end);
@@ -179,6 +185,8 @@ fn failed_save_preserves_candidate_and_exit_retry_sends_identical_ciphertext() {
         request_id: id,
         result: Err("合成磁盘故障".into()),
     });
+    let guidance = quick_panel::account_fill_ui::fill_gate(true, &ui.vault, false).unwrap_err();
+    assert!(guidance.contains("重试原保存") && guidance.contains("重新解锁"));
     assert_eq!(
         ui.vault.pending_document().unwrap().accounts[0].name,
         "合成账号"
@@ -410,4 +418,115 @@ fn queued_old_hint_click_cannot_consume_a_newly_built_offer() {
     assert!(checks.offer(new));
     assert!(checks.consume(old).is_none());
     assert!(checks.consume(new).is_some());
+}
+
+#[test]
+fn hidden_selection_revokes_actions_without_selecting_a_replacement() {
+    use quick_panel::account_fill_ui::reconcile_selection;
+    let mut selected = Some("a".into());
+    assert!(!reconcile_selection(
+        &mut selected,
+        &["a".into(), "b".into()]
+    ));
+    assert_eq!(selected.as_deref(), Some("a"));
+    assert!(reconcile_selection(&mut selected, &["b".into()]));
+    assert!(selected.is_none());
+    assert!(!reconcile_selection(&mut selected, &["b".into()]));
+    assert!(selected.is_none());
+    selected = Some("b".into());
+    assert!(reconcile_selection(&mut selected, &[]));
+    assert!(selected.is_none());
+}
+#[test]
+fn unresolved_username_requires_selection_or_explicit_skip() {
+    use quick_panel::account_fill_ui::UsernameChoice;
+    assert!(UsernameChoice::suggested(None).resolve(true).is_err());
+    assert_eq!(UsernameChoice::Selected(2).resolve(true), Ok(Some(2)));
+    assert_eq!(UsernameChoice::Skipped.resolve(true), Ok(None));
+    assert_eq!(UsernameChoice::Unresolved.resolve(false), Ok(None));
+    assert_eq!(UsernameChoice::Selected(2).resolve(false), Ok(None));
+}
+#[test]
+fn actual_target_is_readable_and_verification_is_truthful() {
+    use quick_panel::{account_fill::*, account_fill_ui::target_presentation};
+    let selector = FieldSelector {
+        automation_id: Some("server".into()),
+        control_type: 50004,
+        class_name: None,
+        anchors: vec![],
+    };
+    let scene = SceneSnapshot {
+        complete: true,
+        scope: SceneScope::Window,
+        app: AppIdentity {
+            canonical_path: "C:\\Db.exe".into(),
+            file_fingerprint: [1; 32],
+        },
+        window: WindowIdentity {
+            handle: 1,
+            pid: 1,
+            process_start: 1,
+        },
+        scene_key: "login".into(),
+        origin: SceneOrigin::NativeDesktop,
+        fields: vec![],
+        targets: vec![LiveTarget {
+            selector: selector.clone(),
+            value: "synthetic-db:5432".into(),
+            depth: 1,
+        }],
+        node_count: 1,
+        max_depth: 1,
+    };
+    let presentation = target_presentation(&scene, None, Some(&selector));
+    assert!(presentation.contains("synthetic-db:5432"));
+    assert!(presentation.contains("未保存"));
+    let binding = Binding {
+        binding_id: "b".into(),
+        account_id: "a".into(),
+        app: scene.app.clone(),
+        scene_key: scene.scene_key.clone(),
+        password: selector.clone(),
+        username: None,
+        target: Some(TargetCondition {
+            selector: selector.clone(),
+            expected: "other-db".into(),
+        }),
+    };
+    let presentation = target_presentation(&scene, Some(&binding), Some(&selector));
+    assert!(!presentation.contains("已核验"));
+    let mut scene = scene;
+    let mut binding = binding;
+    binding.target.as_mut().unwrap().expected = "synthetic-db:5432".into();
+    assert!(
+        target_presentation(&scene, Some(&binding), Some(&selector)).contains("已核验保存目标")
+    );
+    scene.complete = false;
+    assert!(!target_presentation(&scene, Some(&binding), Some(&selector)).contains("已核验"));
+    scene.complete = true;
+    scene.scope = SceneScope::SelectedContext;
+    assert!(!target_presentation(&scene, Some(&binding), Some(&selector)).contains("已核验"));
+    scene.targets[0].value = format!("{}-endmarker", "x".repeat(MAX_TARGET_BYTES - 10));
+    assert_eq!(scene.targets[0].value.len(), MAX_TARGET_BYTES);
+    assert!(target_presentation(&scene, None, Some(&selector)).contains(&scene.targets[0].value));
+}
+
+#[test]
+fn selection_change_or_filter_cancels_old_save_and_inspection_continuations() {
+    use quick_panel::account_fill_ui::AccountSelection;
+    let mut selection = AccountSelection::default();
+    selection.set(Some("a".into()));
+    let accepted_save = selection.token().unwrap();
+    assert!(selection.permits(&accepted_save));
+    selection.reconcile(&["b".into()]);
+    assert!(!selection.permits(&accepted_save));
+    // Removing the filter does not silently select a replacement.
+    selection.reconcile(&["a".into(), "b".into()]);
+    assert!(selection.current.is_none());
+    selection.set(Some("a".into()));
+    assert!(!selection.permits(&accepted_save));
+    let inspection = selection.token().unwrap();
+    selection.set(Some("b".into()));
+    selection.set(Some("a".into()));
+    assert!(!selection.permits(&inspection));
 }

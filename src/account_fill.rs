@@ -639,3 +639,43 @@ impl TeachingSession {
         Ok(binding)
     }
 }
+
+/// Bounded ancestry validation, shared by native point and local-scope resampling.
+pub fn validate_ancestry<T, I: PartialEq + Clone, E>(
+    mut node: T,
+    expected_root: &I,
+    mut identity: impl FnMut(&T) -> Result<I, E>,
+    mut parent: impl FnMut(&T) -> Result<T, E>,
+    mut check: impl FnMut() -> Result<(), E>,
+    rejected: E,
+) -> Result<(), E> {
+    let mut seen = Vec::new();
+    for _ in 0..MAX_ANCESTRY_NODES {
+        check()?;
+        let id = identity(&node)?;
+        check()?;
+        if id == *expected_root {
+            return Ok(());
+        }
+        if seen.contains(&id) {
+            return Err(rejected);
+        }
+        seen.push(id);
+        node = parent(&node)?;
+        check()?;
+    }
+    Err(rejected)
+}
+
+/// Independent of the window collection depth; still bounded by the command deadline.
+pub const MAX_ANCESTRY_NODES: usize = 64;
+
+/// Unique, eligible ordinary field suggested to the native teaching state.
+pub fn suggested_username(snapshot: &SceneSnapshot) -> Option<u64> {
+    let mut eligible = snapshot
+        .fields
+        .iter()
+        .filter(|f| !f.is_password && unique_field(&f.selector, snapshot, false).is_ok());
+    let first = eligible.next()?;
+    eligible.next().is_none().then_some(first.field_id)
+}

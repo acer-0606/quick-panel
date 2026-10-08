@@ -636,3 +636,38 @@ fn selected_scope_never_becomes_exact_or_reusable_teaching() {
     teacher.select_target(None).unwrap();
     assert!(teacher.finish("small".into(), "account".into()).is_err());
 }
+
+#[test]
+fn deep_ancestry_has_independent_bound_and_rejects_wrong_root_cycles_and_budget() {
+    let walk = |start: usize, root: usize, cyclic: bool, expired: bool| {
+        validate_ancestry(
+            start,
+            &root,
+            |n| Ok::<_, &'static str>(*n),
+            |n| Ok(if cyclic { *n } else { n.saturating_sub(1) }),
+            || if expired { Err("budget") } else { Ok(()) },
+            "target",
+        )
+    };
+    assert_eq!(walk(12usize, 0, false, false), Ok(()));
+    assert_eq!(walk(12, 99, false, false), Err("target"));
+    assert_eq!(walk(12, 0, true, false), Err("target"));
+    assert_eq!(walk(200, 0, false, false), Err("target"));
+    assert_eq!(walk(12, 0, false, true), Err("budget"));
+}
+
+#[test]
+fn username_suggestion_counts_eligible_fields_and_rejects_ambiguous_selectors() {
+    let mut s = scene();
+    let mut readonly = s.fields[1].clone();
+    readonly.field_id = 3;
+    readonly.selector = selector("readonly");
+    readonly.writable = false;
+    s.fields.push(readonly);
+    assert_eq!(suggested_username(&s), Some(2));
+    s.fields[2].writable = true;
+    assert_eq!(suggested_username(&s), None);
+    s.fields[2].selector = s.fields[1].selector.clone();
+    s.fields[2].writable = false;
+    assert_eq!(suggested_username(&s), None);
+}
