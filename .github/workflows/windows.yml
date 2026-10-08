@@ -39,7 +39,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Pinned official Node asset verification failed" }
           "QP_CI_NODE_ASSETS=$assets" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - run: cargo fmt --check
-      - run: cargo test --locked
+      - run: cargo test --locked -- --test-threads=1
       - run: cargo clippy --locked --all-targets -- -D warnings
       - shell: pwsh
         run: ./scripts/build-windows.ps1 -Node $env:QP_TEST_NODE -Pnpm $env:QP_CI_PNPM -NodeAssets $env:QP_CI_NODE_ASSETS

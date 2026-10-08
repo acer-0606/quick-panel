@@ -4,7 +4,7 @@ Windows 原生快捷面板，用一个搜索框查找功能、剪贴板内容、
 
 ## 在 Windows 使用
 
-将 dist/QuickPanel-Windows-x64.zip 复制到 Windows x64 电脑，解压后双击 QuickPanel.exe。程序常驻系统托盘，可通过托盘图标或快捷键打开面板。此包面向 Windows 10 和 Windows 11。
+从 [GitHub Releases](https://github.com/acer-0606/quick-panel/releases) 下载 `QuickPanel-Windows-x64.zip`，在 Windows x64 电脑上完整解压后双击 `QuickPanel.exe`，保留随包提供的 `runtime` 目录。程序常驻系统托盘，可通过托盘图标或快捷键打开面板。此包面向 Windows 10 和 Windows 11；下载页同时提供校验文件和对应源码版本。
 
 | 操作 | 默认方式 |
 |---|---|
