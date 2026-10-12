@@ -759,8 +759,18 @@ fn capture(e: &Engine, text: &str) {
 }
 #[track_caller]
 fn stop(e: &Engine) {
+    eprintln!(
+        "storage fixture: shutdown enqueue caller={}",
+        std::panic::Location::caller()
+    );
+    let started = Instant::now();
     e.send(Command::Shutdown).unwrap();
+    eprintln!(
+        "storage fixture: shutdown enqueued elapsed={:?}",
+        started.elapsed()
+    );
     wait(e, |v| matches!(v, Event::ExitReady));
+    eprintln!("storage fixture: ExitReady elapsed={:?}", started.elapsed());
 }
 #[track_caller]
 fn flush(e: &Engine) {

@@ -117,9 +117,20 @@ impl Engine {
                 }
                 actor.emit(Event::Ready(actor.settings.clone()));
                 let exit_ready = actor.run(commands);
+                #[cfg(debug_assertions)]
+                let close_started = Instant::now();
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "storage shutdown: actor returned exit_ready={exit_ready}; closing repository"
+                );
                 let events = actor.events.clone();
                 let notifier = actor.notifier.clone();
                 drop(actor);
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "storage shutdown: repository closed elapsed={:?}",
+                    close_started.elapsed()
+                );
                 if exit_ready && events.send(Event::ExitReady).is_ok() {
                     notifier();
                 }
@@ -3719,6 +3730,16 @@ impl Actor {
                     Ok(())
                 }
                 Command::Shutdown => {
+                    #[cfg(debug_assertions)]
+                    let shutdown_started = Instant::now();
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "storage shutdown: received dirty={} pending={} wal_bytes={} backlog_bytes={}",
+                        self.dirty(),
+                        self.pending.len(),
+                        self.repo.wal_bytes(),
+                        self.repo.wal_backlog_bytes()
+                    );
                     if let Some(work) = self.status_work.take() {
                         self.emit(Event::SemanticStatusFailed {
                             request_id: work.request_id,
@@ -3727,9 +3748,25 @@ impl Actor {
                     }
                     self.exiting = true;
                     self.organizer_cancel();
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "storage shutdown: organizer canceled dirty={} elapsed={:?}",
+                        self.dirty(),
+                        shutdown_started.elapsed()
+                    );
                     if self.flush() {
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "storage shutdown: flush complete elapsed={:?}",
+                            shutdown_started.elapsed()
+                        );
                         // Drop SQLite before the final acknowledgement.
                         self.repo.checkpoint();
+                        #[cfg(debug_assertions)]
+                        eprintln!(
+                            "storage shutdown: checkpoint complete elapsed={:?}",
+                            shutdown_started.elapsed()
+                        );
                         return true;
                     }
                     Ok(())

@@ -782,6 +782,14 @@ impl Repository {
         (frames.saturating_sub(completed) as u64).saturating_mul(self.page_size + 24)
     }
     pub fn checkpoint(&self) -> bool {
+        #[cfg(debug_assertions)]
+        let checkpoint_started = std::time::Instant::now();
+        #[cfg(debug_assertions)]
+        eprintln!(
+            "storage checkpoint: passive begin wal_bytes={} backlog_bytes={}",
+            self.wal_bytes(),
+            self.wal_backlog_bytes()
+        );
         match self
             .connection
             .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
@@ -792,6 +800,11 @@ impl Repository {
                 ))
             }) {
             Ok((busy, frames, completed)) if frames >= 0 && completed >= 0 => {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "storage checkpoint: passive end busy={busy} frames={frames} completed={completed} elapsed={:?}",
+                    checkpoint_started.elapsed()
+                );
                 self.wal_progress
                     .frames
                     .store(frames as usize, Ordering::Relaxed);
@@ -806,12 +819,22 @@ impl Repository {
                 // threshold only. SQLite's bounded busy timeout protects readers;
                 // failure leaves progress intact and the actor schedules a retry.
                 if self.wal_bytes() >= 64 * 1024 * 1024 {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "storage checkpoint: truncate begin elapsed={:?}",
+                        checkpoint_started.elapsed()
+                    );
                     let truncated =
                         self.connection
                             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                                 row.get::<_, i64>(0)
                             })
                             == Ok(0);
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "storage checkpoint: truncate end success={truncated} elapsed={:?}",
+                        checkpoint_started.elapsed()
+                    );
                     if !truncated {
                         return false;
                     }
