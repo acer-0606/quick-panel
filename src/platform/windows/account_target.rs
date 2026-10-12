@@ -234,14 +234,22 @@ impl Automation {
             Ok(Self { uia, tuning })
         }
     }
+    #[cfg_attr(test, track_caller)]
     fn query<T>(
         &self,
         deadline: Instant,
         f: impl FnOnce() -> windows::core::Result<T>,
     ) -> Result<T, FillError> {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .ok_or(FillError::BudgetExceeded)?;
+        #[cfg(test)]
+        let started = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            #[cfg(test)]
+            eprintln!(
+                "synthetic UIA query deadline already exhausted at {}",
+                std::panic::Location::caller()
+            );
+            return Err(FillError::BudgetExceeded);
+        };
         let timeout = remaining.as_millis().clamp(1, 200) as u32;
         unsafe {
             self.tuning
@@ -251,8 +259,22 @@ impl Automation {
                 .SetTransactionTimeout(timeout)
                 .map_err(|_| FillError::QueryFailed)?;
         }
-        let result = f().map_err(|error| error.code().0 as u32 == UIA_E_TIMEOUT);
-        crate::account_fill_execution::finish_query(result, Instant::now() >= deadline)
+        let result = f();
+        #[cfg(test)]
+        let hresult = result.as_ref().err().map(|error| error.code());
+        let result = crate::account_fill_execution::finish_query(
+            result.map_err(|error| error.code().0 as u32 == UIA_E_TIMEOUT),
+            Instant::now() >= deadline,
+        );
+        #[cfg(test)]
+        if matches!(result, Err(FillError::BudgetExceeded)) {
+            eprintln!(
+                "synthetic UIA query budget at {} hresult={hresult:?} timeout_ms={timeout} remaining_before={remaining:?} duration={:?}",
+                std::panic::Location::caller(),
+                started.elapsed()
+            );
+        }
+        result
     }
     fn identity(
         &self,
@@ -347,7 +369,19 @@ impl Automation {
             if !foreground_matches(context.target) {
                 return Err(FillError::TargetChanged);
             }
+            #[cfg(test)]
+            eprintln!(
+                "synthetic UIA point begin scope={:?} needs_scope={} remaining={:?}",
+                context.scope,
+                context.needs_scope,
+                deadline.saturating_duration_since(Instant::now())
+            );
             let hit = self.query(deadline, || self.uia.ElementFromPoint(POINT { x, y }))?;
+            #[cfg(test)]
+            eprintln!(
+                "synthetic UIA point hit remaining={:?}",
+                deadline.saturating_duration_since(Instant::now())
+            );
             if self.query(deadline, || hit.CurrentProcessId())? as u32 != context.target.pid {
                 return Err(FillError::TargetChanged);
             }
@@ -367,6 +401,13 @@ impl Automation {
                 context.scope = SceneScope::SelectedContext;
                 context.needs_scope = false;
             }
+            #[cfg(test)]
+            eprintln!(
+                "synthetic UIA point sample scope={:?} needs_scope={} remaining={:?}",
+                context.scope,
+                context.needs_scope,
+                deadline.saturating_duration_since(Instant::now())
+            );
             let mut snapshot = self.sample(context, deadline)?;
             let field_id = *context.ids.get(&id).ok_or(FillError::TeachingRequired)?;
             let mut selector = context
@@ -495,6 +536,14 @@ impl Automation {
                 &mut scene,
                 &mut structure,
             ) {
+                #[cfg(test)]
+                eprintln!(
+                    "synthetic UIA visit failed error={error:?} scope={:?} nodes={} depth={} remaining={:?}",
+                    context.scope,
+                    scene.node_count,
+                    scene.max_depth,
+                    deadline.saturating_duration_since(Instant::now())
+                );
                 context.origin = scene.origin;
                 if error == FillError::BudgetExceeded {
                     context.needs_scope = true;

@@ -277,12 +277,33 @@ impl Drop for Picker {
 mod tests {
     use super::*;
     use windows::core::w;
+    unsafe extern "system" fn synthetic_proc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+    }
     #[test]
     fn production_hooks_pair_release_reenter_and_cleanup_instruction() {
         unsafe {
+            // A STATIC text window is not a reliable WindowFromPhysicalPoint target.
+            // Use a normal DefWindowProc class and a point derived from its client area.
+            let instance = GetModuleHandleW(None).unwrap();
+            let class = w!("QuickPanelSyntheticPicker");
+            assert_ne!(
+                RegisterClassW(&WNDCLASSW {
+                    lpfnWndProc: Some(synthetic_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: class,
+                    ..Default::default()
+                }),
+                0
+            );
             let target = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                w!("STATIC"),
+                class,
                 w!("synthetic-picker"),
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 80,
@@ -291,7 +312,7 @@ mod tests {
                 200,
                 None,
                 None,
-                None,
+                Some(instance.into()),
                 None,
             )
             .unwrap();
@@ -310,8 +331,23 @@ mod tests {
                 picker.own_pid = 0;
                 picker
             };
+            let mut point = POINT { x: 70, y: 70 };
+            assert!(windows::Win32::Graphics::Gdi::ClientToScreen(target, &mut point).as_bool());
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            assert_eq!(
+                GetAncestor(WindowFromPhysicalPoint(point), GA_ROOT),
+                target,
+                "fixture point=({}, {}) foreground={:?}",
+                point.x,
+                point.y,
+                GetForegroundWindow()
+            );
             let mouse = MSLLHOOKSTRUCT {
-                pt: POINT { x: 150, y: 150 },
+                pt: point,
                 ..Default::default()
             };
             let key = KBDLLHOOKSTRUCT {
