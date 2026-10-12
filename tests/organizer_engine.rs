@@ -528,15 +528,19 @@ fn excluded_application_and_expired_observation_never_produce_new_work() {
     assert!(!s.in_flight);
     stop(&e);
 }
+#[track_caller]
 fn wait(e: &Engine, f: impl Fn(&Event) -> bool) -> Event {
-    let end = Instant::now() + Duration::from_secs(5);
+    let start = Instant::now();
+    let caller = std::panic::Location::caller();
+    let mut observed = Vec::new();
+    let end = start + Duration::from_secs(5);
     loop {
         match e.try_recv() {
             Ok(v) if f(&v) => return v,
             Ok(Event::Error { message, .. }) => panic!("{message}"),
-            Ok(_) => (),
+            Ok(event) => observed.push(format!("{:?}", std::mem::discriminant(&event))),
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                assert!(Instant::now() < end, "timeout");
+                assert!(Instant::now() < end, "timeout caller={caller}, elapsed={:?}, observed event variants={observed:?}", start.elapsed());
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(x) => panic!("{x}"),
@@ -681,11 +685,13 @@ fn organizer_metadata_is_emitted_as_guarded_patches_instead_of_search_refreshes(
     );
     stop(&e);
 }
+#[track_caller]
 fn open(p: &std::path::Path) -> Engine {
     let e = Engine::start(EngineOptions::new(p.into()), Arc::new(|| {})).unwrap();
     wait(&e, |v| matches!(v, Event::Ready(_)));
     e
 }
+#[track_caller]
 fn settings(e: &Engine, s: Settings) {
     e.send(Command::SaveSettings(s)).unwrap();
     wait(e, |v| matches!(v, Event::Saved(_)));
@@ -700,6 +706,7 @@ fn config(mode: OrganizerMode) -> Settings {
     s.ai.encrypted_key = "fixture".into();
     s
 }
+#[track_caller]
 fn snapshot(e: &Engine) -> Snapshot {
     e.send(Command::OrganizerSnapshot { request_id: 17 })
         .unwrap();
@@ -710,6 +717,7 @@ fn snapshot(e: &Engine) -> Snapshot {
         _ => unreachable!(),
     }
 }
+#[track_caller]
 fn work(e: &Engine) -> Work {
     e.send(Command::OrganizerTick).unwrap();
     match wait(e, |v| matches!(v, Event::OrganizerWork(_))) {
@@ -745,10 +753,12 @@ fn capture(e: &Engine, text: &str) {
     }))
     .unwrap();
 }
+#[track_caller]
 fn stop(e: &Engine) {
     e.send(Command::Shutdown).unwrap();
     wait(e, |v| matches!(v, Event::ExitReady));
 }
+#[track_caller]
 fn flush(e: &Engine) {
     e.send(Command::Flush).unwrap();
     wait(e, |v| matches!(v, Event::Saved(_)));
@@ -1314,6 +1324,7 @@ fn ready_reservation_reclaims_done_before_stalling_and_preserves_ready_sources()
     complete(&e, &w);
     let ready = snapshot(&e).proposals;
     for i in 0..180 {
+        eprintln!("ready reservation seed {i}/180");
         e.send(Command::SaveFavorite(FavoriteInput {
             id: Some(format!("reclaim-{i}")),
             kind: ItemKind::Folder,
@@ -1355,6 +1366,7 @@ fn ready_reservation_reclaims_done_before_stalling_and_preserves_ready_sources()
         .unwrap();
     drop(db);
     let e = open(&p);
+    eprintln!("ready reservation reopened; requesting work");
     let w = work(&e);
     assert!(!w.candidates.is_empty());
     assert_eq!(snapshot(&e).proposals, ready);
