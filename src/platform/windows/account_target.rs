@@ -251,11 +251,8 @@ impl Automation {
                 .SetTransactionTimeout(timeout)
                 .map_err(|_| FillError::QueryFailed)?;
         }
-        let result = f().map_err(|_| FillError::QueryFailed)?;
-        if Instant::now() >= deadline {
-            return Err(FillError::BudgetExceeded);
-        }
-        Ok(result)
+        let result = f().map_err(|error| error.code().0 as u32 == UIA_E_TIMEOUT);
+        crate::account_fill_execution::finish_query(result, Instant::now() >= deadline)
     }
     fn identity(
         &self,

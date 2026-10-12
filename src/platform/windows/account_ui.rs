@@ -375,6 +375,11 @@ impl Runtime {
                     }
                 }
                 AccountResult::Failed(error) => {
+                    #[cfg(test)]
+                    eprintln!(
+                        "synthetic native reply request={} generation={} error={error:?} target={:?}",
+                        reply.request_id, reply.generation, self.flow.target
+                    );
                     if self.last_fill == Some((reply.request_id, reply.generation))
                         && !self.open
                         && !matches!(error, FillError::Cancelled | FillError::TargetChanged)
@@ -2106,10 +2111,20 @@ mod tests {
         unsafe {
             let fixture = Synthetic::new(270);
             let mut runtime = unlocked_runtime(&fixture);
+            let inspect_started = Instant::now();
             runtime.start_inspect(Purpose::Manual);
             pump_runtime(&mut runtime);
             assert!(runtime.inspection.is_none());
-            assert!(runtime.notice.contains("页面较复杂"));
+            assert!(
+                runtime.notice.contains("页面较复杂"),
+                "budget fixture notice={:?} teaching={:?} window={:?} point={:?} foreground={:?} elapsed={:?}",
+                runtime.notice,
+                runtime.teaching_context,
+                fixture.identity(),
+                fixture.point(),
+                GetForegroundWindow(),
+                inspect_started.elapsed()
+            );
             assert!(
                 runtime.teaching_context.is_some(),
                 "failed complete capture must retain a teaching-only ticket"
@@ -2412,53 +2427,107 @@ mod tests {
     #[test]
     fn runtime_filter_revokes_fill_and_preserves_an_accepted_binding_save() {
         unsafe {
-            let fixture = Synthetic::new(0);
-            let mut runtime = unlocked_runtime(&fixture);
-            runtime.fill_mode = true;
-            runtime.start_inspect(Purpose::Manual);
-            pump_runtime(&mut runtime);
-            runtime.filter_accounts("synthetic");
-            assert_eq!(runtime.selected_account().as_deref(), Some("account"));
-            runtime.fill(true);
-            assert!(runtime.after_save.is_some());
-            assert!(runtime.flow.vault.pending_document().is_some());
-            runtime.queued_inspect = Some(Purpose::Saved(Box::new(
-                runtime.after_save.as_ref().unwrap().binding.clone(),
-            )));
-            runtime.filter_accounts("no-visible-account");
-            assert!(runtime.selected_account().is_none());
-            assert!(runtime.selection.current.is_none());
-            assert!(runtime.after_save.is_none());
-            assert!(runtime.queued_inspect.is_none());
-            assert!(runtime.flow.vault.pending_document().is_some());
-            pump_runtime(&mut runtime);
-            assert_eq!(
-                runtime
-                    .flow
-                    .vault
-                    .session()
-                    .document()
-                    .unwrap()
-                    .bindings
-                    .len(),
-                1
-            );
-            assert!(runtime.pending.is_none() && runtime.inspection.is_none());
-            assert!(runtime.last_fill.is_none());
-            let mut value = [0u16; 64];
-            assert_eq!(GetWindowTextW(fixture.password, &mut value), 0);
-            runtime.filter_accounts("");
-            assert!(runtime.selected_account().is_none());
-            runtime.fill(false);
-            assert!(runtime.notice.contains("请选择"));
-            assert!(
-                operation(
-                    &Rc::new(RefCell::new(runtime)),
-                    &EditKind::Account(Some("account".into())),
-                    &["synthetic".into(), String::new(), String::new()]
-                )
-                .is_err()
-            );
+            for filter_during_write in [false, true] {
+                let fixture = Synthetic::new(0);
+                let mut runtime = unlocked_runtime(&fixture);
+                runtime.fill_mode = true;
+                runtime.start_inspect(Purpose::Manual);
+                pump_runtime(&mut runtime);
+                runtime.filter_accounts("synthetic");
+                assert_eq!(runtime.selected_account().as_deref(), Some("account"));
+                runtime.fill(true);
+                assert!(
+                    runtime.after_save.is_some(),
+                    "save notice={:?} state={:?}",
+                    runtime.notice,
+                    runtime.flow.vault.state()
+                );
+                assert_eq!(runtime.flow.vault.state(), SaveState::Preparing);
+                assert!(!runtime.flow.vault.can_shutdown());
+                // Candidate becomes available only after the real preparation worker replies.
+                assert!(runtime.flow.vault.pending_document().is_none());
+                let mut receipt = None;
+                if filter_during_write {
+                    let deadline = Instant::now() + std::time::Duration::from_secs(30);
+                    loop {
+                        if let Some(notice) = runtime.flow.vault.poll() {
+                            assert!(
+                                matches!(notice, VaultNotice::Prepared),
+                                "preparation={notice:?}"
+                            );
+                            runtime.vault_notice(notice);
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "preparation state={:?}",
+                            runtime.flow.vault.state()
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    assert_eq!(runtime.flow.vault.state(), SaveState::Ready);
+                    assert!(runtime.flow.vault.pending_document().is_some());
+                    runtime.tick(|command| {
+                        if let Command::WriteAccountVault {
+                            request_id,
+                            expected_revision,
+                            ..
+                        } = command
+                        {
+                            receipt = Some((request_id, expected_revision + 1));
+                        }
+                        Ok(())
+                    });
+                    assert!(receipt.is_some());
+                    assert_eq!(runtime.flow.vault.state(), SaveState::AwaitingReceipt);
+                }
+                runtime.queued_inspect = Some(Purpose::Saved(Box::new(
+                    runtime.after_save.as_ref().unwrap().binding.clone(),
+                )));
+                runtime.filter_accounts("no-visible-account");
+                assert!(runtime.selected_account().is_none());
+                assert!(runtime.selection.current.is_none());
+                assert!(runtime.after_save.is_none());
+                assert!(runtime.queued_inspect.is_none());
+                assert!(!runtime.flow.vault.can_shutdown());
+                if let Some((request_id, revision)) = receipt {
+                    assert!(runtime.flow.vault.pending_document().is_some());
+                    runtime.event(Event::AccountVaultWritten {
+                        request_id,
+                        result: Ok(revision),
+                    });
+                } else {
+                    assert_eq!(runtime.flow.vault.state(), SaveState::Preparing);
+                }
+                pump_runtime(&mut runtime);
+                assert_eq!(
+                    runtime
+                        .flow
+                        .vault
+                        .session()
+                        .document()
+                        .unwrap()
+                        .bindings
+                        .len(),
+                    1
+                );
+                assert!(runtime.pending.is_none() && runtime.inspection.is_none());
+                assert!(runtime.last_fill.is_none());
+                let mut value = [0u16; 64];
+                assert_eq!(GetWindowTextW(fixture.password, &mut value), 0);
+                runtime.filter_accounts("");
+                assert!(runtime.selected_account().is_none());
+                runtime.fill(false);
+                assert!(runtime.notice.contains("请选择"));
+                assert!(
+                    operation(
+                        &Rc::new(RefCell::new(runtime)),
+                        &EditKind::Account(Some("account".into())),
+                        &["synthetic".into(), String::new(), String::new()]
+                    )
+                    .is_err()
+                );
+            }
         }
     }
     #[test]

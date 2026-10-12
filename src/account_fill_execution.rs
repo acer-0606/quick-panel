@@ -41,6 +41,21 @@ impl FillError {
         }
     }
 }
+/// Finish a provider call without exposing native errors or accepting late success.
+/// The error flag identifies the provider's timeout HRESULT.
+pub fn finish_query<T>(result: Result<T, bool>, deadline_expired: bool) -> Result<T, FillError> {
+    if deadline_expired {
+        return Err(FillError::BudgetExceeded);
+    }
+    result.map_err(|provider_timeout| {
+        if provider_timeout {
+            FillError::BudgetExceeded
+        } else {
+            FillError::QueryFailed
+        }
+    })
+}
+
 struct State {
     epoch: AtomicU64,
     generation: AtomicU64,

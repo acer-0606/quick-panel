@@ -384,8 +384,17 @@ mod tests {
                     }
                 }
                 if cancel == 0 {
+                    let hit = WindowFromPhysicalPoint(mouse.pt);
+                    let hit_root = GetAncestor(hit, GA_ROOT);
+                    let actual = picker.poll();
+                    let mut rect = RECT::default();
+                    GetWindowRect(target, &mut rect).unwrap();
                     assert!(
-                        matches!(picker.poll(),PickEvent::Selected(PickPoint {window,..}) if window==identity)
+                        matches!(actual,PickEvent::Selected(PickPoint {window,..}) if window==identity),
+                        "picker={actual:?} expected={identity:?} point=({}, {}) hit={hit:?} hit_root={hit_root:?} foreground={:?} target_rect={rect:?}",
+                        mouse.pt.x,
+                        mouse.pt.y,
+                        GetForegroundWindow()
                     );
                 } else {
                     assert_eq!(picker.poll(), PickEvent::Cancelled);

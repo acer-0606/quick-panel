@@ -482,3 +482,30 @@ fn equivalent_remember_reuses_id_and_keeps_exact_hint_without_merging_other_targ
     doc.accounts.clear();
     assert!(doc.upsert_binding(equivalent).is_err());
 }
+
+#[test]
+fn provider_timeout_before_deadline_keeps_budget_classification() {
+    assert_eq!(
+        finish_query::<()>(Err(true), false),
+        Err(FillError::BudgetExceeded)
+    );
+}
+#[test]
+fn failed_query_that_exhausts_deadline_reports_budget() {
+    assert_eq!(
+        finish_query::<()>(Err(false), true),
+        Err(FillError::BudgetExceeded)
+    );
+}
+#[test]
+fn unsupported_query_is_never_promoted_to_success() {
+    assert_eq!(
+        finish_query::<()>(Err(false), false),
+        Err(FillError::QueryFailed)
+    );
+}
+#[test]
+fn successful_query_after_deadline_is_rejected() {
+    assert_eq!(finish_query(Ok(42), true), Err(FillError::BudgetExceeded));
+    assert_eq!(finish_query(Ok(42), false), Ok(42));
+}
