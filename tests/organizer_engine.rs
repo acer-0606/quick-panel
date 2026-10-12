@@ -540,7 +540,11 @@ fn wait(e: &Engine, f: impl Fn(&Event) -> bool) -> Event {
             Ok(Event::Error { message, .. }) => panic!("{message}"),
             Ok(event) => observed.push(format!("{:?}", std::mem::discriminant(&event))),
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                assert!(Instant::now() < end, "timeout caller={caller}, elapsed={:?}, observed event variants={observed:?}", start.elapsed());
+                assert!(
+                    Instant::now() < end,
+                    "timeout caller={caller}, elapsed={:?}, observed event variants={observed:?}",
+                    start.elapsed()
+                );
                 std::thread::sleep(Duration::from_millis(2));
             }
             Err(x) => panic!("{x}"),
