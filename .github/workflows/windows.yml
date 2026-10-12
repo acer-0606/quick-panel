@@ -1,5 +1,14 @@
 name: Windows verification
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      storage_shutdown_diagnostic:
+        description: Run the fixed storage shutdown diagnostic before the full verification suite
+        type: boolean
+        default: false
+        required: false
 jobs:
   windows:
     runs-on: windows-latest
@@ -39,6 +48,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Pinned official Node asset verification failed" }
           "QP_CI_NODE_ASSETS=$assets" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - run: cargo fmt --check
+      - name: Diagnose storage shutdown phases
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.storage_shutdown_diagnostic }}
+        run: cargo test --locked --test organizer_engine ready_reservation_reclaims_done_before_stalling_and_preserves_ready_sources -- --exact --nocapture --test-threads=1
       - run: cargo test --locked -- --test-threads=1
       - run: cargo clippy --locked --all-targets -- -D warnings
       - shell: pwsh
