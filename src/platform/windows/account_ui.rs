@@ -32,6 +32,14 @@ use windows::{
     core::{PCWSTR, w},
 };
 pub const TIMER: usize = 794;
+pub const WAKE: u32 = WM_APP + 96;
+pub fn post_wake(owner: HWND) {
+    if !owner.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(Some(owner), WAKE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
 #[derive(Clone)]
 enum Purpose {
     Manual,
@@ -90,6 +98,7 @@ pub struct Runtime {
     pub shutdown_requested: bool,
     pub shutdown_sent: bool,
     pub shutdown_failed: bool,
+    shutdown_send_failed: bool,
 }
 impl Runtime {
     pub fn new() -> Self {
@@ -129,10 +138,56 @@ impl Runtime {
             shutdown_requested: false,
             shutdown_sent: false,
             shutdown_failed: false,
+            shutdown_send_failed: false,
         }
+    }
+    /// Attach before any vault command is admitted.
+    pub fn attach_owner(&mut self, owner: HWND) {
+        self.owner = owner;
+        let handle = owner.0 as usize;
+        self.flow = AccountFlow::with_notify(std::sync::Arc::new(move || {
+            post_wake(HWND(handle as *mut _));
+        }));
     }
     fn changed(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        post_wake(self.owner);
+    }
+    pub fn timer_delay(&self) -> Option<std::time::Duration> {
+        crate::account_fill_ui::account_timer_delay(
+            self.flow.vault.session().is_unlocked(),
+            self.last_active.elapsed(),
+            self.settings.lock_minutes,
+            self.worker.as_ref().is_some_and(AccountWorker::is_busy)
+                || self.picker.is_some()
+                || self.pending.is_some()
+                || self.after_save.is_some()
+                || (self.flow.target.is_some()
+                    && (self.hint_binding.is_some()
+                        || (self.open
+                            && (self.inspection.is_some() || self.teaching_context.is_some())))),
+        )
+    }
+    pub fn schedule(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.owner), TIMER);
+            if let Some(delay) = self.timer_delay() {
+                // A failed lock deadline must fail closed, never leave secrets unlocked.
+                if SetTimer(
+                    Some(self.owner),
+                    TIMER,
+                    delay.as_millis().clamp(1, u32::MAX as u128) as u32,
+                    None,
+                ) == 0
+                    && (self.flow.vault.session().is_unlocked()
+                        || self.flow.target.is_some()
+                        || self.picker.is_some())
+                {
+                    self.lock();
+                    self.notice = "无法设置安全锁定时限，保险箱已锁定".into();
+                }
+            }
+        }
     }
     pub fn configure(&mut self, settings: AccountFillSettings, appearance: Theme) {
         if self.settings.enabled && !settings.enabled {
@@ -237,7 +292,15 @@ impl Runtime {
             self.changed();
         }
     }
+    pub fn request_shutdown(&mut self) {
+        self.exit();
+        self.shutdown_requested = true;
+        self.shutdown_sent = false;
+        self.shutdown_send_failed = false;
+        self.changed();
+    }
     pub fn cancel_exit(&mut self) {
+        self.shutdown_send_failed = false;
         self.flow.exiting = false;
         self.shutdown_requested = false;
         self.shutdown_sent = false;
@@ -494,12 +557,17 @@ impl Runtime {
             self.flow.target = Some(target);
             self.start_inspect(Purpose::HintBase(version));
         }
-        if self.shutdown_requested && self.flow.shutdown_ready() && !self.shutdown_sent {
+        if self.shutdown_requested
+            && self.flow.shutdown_ready()
+            && !self.shutdown_sent
+            && !self.shutdown_send_failed
+        {
             match send(Command::Shutdown) {
                 Ok(()) => self.shutdown_sent = true,
                 Err(e) => {
                     self.notice = e;
                     self.shutdown_failed = true;
+                    self.shutdown_send_failed = true;
                     self.changed();
                 }
             }
@@ -507,7 +575,13 @@ impl Runtime {
     }
     fn ensure_worker(&mut self) -> bool {
         if self.worker.is_none() {
-            match AccountWorker::new(self.flow.vault.session().epoch()) {
+            let handle = self.owner.0 as usize;
+            match AccountWorker::with_notify(
+                self.flow.vault.session().epoch(),
+                std::sync::Arc::new(move || {
+                    post_wake(HWND(handle as *mut _));
+                }),
+            ) {
                 Ok(worker) => self.worker = Some(worker),
                 Err(e) => {
                     self.notice = e.message().into();
@@ -1074,6 +1148,12 @@ impl Runtime {
         self.changed();
     }
     pub fn retry(&mut self) {
+        if self.shutdown_send_failed && self.flow.shutdown_ready() {
+            self.shutdown_send_failed = false;
+            self.shutdown_failed = false;
+            self.changed();
+            return;
+        }
         match self.flow.vault.retry() {
             Ok(()) => {
                 self.shutdown_failed = false;
@@ -1147,6 +1227,7 @@ fn operation(
     ) {
         r.flow.vault.retry()?;
         r.notice = "正在重试原保存请求…".into();
+        r.changed();
         return Ok(());
     }
     if matches!(kind, EditKind::Create | EditKind::Master) {
@@ -1910,6 +1991,156 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_vault_wakes_without_idle_poll_and_rearms_lock_deadline_then_drains_exit() {
+        unsafe {
+            let owner = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("synthetic-wake"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                200,
+                100,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            struct Window(HWND);
+            impl Drop for Window {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _window = Window(owner);
+            let mut runtime = Runtime::new();
+            runtime.attach_owner(owner);
+            runtime.settings.lock_minutes = 1;
+            runtime.schedule();
+            assert!(
+                KillTimer(Some(owner), TIMER).is_err(),
+                "locked idle must not own a timer"
+            );
+            let envelope = RefCell::new(Vec::new());
+            let mut shutdown = false;
+            // Only an actual posted wake or deadline message runs the consumer.
+            let mut pump = |runtime: &mut Runtime, done: &dyn Fn(&Runtime) -> bool| {
+                let end = Instant::now() + std::time::Duration::from_secs(30);
+                while !done(runtime) {
+                    let mut msg = MSG::default();
+                    if PeekMessageW(&mut msg, Some(owner), 0, 0, PM_REMOVE).as_bool() {
+                        if msg.message == WAKE || (msg.message == WM_TIMER && msg.wParam.0 == TIMER)
+                        {
+                            let mut receipt = None;
+                            runtime.tick(|command| {
+                                match command {
+                                    Command::WriteAccountVault {
+                                        request_id,
+                                        expected_revision,
+                                        envelope: bytes,
+                                    } => {
+                                        *envelope.borrow_mut() = bytes;
+                                        receipt = Some((request_id, expected_revision + 1));
+                                    }
+                                    Command::Shutdown => shutdown = true,
+                                    _ => (),
+                                }
+                                Ok(())
+                            });
+                            if let Some((request_id, revision)) = receipt {
+                                runtime.event(Event::AccountVaultWritten {
+                                    request_id,
+                                    result: Ok(revision),
+                                });
+                            }
+                            runtime.schedule();
+                        } else {
+                            DispatchMessageW(&msg);
+                        }
+                    } else {
+                        MsgWaitForMultipleObjectsEx(None, 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    }
+                    assert!(Instant::now() < end, "posted vault wake/deadline was lost");
+                }
+            };
+            let master = Secret::new("synthetic-wake-master".into());
+            let id = runtime.flow.next_id();
+            runtime
+                .flow
+                .vault
+                .accept_create(id, master.clone(), master.clone(), VaultDocument::default())
+                .unwrap();
+            assert_eq!(runtime.timer_delay(), None);
+            pump(&mut runtime, &|r| r.flow.vault.session().is_unlocked());
+            assert!(runtime.timer_delay().unwrap() > std::time::Duration::from_secs(50));
+            runtime.last_active = Instant::now() - std::time::Duration::from_secs(61);
+            runtime.schedule();
+            pump(&mut runtime, &|r| !r.flow.vault.session().is_unlocked());
+            assert!(KillTimer(Some(owner), TIMER).is_err());
+            // A new unlock wakes a stopped timer. An accepted edit then drains
+            // even after the window closes and exit revokes plaintext.
+            runtime
+                .flow
+                .vault
+                .begin_unlock(
+                    runtime.flow.vault.session().epoch(),
+                    master,
+                    crate::account_vault::VaultSnapshot {
+                        revision: 1,
+                        envelope: envelope.borrow().clone(),
+                    },
+                )
+                .unwrap();
+            pump(&mut runtime, &|r| r.flow.vault.session().is_unlocked());
+            let id = runtime.flow.next_id();
+            runtime
+                .flow
+                .vault
+                .accept_save(id, VaultDocument::default())
+                .unwrap();
+            runtime.dismiss();
+            runtime.exit();
+            runtime.shutdown_requested = true;
+            post_wake(owner);
+            pump(&mut runtime, &|r| r.shutdown_sent);
+            assert!(shutdown);
+            assert!(!envelope.borrow().is_empty());
+            assert!(!runtime.flow.vault.session().is_unlocked());
+            assert_eq!(runtime.timer_delay(), None);
+            assert!(KillTimer(Some(owner), TIMER).is_err());
+        }
+    }
+
+    #[test]
+    fn failed_shutdown_send_waits_for_explicit_retry_instead_of_self_waking_forever() {
+        let mut runtime = Runtime::new();
+        runtime.request_shutdown();
+        let mut attempts = 0;
+        for _ in 0..3 {
+            runtime.tick(|command| {
+                assert!(matches!(command, Command::Shutdown));
+                attempts += 1;
+                Err("synthetic disconnected actor".into())
+            });
+        }
+        assert_eq!(attempts, 1);
+        assert!(runtime.shutdown_failed);
+        runtime.retry();
+        runtime.tick(|command| {
+            assert!(matches!(command, Command::Shutdown));
+            attempts += 1;
+            Ok(())
+        });
+        assert_eq!(attempts, 2);
+        assert!(runtime.shutdown_sent);
+        assert_eq!(runtime.timer_delay(), None);
+    }
 
     struct Synthetic {
         root: HWND,

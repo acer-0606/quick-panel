@@ -1,3 +1,26 @@
+# 2026-10-12 · 0.1.1 可用性、空闲调度与读取性能修复
+
+本波包含账号本次填入/场景资格与原生守卫、设置导航/滚动及真实缩放记忆、有界正文搜索与索引资格/计数缓存，以及账号事件唤醒、明确重试合并、空查询路径配额和设置中心索引操作。测试仅使用合成内容、临时数据库和合成窗口，不访问用户保险箱、剪贴板、真实模型 API 或录屏。
+
+账号的 crypto 完成、UIA 完成/清理、WinEvent、用户操作、存储回执与退出请求会唤醒应用。仅在实际 UIA 工作、点选或有效目标守卫期间保留短时检查；解锁空闲时只设置锁定截止时间；关闭且锁定无任务时不保留 100ms 定时器。保存回执仍严格关联，退出排空已经接纳的保存。重试沿用原 Actor 权限与预算边界，在真实 worker 空闲及调度屏障完成后发送一次 Retry/Tick；配置变化或停用会撤销等待请求。智能设置中的索引动作由仍打开的 hub 同步分发，浏览、取消编辑或保存设置本身不会发送索引文本。
+
+验证命令固定 Rust 1.95.0，所有 Cargo 串行：`CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`。本机子进程合成用例使用固定 `QP_TEST_NODE`；未变更的 Node 模块不在 host 重跑，Windows CI 仍执行完整流水线。完整命令 metadata/raw logs 保留在实施证据。原生 fixtures 在 macOS 仅交叉编译，不计为原生执行。
+
+最终本机验证（本轮源码，非历史版本）：
+
+| 检查 | 实际结果 |
+|---|---|
+| 唯一一次完整 `cargo +1.95.0 test --locked -- --test-threads=1` | **610 passed / 0 failed / 3 既有 ignored**，46 个 suite summaries，192.770 秒，0 warning |
+| 账号/重试/路径/设置定点 | **62 passed / 0 failed**；路径先测 RED，账号与重试另有旧行为回退 RED/GREEN |
+| host / Windows GNU all-target strict Clippy | 均 exit0，`-D warnings`；Windows 原生测试在 host 执行0项 |
+| `cargo +1.95.0 run --locked -- --core-check` | exit0；`pending_visible`、`disk_empty_before_flush`、`exit_restored` 均为 true，SQLite 3.53.2 |
+
+完整共享套件包含旧 organizer ready-reservation 用例且本次通过。3项默认ignored沿用既有设计（隔离子进程probe、两个Release大库/空间专项）；未为本次验证新增跳过。新Windows合成fixture覆盖真实消息唤醒/锁定截止、退出发送失败等待明确重试，以及hub仍打开时索引开始/取消。
+
+最终交付采用同一冻结源码提交的 Windows CI MSVC Release 产物；最终 Windows run URL、实际计数、source_commit/source_tree_clean、ZIP 成员/CRC/字节/SHA-256、Node/Pi 资产许可核验记在发布记录和外置 manifest / SHA256SUMS，不在 CI 后回写包内源码文档。历史章节中的运行计数仅属于各自版本。旧 organizer 压力用例曾有通用 5 秒超时，后续诊断版本完整 CI 通过仍不足以定位旧失败原因；保留 caller/stage 诊断，不扩大 timeout 或跳过用例。
+
+人工 Windows 验收仍需覆盖中文 IME、真实第三方登录页/权限边界、多屏 DPI、WIC 图片及系统锁屏/休眠；CI 合成窗口不能代替这些实机场景。普通历史仍最多缓冲 60 秒、默认提前 5 秒保存；明确修改立即保存，正常退出排空，系统强杀/断电不保证恢复未落盘内容。
+
 # 2026-10-08 账号交互修正（当前交付）
 
 本波从 `604665545ab95701a74d8305a9e7039217a277ab` 修复隐藏所选账号的动作授权、用户名尚未确定被误作跳过，以及深层密码框无法形成完整局部范围三项问题，同时显示实际服务器/连接名并保留失败保存的重试/放弃后重新解锁门控。列表筛选会撤销旧识别与保存续填，保留已经接纳的保存；可见选择稳定且不会自动选择替代账号。独立提示不继承已关闭列表的查询。

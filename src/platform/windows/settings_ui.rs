@@ -460,3 +460,92 @@ pub unsafe fn show(
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn smart_hub_start_and_cancel_are_delivered_while_hub_remains_open() {
+        unsafe {
+            let owner = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("synthetic-settings"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                300,
+                200,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            struct Window(HWND);
+            impl Drop for Window {
+                fn drop(&mut self) {
+                    unsafe {
+                        let _ = DestroyWindow(self.0);
+                    }
+                }
+            }
+            let _window = Window(owner);
+            let mut phase = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let mut index = crate::semantic_ui::IndexSession::default();
+            let result = show(owner, Group::Smart, |hub, group, action| {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "index actions were not delivered inside the hub"
+                );
+                assert_eq!(group, Group::Smart);
+                if hub != owner {
+                    assert!(IsWindow(Some(hub)).as_bool());
+                    match phase {
+                        0 => {
+                            assert!(action.is_none());
+                            let combo = GetDlgItem(Some(hub), 12).unwrap();
+                            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(1)), None);
+                            PostMessageW(Some(hub), WM_COMMAND, WPARAM(1), LPARAM(0)).unwrap();
+                            phase = 1;
+                        }
+                        1 if action.is_some() => {
+                            assert_eq!(action, Some(Action::IndexStart));
+                            crate::settings_ui::index_action(action.unwrap(), true, index.active())
+                                .unwrap();
+                            assert!(matches!(
+                                index.begin("synthetic-profile"),
+                                crate::model::Command::PrepareSemanticIndex { .. }
+                            ));
+                            assert!(index.active());
+                            let combo = GetDlgItem(Some(hub), 12).unwrap();
+                            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(2)), None);
+                            PostMessageW(Some(hub), WM_COMMAND, WPARAM(1), LPARAM(0)).unwrap();
+                            phase = 2;
+                        }
+                        2 if action.is_some() => {
+                            assert_eq!(action, Some(Action::IndexCancel));
+                            crate::settings_ui::index_action(action.unwrap(), true, index.active())
+                                .unwrap();
+                            index.cancel();
+                            assert!(!index.active());
+                            PostMessageW(Some(hub), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+                            phase = 3;
+                        }
+                        _ => (),
+                    }
+                }
+                Snapshot {
+                    appearance: Theme::System,
+                    detail: index.label(None),
+                    alive: true,
+                    close_label: "返回",
+                }
+            });
+            assert_eq!(phase, 3);
+            assert!(result.is_none());
+            assert!(!index.active());
+        }
+    }
+}

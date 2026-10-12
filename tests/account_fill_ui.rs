@@ -530,3 +530,92 @@ fn selection_change_or_filter_cancels_old_save_and_inspection_continuations() {
     selection.set(Some("a".into()));
     assert!(!selection.permits(&inspection));
 }
+
+#[test]
+fn completion_wake_drains_hidden_locked_save_retry_and_exit_without_poll_timer() {
+    use quick_panel::{account_fill_ui::account_timer_delay, account_vault_jobs::SaveState};
+    use std::{
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
+    let (tx, rx) = mpsc::channel();
+    let mut flow = AccountFlow::with_notify(Arc::new(move || {
+        let _ = tx.send(());
+    }));
+    assert_eq!(account_timer_delay(false, Duration::ZERO, 5, false), None);
+    let id = flow.next_id();
+    let master = Secret::new("synthetic-wake-master".into());
+    flow.vault
+        .accept_create(id, master.clone(), master, VaultDocument::default())
+        .unwrap();
+    flow.dismiss();
+    flow.request_exit();
+    assert!(!flow.shutdown_ready());
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("background completion must wake the closed UI");
+    assert_eq!(flow.vault.poll(), Some(VaultNotice::Prepared));
+    let mut commands = vec![];
+    flow.vault
+        .dispatch_save(|command| {
+            commands.push(command);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(commands.len(), 1);
+    assert!(
+        flow.vault
+            .handle_event(&Event::AccountVaultWritten {
+                request_id: id + 1,
+                result: Ok(1)
+            })
+            .is_none()
+    );
+    flow.vault.handle_event(&Event::AccountVaultWritten {
+        request_id: id,
+        result: Err("合成磁盘错误".into()),
+    });
+    assert_eq!(flow.vault.state(), SaveState::FailedWrite);
+    assert!(!flow.shutdown_ready());
+    flow.vault.retry().unwrap();
+    flow.vault
+        .dispatch_save(|command| {
+            commands.push(command);
+            Ok(())
+        })
+        .unwrap();
+    flow.vault.handle_event(&Event::AccountVaultWritten {
+        request_id: id,
+        result: Ok(1),
+    });
+    assert!(flow.shutdown_ready());
+    assert!(!flow.vault.session().is_unlocked());
+    assert_eq!(commands.len(), 2);
+    assert_eq!(account_timer_delay(false, Duration::ZERO, 5, false), None);
+}
+
+#[test]
+fn account_idle_deadline_and_native_guard_select_only_needed_wakes() {
+    use quick_panel::account_fill_ui::account_timer_delay;
+    use std::time::Duration as D;
+    assert_eq!(account_timer_delay(false, D::ZERO, 5, false), None);
+    assert_eq!(
+        account_timer_delay(true, D::from_secs(299), 5, false),
+        Some(D::from_secs(1))
+    );
+    assert_eq!(
+        account_timer_delay(true, D::from_secs(300), 5, false),
+        Some(D::ZERO)
+    );
+    assert_eq!(
+        account_timer_delay(true, D::ZERO, 5, false),
+        Some(D::from_secs(300))
+    );
+    assert_eq!(
+        account_timer_delay(false, D::ZERO, 5, true),
+        Some(D::from_millis(100))
+    );
+    assert_eq!(
+        account_timer_delay(true, D::from_millis(299950), 5, true),
+        Some(D::from_millis(50))
+    );
+}

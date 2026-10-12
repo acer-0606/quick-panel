@@ -261,3 +261,67 @@ fn changed_settings_revoke_completion_without_releasing_real_worker_slot() {
     assert!(worker.try_result().is_none());
     assert!(!worker.busy());
 }
+
+#[test]
+fn explicit_retry_runs_before_hour_interval_coalesces_busy_and_respects_disable() {
+    let d = tempfile::tempdir().unwrap();
+    let e = Engine::start(EngineOptions::new(d.path().join("db")), Arc::new(|| {})).unwrap();
+    event(&e, |v| matches!(v, Event::Ready(_)));
+    let mut settings = configuration();
+    settings.organizer.interval_seconds = 3600;
+    e.send(Command::SaveSettings(settings.clone())).unwrap();
+    event(&e, |v| matches!(v, Event::Saved(_)));
+    captured(&e, "retry fixture");
+    let first = work(&e);
+    e.send(Command::OrganizerComplete {
+        token: first.token,
+        result: Err("合成网络失败".into()),
+    })
+    .unwrap();
+    assert!(!snapshot(&e).in_flight);
+    let mut schedule = RetrySchedule::default();
+    schedule.request();
+    schedule.request();
+    assert!(schedule.commands(true, true).is_none());
+    assert!(schedule.pending());
+    for command in schedule.commands(true, false).unwrap() {
+        e.send(command).unwrap();
+    }
+    assert!(schedule.commands(true, false).is_none());
+    let retried = match event(&e, |v| matches!(v, Event::OrganizerWork(_))) {
+        Event::OrganizerWork(w) => w,
+        _ => unreachable!(),
+    };
+    assert_ne!(first.token, retried.token);
+    assert_eq!(first.candidates, retried.candidates);
+    e.send(Command::OrganizerComplete {
+        token: retried.token,
+        result: Err("合成网络失败".into()),
+    })
+    .unwrap();
+    assert!(!snapshot(&e).in_flight);
+    schedule.request();
+    assert!(schedule.commands(false, false).is_none());
+    assert!(!schedule.pending());
+    assert!(schedule.commands(true, false).is_none());
+    schedule.request();
+    assert!(!schedule.settings_changed(&settings, &settings));
+    assert!(schedule.pending());
+    let mut changed = settings.clone();
+    changed.ai.model = "other-synthetic-model".into();
+    assert!(schedule.settings_changed(&settings, &changed));
+    assert!(schedule.commands(true, false).is_none());
+    schedule.request();
+    changed = settings.clone();
+    changed.organizer.enabled = false;
+    assert!(schedule.settings_changed(&settings, &changed));
+    assert!(schedule.commands(true, false).is_none());
+    settings.organizer.enabled = false;
+    e.send(Command::SaveSettings(settings)).unwrap();
+    event(&e, |v| matches!(v, Event::Saved(_)));
+    e.send(Command::OrganizerRetry).unwrap();
+    e.send(Command::OrganizerTick).unwrap();
+    assert!(!snapshot(&e).in_flight);
+    e.send(Command::Shutdown).unwrap();
+    event(&e, |v| matches!(v, Event::ExitReady));
+}

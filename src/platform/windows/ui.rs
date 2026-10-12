@@ -472,6 +472,7 @@ struct App {
     organizer_worker: Option<OrganizerWorker>,
     organizer_session: crate::organizer_ui::OrganizerSession,
     organizer_tick_pending: bool,
+    organizer_retry: crate::organizer_ui::RetrySchedule,
     organizer_review: Rc<RefCell<crate::organizer_ui::ReviewState>>,
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
     organizer_page_open: bool,
@@ -608,6 +609,7 @@ pub fn run() -> Result<(), String> {
             organizer_worker: None,
             organizer_session: crate::organizer_ui::OrganizerSession::default(),
             organizer_tick_pending: false,
+            organizer_retry: crate::organizer_ui::RetrySchedule::default(),
             organizer_review: Rc::new(RefCell::new(crate::organizer_ui::ReviewState::default())),
             organizer_outbox: Rc::new(RefCell::new((None, None))),
             organizer_page_open: false,
@@ -717,10 +719,7 @@ pub fn run() -> Result<(), String> {
         let _window_guard = WindowGuard(hwnd);
         let mut app = host.app.borrow_mut();
         app.hwnd = hwnd;
-        app.accounts.borrow_mut().owner = hwnd;
-        if SetTimer(Some(hwnd), super::account_ui::TIMER, 100, None) == 0 {
-            return Err("无法启动账号状态处理".into());
-        }
+        app.accounts.borrow_mut().attach_owner(hwnd);
         let _ = windows::Win32::System::RemoteDesktop::WTSRegisterSessionNotification(
             hwnd,
             windows::Win32::System::RemoteDesktop::NOTIFY_FOR_THIS_SESSION,
@@ -953,6 +952,11 @@ impl App {
         }
     }
     fn cancel_organizer_for_settings(&mut self, next: &Settings) {
+        if self.organizer_retry.settings_changed(&self.settings, next) {
+            let mut review = self.organizer_review.borrow_mut();
+            review.message = "配置已改变，等待中的重试已取消；需要时请按新配置再次重试".into();
+            review.revision += 1;
+        }
         if let Some(_id) = self
             .organizer_session
             .settings_changed(&self.settings, next)
@@ -967,7 +971,30 @@ impl App {
             self.send(Command::OrganizerSnapshot { request_id });
         }
     }
+    fn request_organizer_retry(&mut self) {
+        self.organizer_retry.request();
+        {
+            let mut review = self.organizer_review.borrow_mut();
+            review.message = if !self.settings.organizer.enabled {
+                "管家已停用；请先启用后再重试"
+            } else if crate::organizer_ui::organizer_config_warning(&self.settings.ai).is_some() {
+                "连接配置不完整；请先检查服务连接"
+            } else {
+                "已请求重试；后台忙时等待当前任务结束后调度一次"
+            }
+            .into();
+            review.revision += 1;
+        }
+        self.organizer_tick();
+    }
     fn organizer_tick(&mut self) {
+        if !self.settings.organizer.enabled
+            || self.state.lifecycle != Lifecycle::Running
+            || crate::organizer_ui::organizer_config_warning(&self.settings.ai).is_some()
+        {
+            self.organizer_retry.cancel();
+            return;
+        }
         if self.settings.organizer.enabled
             && self.state.lifecycle == Lifecycle::Running
             && !self.organizer_tick_pending
@@ -976,7 +1003,18 @@ impl App {
             let request_id = self.organizer_review.borrow_mut().request_snapshot();
             let Some(request_id) = request_id else { return };
             self.organizer_tick_pending = true;
-            self.send(Command::OrganizerTick);
+            if let Some(commands) = self.organizer_retry.commands(true, false) {
+                {
+                    let mut review = self.organizer_review.borrow_mut();
+                    review.message.clear();
+                    review.revision += 1;
+                }
+                for command in commands {
+                    self.send(command);
+                }
+            } else {
+                self.send(Command::OrganizerTick);
+            }
             // FIFO local barrier acknowledges even an empty/cooling tick, avoiding
             // a queue of timer commands while the actor is busy.
             self.send(Command::OrganizerSnapshot { request_id });
@@ -1750,10 +1788,7 @@ impl App {
 
     fn send(&self, c: Command) {
         if matches!(c, Command::Shutdown) {
-            let mut accounts = self.accounts.borrow_mut();
-            accounts.exit();
-            accounts.shutdown_requested = true;
-            accounts.shutdown_sent = false;
+            self.accounts.borrow_mut().request_shutdown();
             return;
         }
         if matches!(c, Command::CancelShutdown) {
@@ -2343,6 +2378,9 @@ impl App {
                 }
             }
         }
+        if self.organizer_retry.pending() {
+            self.organizer_tick();
+        }
         if let Some(done) = self
             .screenshot_worker
             .as_ref()
@@ -2565,6 +2603,9 @@ impl App {
                     self.organizer_review
                         .borrow_mut()
                         .adopt_snapshot(request_id, snapshot);
+                    if self.organizer_retry.pending() {
+                        self.organizer_tick();
+                    }
                 }
                 Event::OrganizerChanged => {
                     self.organizer_progress.mark_dirty();
@@ -3583,6 +3624,7 @@ impl App {
                 .ok_or_else(|| "存储尚未就绪".to_string())?
                 .send(command)
         });
+        self.accounts.borrow_mut().schedule();
         if let Some(message) = self.accounts.borrow_mut().take_attention() {
             self.effects.push_back(UiEffect::AccountResult {
                 owner: self.hwnd,
@@ -3694,6 +3736,7 @@ impl App {
             224 => self.add(false),
             EXIT if self.state.lifecycle == Lifecycle::Running => {
                 self.accounts.borrow_mut().exit();
+                self.organizer_retry.cancel();
                 let _ = KillTimer(Some(self.hwnd), ORGANIZER_TIMER);
                 self.organizer_session.cancel();
                 if let Some(worker) = &self.organizer_worker
@@ -3784,6 +3827,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     WM_SIZING => host.defer(Deferred::Message(msg, wp, LPARAM(0))),
                     ENGINE_WAKE
                     | WORK_WAKE
+                    | super::account_ui::WAKE
+                    | super::account_hint::HINT_CLICK
                     | ORGANIZER_UI_WAKE
                     | SHOW_EXISTING
                     | WM_CLIPBOARDUPDATE
@@ -3850,6 +3895,10 @@ unsafe fn app_message(
     lp: LPARAM,
 ) -> Option<LRESULT> {
     match msg {
+        super::account_ui::WAKE => {
+            app.account_tick();
+            return Some(LRESULT(0));
+        }
         WM_TIMER if wp.0 == super::account_ui::TIMER => {
             app.account_tick();
             return Some(LRESULT(0));
@@ -3918,7 +3967,11 @@ unsafe fn app_message(
                             .borrow_mut()
                             .bind_work(&app.organizer_session);
                     }
-                    app.send(command);
+                    if matches!(command, Command::OrganizerRetry) {
+                        app.request_organizer_retry();
+                    } else {
+                        app.send(command);
+                    }
                     if app.organizer_page_open {
                         app.organizer_snapshot();
                     }
@@ -4454,6 +4507,37 @@ impl Host {
                         Ok(())
                     }),
                 );
+            }
+            Edit::IndexStart | Edit::IndexCancel => {
+                let mut app = self.app.borrow_mut();
+                if app.state.lifecycle != Lifecycle::Running {
+                    return;
+                }
+                let permitted = crate::settings_ui::index_action(
+                    action,
+                    app.settings.embedding.enabled,
+                    app.semantic_index.active(),
+                );
+                match permitted {
+                    Err(message) => app.settings_notice = message.into(),
+                    Ok(()) if action == Edit::IndexCancel => {
+                        app.cancel_index();
+                        app.settings_notice =
+                            "已取消索引；已接纳的索引写入仍会完成，未发送内容不会继续发送。".into();
+                    }
+                    Ok(()) => {
+                        if let Err(message) =
+                            ai_client::validate_embedding_settings(&app.settings.embedding)
+                        {
+                            app.settings_notice = message;
+                            return;
+                        }
+                        app.begin_index();
+                        app.settings_notice = if app.semantic_index.active() {
+                            "已按当前会话已提交的配置开始索引；仅发送所选范围内容。配置如有写盘错误会另行显示。"
+                        } else { "索引未开始；请检查连接配置和后台状态后重试" }.into();
+                    }
+                }
             }
             Edit::AccountLock => self.app.borrow_mut().accounts.borrow_mut().lock(),
             Edit::AccountManage | Edit::Review | Edit::Memory => (),

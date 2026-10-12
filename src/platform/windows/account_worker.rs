@@ -107,6 +107,9 @@ impl AccountControl {
 }
 impl AccountWorker {
     pub fn new(epoch: u64) -> Result<Self, FillError> {
+        Self::with_notify(epoch, Arc::new(|| {}))
+    }
+    pub fn with_notify(epoch: u64, notify: Arc<dyn Fn() + Send + Sync>) -> Result<Self, FillError> {
         let lifetime = WorkerLifetime::acquire()?;
         let (tx, jobs) = mpsc::sync_channel::<Message>(1);
         let (replies, rx) = mpsc::sync_channel(1);
@@ -117,7 +120,7 @@ impl AccountWorker {
             .name("account-uia".into())
             .spawn(move || {
                 let _lifetime = lifetime;
-                run(jobs, replies, cleanup_on_worker)
+                run(jobs, replies, cleanup_on_worker, notify)
             })
             .map_err(|_| FillError::QueryFailed)?;
         Ok(Self {
@@ -295,11 +298,17 @@ fn inspection(
         teaching_required,
     }
 }
-fn run(jobs: Receiver<Message>, replies: SyncSender<AccountReply>, cleanup: Arc<AtomicBool>) {
+fn run(
+    jobs: Receiver<Message>,
+    replies: SyncSender<AccountReply>,
+    cleanup: Arc<AtomicBool>,
+    notify: Arc<dyn Fn() + Send + Sync>,
+) {
     if unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_err() {
         for message in jobs {
             let Message::Job(job) = message else {
                 cleanup.store(false, Ordering::SeqCst);
+                notify();
                 continue;
             };
             let Job {
@@ -316,6 +325,7 @@ fn run(jobs: Receiver<Message>, replies: SyncSender<AccountReply>, cleanup: Arc<
                 generation,
                 result: AccountResult::Failed(FillError::QueryFailed),
             });
+            notify();
         }
         return;
     }
@@ -331,6 +341,7 @@ fn run(jobs: Receiver<Message>, replies: SyncSender<AccountReply>, cleanup: Arc<
                 gate.revoke();
                 session = None;
                 cleanup.store(false, Ordering::SeqCst);
+                notify();
                 continue;
             }
         };
@@ -371,6 +382,7 @@ fn run(jobs: Receiver<Message>, replies: SyncSender<AccountReply>, cleanup: Arc<
         // Busy remains held until every provider call and secret cleanup has finished.
         drop(job.lease);
         let _ = replies.send(reply);
+        notify();
     }
 }
 fn handle(

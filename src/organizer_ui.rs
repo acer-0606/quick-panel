@@ -1245,3 +1245,49 @@ pub fn feedback_intro(title: &str, target: &crate::harness_tools::FeedbackTarget
             .unwrap_or("暂无完成建议，仅记录原因")
     )
 }
+
+/// One user-requested retry, retained until the physical worker and actor barrier are free.
+/// Settings changes revoke this request so it never authorizes a different configuration.
+#[derive(Default)]
+pub struct RetrySchedule {
+    pending: bool,
+}
+impl RetrySchedule {
+    pub fn request(&mut self) {
+        self.pending = true;
+    }
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+    pub fn cancel(&mut self) {
+        self.pending = false;
+    }
+    pub fn settings_changed(
+        &mut self,
+        old: &crate::model::Settings,
+        next: &crate::model::Settings,
+    ) -> bool {
+        let revoked = self.pending && organizer_settings_changed(old, next);
+        if revoked {
+            self.cancel();
+        }
+        revoked
+    }
+    pub fn commands(
+        &mut self,
+        allowed: bool,
+        occupied: bool,
+    ) -> Option<[crate::model::Command; 2]> {
+        if !allowed {
+            self.cancel();
+        }
+        if !self.pending || occupied {
+            return None;
+        }
+        self.cancel();
+        Some([
+            crate::model::Command::OrganizerRetry,
+            crate::model::Command::OrganizerTick,
+        ])
+    }
+}

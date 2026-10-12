@@ -494,3 +494,37 @@ fn screenshot_and_optional_shortcut_settings_are_searchable_while_history_is_pau
         );
     }
 }
+
+#[test]
+fn empty_query_reserves_paths_only_by_displacing_ordinary_history() {
+    let history = || {
+        (0..50)
+            .map(|i| Entry::Saved(saved(&format!("h{i}"), "历史", ItemKind::Clipboard)))
+            .collect::<Vec<_>>()
+    };
+    let mut rows = history();
+    if let Entry::Saved(item) = &mut rows[49] {
+        item.pinned = true;
+    }
+    rows[48] = Entry::Saved(saved("favorite", "收藏", ItemKind::Folder));
+    let merged = palette::with_suggestions("", rows, (0..8).map(suggested).collect());
+    assert_eq!(merged.len(), 50);
+    assert_eq!(merged.iter().filter(|r| r.suggested().is_some()).count(), 5);
+    assert!(merged.iter().any(|r| r.id() == "favorite"));
+    assert!(merged.iter().any(|r| r.id() == "h49"));
+    assert_eq!(merged[0].id(), "h0");
+    assert!(
+        palette::with_suggestions("query", history(), (0..8).map(suggested).collect())
+            .iter()
+            .all(|r| r.suggested().is_none())
+    );
+    assert_eq!(palette::with_suggestions("", history(), vec![]).len(), 50);
+    let protected = (0..50)
+        .map(|i| Entry::Saved(saved(&format!("f{i}"), "收藏", ItemKind::Folder)))
+        .collect();
+    assert!(
+        palette::with_suggestions("", protected, (0..8).map(suggested).collect())
+            .iter()
+            .all(|r| r.suggested().is_none())
+    );
+}

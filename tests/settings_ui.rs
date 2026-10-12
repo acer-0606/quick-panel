@@ -483,3 +483,21 @@ fn native_review_return_registers_memory_before_opening_settings_and_restores_it
         Some(Page::Review)
     );
 }
+
+#[test]
+fn smart_hub_exposes_explicit_index_actions_and_guards_disabled_busy_and_cancel() {
+    use settings_ui::index_action;
+    assert_eq!(
+        Group::Smart.actions(),
+        &[Action::Smart, Action::IndexStart, Action::IndexCancel]
+    );
+    assert!(index_action(Action::IndexStart, false, false).is_err());
+    assert!(index_action(Action::IndexStart, true, true).is_err());
+    assert!(index_action(Action::IndexStart, true, false).is_ok());
+    assert!(index_action(Action::IndexCancel, false, true).is_ok());
+    assert!(index_action(Action::IndexCancel, true, false).is_err());
+    assert!(index_action(Action::Smart, true, false).is_err());
+    let note = settings_ui::description(Group::Smart, &Settings::default(), "未建立", None);
+    assert!(note.contains("编辑表单须先提交或取消"));
+    assert!(note.contains("当前会话已提交的配置"));
+}

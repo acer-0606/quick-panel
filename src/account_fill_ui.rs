@@ -30,8 +30,12 @@ impl Default for AccountFlow {
 }
 impl AccountFlow {
     pub fn new() -> Self {
+        Self::with_notify(Arc::new(|| {}))
+    }
+    /// Completion wake survives closing/locking the UI and accepted save preparation.
+    pub fn with_notify(notify: Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
-            vault: VaultController::new(Arc::new(|| {})),
+            vault: VaultController::new(notify),
             snapshot: None,
             loaded: false,
             target: None,
@@ -417,5 +421,26 @@ pub fn fill_gate(
         Err("请等待当前识别或保险箱保存完成")
     } else {
         Ok(())
+    }
+}
+
+/// The UI owns the deadline; crypto and storage completions wake it explicitly.
+/// Poll only while a native target/picker/real UIA slot requires a freshness check.
+pub fn account_timer_delay(
+    unlocked: bool,
+    idle: std::time::Duration,
+    lock_minutes: u32,
+    native_poll: bool,
+) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    let lock =
+        unlocked.then(|| Duration::from_secs(u64::from(lock_minutes) * 60).saturating_sub(idle));
+    if native_poll {
+        Some(
+            lock.unwrap_or(Duration::from_millis(100))
+                .min(Duration::from_millis(100)),
+        )
+    } else {
+        lock
     }
 }

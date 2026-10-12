@@ -40,7 +40,7 @@ impl Group {
             Self::General => &[Action::General],
             Self::Data => &[Action::Data],
             Self::Paths => &[Action::Paths],
-            Self::Smart => &[Action::Smart],
+            Self::Smart => &[Action::Smart, Action::IndexStart, Action::IndexCancel],
             Self::Organizer => &[
                 Action::Organizer,
                 Action::Advanced,
@@ -61,6 +61,8 @@ pub enum Action {
     Data,
     Paths,
     Smart,
+    IndexStart,
+    IndexCancel,
     Organizer,
     Advanced,
     Review,
@@ -78,6 +80,8 @@ impl Action {
             Self::Data => "编辑记录、排除与保留",
             Self::Paths => "编辑观察与排除",
             Self::Smart => "编辑能力、首选与索引范围",
+            Self::IndexStart => "建立 / 更新语义索引（发送所选范围文本）",
+            Self::IndexCancel => "取消当前语义索引",
             Self::Organizer => "编辑开关、模式与范围",
             Self::Advanced => "高级调度参数",
             Self::Review => "管理已有整理建议",
@@ -214,7 +218,7 @@ pub fn description(group: Group, s: &Settings, index: &str, query: Option<&str>)
         },
         Group::Data => format!("记录{}\r\n未固定历史：{}天未使用 / 最多{}条\r\n排除应用：{}\r\n\r\n{}",if s.capture_paused {"已暂停；已有历史与截图复制仍可使用"} else {"已开启"},s.retention_days,s.max_history,if s.excluded_apps.is_empty(){"无".into()}else{s.excluded_apps.join("、")},RETENTION_NOTE),
         Group::Paths => format!("常用路径{}。可观察资源管理器与最近文档，管理排除目录。\r\n清空访问统计及不再推荐名单后，后续新访问可重新推荐。",enabled(s.path_activity.enabled)),
-        Group::Smart => format!("Claude 按意思查找{}；语义查找{}。\r\n首选：{}；索引范围：{}\r\n{}\r\n\r\n索引状态：{}\r\n{}\r\n\r\n服务地址、密钥、模型和测试请到“服务连接”。建立/更新索引可从面板索引入口或功能搜索执行。",enabled(s.ai.enabled),enabled(s.embedding.enabled),match s.smart_search {SmartSearchMode::Auto=>"自动",SmartSearchMode::Claude=>"Claude",SmartSearchMode::Semantic=>"语义"},match s.embedding.index_scope {crate::semantic::IndexScope::PinnedAndFavorites=>"固定内容与收藏",crate::semantic::IndexScope::AllText=>"全部文本"},if !s.ai.enabled && !s.embedding.enabled {"请启用所需能力；配置不足时先到服务连接。"}else{"首选能力决定智能查找的选择；关闭检索不影响独立 AI 管家。"},index,query.unwrap_or("本次没有智能查询状态")),
+        Group::Smart => format!("Claude 按意思查找{}；语义查找{}。\r\n首选：{}；索引范围：{}\r\n{}\r\n\r\n索引状态：{}\r\n{}\r\n\r\n服务地址、密钥、模型和测试请到“服务连接”。可在本页选择“建立 / 更新语义索引”或“取消当前语义索引”。建立索引才会发送所选范围文本。编辑表单须先提交或取消；索引使用当前会话已提交的配置，异步写盘状态见下方。",enabled(s.ai.enabled),enabled(s.embedding.enabled),match s.smart_search {SmartSearchMode::Auto=>"自动",SmartSearchMode::Claude=>"Claude",SmartSearchMode::Semantic=>"语义"},match s.embedding.index_scope {crate::semantic::IndexScope::PinnedAndFavorites=>"固定内容与收藏",crate::semantic::IndexScope::AllText=>"全部文本"},if !s.ai.enabled && !s.embedding.enabled {"请启用所需能力；配置不足时先到服务连接。"}else{"首选能力决定智能查找的选择；关闭检索不影响独立 AI 管家。"},index,query.unwrap_or("本次没有智能查询状态")),
         Group::Organizer => format!("后台整理{}；整理记忆{}。\r\n模式：{}\r\n范围：{}\r\n核心设置包含开关、模式、范围、整理说明和记忆。间隔、批量、模型轮次放在高级参数。\r\n\r\n{}\r\n{}\r\n管理页加载后显示实际建议与记忆；此处不推测未加载数量。",enabled(s.organizer.enabled),enabled(s.organizer.memory_enabled),match s.organizer.mode {crate::organizer::OrganizerMode::Suggest=>"生成建议，由我确认",crate::organizer::OrganizerMode::Automatic=>"仅填空别名，追加标签"},match s.organizer.scope {crate::organizer::OrganizerScope::SavedAndPaths=>"收藏、固定剪贴板和外部路径",crate::organizer::OrganizerScope::SavedOnly=>"收藏和固定剪贴板",crate::organizer::OrganizerScope::PathsOnly=>"外部常用路径",crate::organizer::OrganizerScope::AllTextAndPaths=>"全部文本与外部路径"},if s.organizer.enabled {"可管理已有建议和记忆。"}else{"管家已停用：后台不再整理，仍可管理已有建议与记忆。"},if s.organizer.memory_enabled {"记忆用于规则与反馈；具体生效条件见管理页。"}else{"记忆已停用：停止使用已有规则和记录新反馈。"}),
         Group::Services => "Claude 兼容 API：检索与 AI 管家共用地址、密钥、模型与推理强度。\r\nEmbedding：独立服务连接与模型。\r\n\r\n能力开关、首选和索引范围在“智能查找”；管家开关在“AI 管家”。\r\n配置完整不代表连接成功；进入编辑后可手动获取模型或测试，结果仅对应当时的配置。浏览本页不会发起网络请求。".into(),
     }
@@ -589,5 +593,18 @@ pub fn editor_error_rect(width: i32, height: i32, dpi: u32) -> Rect {
         y: height - scale(102),
         width: (width - scale(36)).max(1),
         height: scale(50),
+    }
+}
+
+/// These actions are invoked synchronously from the settings hub, after any leaf
+/// editor has committed or cancelled its draft. Browsing/saving never indexes.
+pub fn index_action(action: Action, enabled: bool, indexing: bool) -> Result<(), &'static str> {
+    match action {
+        Action::IndexStart if !enabled => Err("语义查找已停用；请先启用并配置 Embedding"),
+        Action::IndexStart if indexing => Err("正在建立索引；可选择取消当前语义索引"),
+        Action::IndexStart => Ok(()),
+        Action::IndexCancel if indexing => Ok(()),
+        Action::IndexCancel => Err("当前没有正在建立的索引"),
+        _ => Err("此操作不是索引操作"),
     }
 }

@@ -82,6 +82,7 @@ unsafe extern "system" fn event(
         }
     }
     EVENTS.event();
+    super::account_ui::post_wake(HWND(OWNER.load(Ordering::Acquire) as *mut _));
 }
 struct Style {
     colors: theme::Colors,

@@ -778,12 +778,29 @@ pub fn with_suggestions(
     let limit = if query.trim().is_empty() { 5 } else { 10 };
     let mut added = 0;
     for path in paths {
-        if rows.len() >= 50 || added >= limit {
+        if added >= limit {
             break;
         }
         if let Ok(key) = crate::path_activity::normalize_path(&path.path)
             && keys.insert(key)
         {
+            if rows.len() >= 50 {
+                // Empty-query recommendations may replace only ordinary history.
+                // Keep the caller's relevance order for an actual search.
+                let replace = query
+                    .trim()
+                    .is_empty()
+                    .then(|| {
+                        rows.iter().rposition(|row| {
+                            row.saved().is_some_and(|item| {
+                                item.kind == ItemKind::Clipboard && !item.pinned
+                            })
+                        })
+                    })
+                    .flatten();
+                let Some(index) = replace else { break };
+                rows.remove(index);
+            }
             rows.push(Entry::Suggested(path.into()));
             added += 1;
         }
