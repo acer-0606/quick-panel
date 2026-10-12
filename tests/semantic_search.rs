@@ -670,23 +670,19 @@ fn candidate_pages_are_bounded_skip_unchanged_and_preserve_real_text() {
             "真正正文",
         );
     }
+    // SQL eligibility skips unselected rows before body materialization and
+    // before the page quota; the first bounded batch reaches selected sources.
     let first = one_page(&engine, IndexCursor::default());
-    assert!(first.candidates.is_empty());
-    assert_eq!(first.cursor.after_rowid, 128);
+    assert_eq!(first.candidates.len(), 16);
+    assert_eq!(first.cursor.after_rowid, 146);
     assert!(!first.done);
+    assert!(first.candidates.iter().all(|c| c.text.contains("真正正文")));
+    store(&engine, &first, vec![vec![1., 0.]; 16]);
     let second = one_page(&engine, first.cursor);
-    assert_eq!(second.candidates.len(), 16);
-    assert!(
-        second
-            .candidates
-            .iter()
-            .all(|c| c.text.contains("真正正文"))
-    );
-    store(&engine, &second, vec![vec![1., 0.]; 16]);
-    let third = one_page(&engine, second.cursor);
-    assert_eq!(third.candidates.len(), 2);
-    store(&engine, &third, vec![vec![1., 0.]; 2]);
-    assert!(one_page(&engine, third.cursor).done);
+    assert_eq!(second.candidates.len(), 2);
+    assert_eq!(second.cursor.after_rowid, 148);
+    store(&engine, &second, vec![vec![1., 0.]; 2]);
+    assert!(one_page(&engine, second.cursor).done);
     assert!(batch(&engine, IndexCursor::default()).candidates.is_empty());
     shutdown(&engine);
 }

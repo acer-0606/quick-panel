@@ -7,6 +7,18 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FULL_BODY_READS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    pub(crate) static PREVIEW_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+fn count_body(text: &str) {
+    FULL_BODY_READS.with(|n| {
+        let (rows, bytes) = n.get();
+        n.set((rows + 1, bytes + text.len()));
+    });
+}
 #[derive(Default)]
 struct WalProgress {
     frames: AtomicUsize,
@@ -33,6 +45,7 @@ unsafe extern "C" fn observe_wal(
 pub(crate) enum Mutation {
     Content,
     Metadata,
+    Eligibility,
     SearchMetadata,
 }
 pub(crate) struct PendingItem {
@@ -219,6 +232,20 @@ impl Repository {
         })
         .transpose()
     }
+    pub(crate) fn body_preview(&self, id: &str) -> Result<String, String> {
+        self.connection
+            .prepare_cached("SELECT substr(text,1,152) FROM items WHERE id=?1")
+            .map_err(|e| e.to_string())?
+            .query_row([id], |r| r.get(0))
+            .optional()
+            .map(|v: Option<String>| {
+                let text = v.unwrap_or_default();
+                #[cfg(test)]
+                PREVIEW_BYTES.with(|n| n.set(n.get() + text.len()));
+                text
+            })
+            .map_err(|e| e.to_string())
+    }
     pub fn organizer_context(&self, id: &str) -> Result<String, String> {
         self.connection
             .query_row(
@@ -243,6 +270,8 @@ impl Repository {
         let Some((summary, text, target, open_with)) = raw else {
             return Ok(None);
         };
+        #[cfg(test)]
+        count_body(&text);
         let mut item = StoredItem {
             summary: serde_json::from_str(&summary).map_err(|e| e.to_string())?,
             text,
@@ -369,6 +398,7 @@ impl Repository {
         query: &SearchQuery,
         from_ms: Option<i64>,
         until_ms: Option<i64>,
+        excerpts: &mut HashMap<String, String>,
         mut checkpoint: impl FnMut() -> Result<(), String>,
     ) -> Result<Vec<ItemSummary>, String> {
         let needle = search::normalize(query.text.trim());
@@ -428,7 +458,8 @@ impl Repository {
                         {
                             continue;
                         }
-                        if !search::matches_normalized(&item, &needle) {
+                        let metadata_match = search::matches_normalized(&item, &needle);
+                        let excerpt = if !metadata_match {
                             if minimum_rank > 0 {
                                 continue;
                             }
@@ -438,10 +469,18 @@ impl Repository {
                                 .map_err(|e| e.to_string())?
                                 .query_row([rowid], |r| r.get(0))
                                 .map_err(|e| e.to_string())?;
-                        }
-                        if search::matches_normalized(&item, &needle) {
+                            #[cfg(test)]
+                            count_body(&item.text);
+                            search::body_excerpt(&item.text, &needle)
+                        } else {
+                            None
+                        };
+                        if metadata_match || excerpt.is_some() {
                             accepted += 1;
                             fts_ids.insert(rowid);
+                            if let Some(excerpt) = excerpt {
+                                excerpts.insert(item.summary.id.clone(), excerpt);
+                            }
                             confirmed.insert(rowid, item.summary);
                         }
                     }
@@ -552,8 +591,11 @@ impl Repository {
             if let Some(text) = text {
                 // Metadata was already loaded above. Avoid another statement prepare,
                 // a string-ID lookup and duplicate summary JSON parsing for FTS collisions.
+                #[cfg(test)]
+                count_body(&text);
                 item.text = text;
-                if search::matches_normalized(&item, &needle) {
+                if let Some(excerpt) = search::body_excerpt(&item.text, &needle) {
+                    excerpts.insert(item.summary.id.clone(), excerpt);
                     summaries.push(item.summary);
                 }
             }
@@ -650,7 +692,7 @@ impl Repository {
             let summary = serde_json::to_string(s).map_err(|e| e.to_string())?;
             if change.mutation != Mutation::Content {
                 tx.execute("UPDATE items SET pinned=?2,last_used_ms=?3,use_count=?4,summary=?5,title=?6 WHERE id=?1",params![id,s.pinned,s.last_used_ms,i64::try_from(s.use_count).unwrap_or(i64::MAX),summary,s.title]).map_err(|e|e.to_string())?;
-                if change.mutation == Mutation::Metadata {
+                if matches!(change.mutation, Mutation::Metadata | Mutation::Eligibility) {
                     continue;
                 }
             } else {
@@ -825,7 +867,7 @@ mod scheduling_tests {
             ..Default::default()
         };
         let mut pages = 0;
-        let interrupted = repo.summaries_in_period(&query, None, None, || {
+        let interrupted = repo.summaries_in_period(&query, None, None, &mut HashMap::new(), || {
             pages += 1;
             if pages == 300 {
                 Err("due save".into())
@@ -849,7 +891,7 @@ mod scheduling_tests {
         )
         .unwrap();
         let complete = repo
-            .summaries_in_period(&query, None, None, || Ok(()))
+            .summaries_in_period(&query, None, None, &mut HashMap::new(), || Ok(()))
             .unwrap();
         assert_eq!(complete.len(), 1);
         assert_eq!(complete[0].id, "page:0");

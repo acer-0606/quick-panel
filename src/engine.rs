@@ -34,19 +34,19 @@ impl Queries {
         self.revision.fetch_add(1, Ordering::AcqRel);
         if matches!(
             command,
-            Command::Capture(_)
-                | Command::StoreEmbeddings { .. }
+            Command::StoreEmbeddings { .. }
                 | Command::SaveFavorite(_)
                 | Command::EditClipboardMetadata(_)
                 | Command::SaveSettings(_)
                 | Command::Delete(_)
                 | Command::Pin { .. }
-                | Command::Used(_)
         ) {
             self.semantic_revision.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
+const MAX_PENDING_ITEMS: usize = 4096;
+const MAX_PENDING_METADATA_BYTES: usize = 4 * 1024 * 1024;
 const QUERY_YIELDED: &str = "internal: query yielded";
 struct Commands {
     sender: Option<Sender<QueuedCommand>>,
@@ -89,9 +89,12 @@ impl Engine {
                     options,
                     settings,
                     pending: HashMap::new(),
+                    pending_payload: 0,
+                    pending_metadata: 0,
                     vectors: crate::semantic_store::PendingVectors::default(),
                     semantic_scan: None,
                     status_work: None,
+                    status_cache: None,
                     source_generation: 0,
                     queries: worker_queries,
                     query_guard: None,
@@ -360,13 +363,25 @@ struct SemanticStatusWork {
     revision: u64,
 
     source_generation: u64,
+    data_version: i64,
     profile: String,
+    active_profile: Option<(String, usize)>,
     scope: crate::semantic::IndexScope,
     after_rowid: i64,
     disk_done: bool,
     pending_ids: Vec<String>,
     indexed: usize,
     needs_update: bool,
+}
+
+// Completed status retains counters and their input identity, never bodies or
+// vectors. A fresh request always supplies its own receipt ID.
+struct SemanticStatusCache {
+    revision: u64,
+    source_generation: u64,
+    data_version: i64,
+    scope: crate::semantic::IndexScope,
+    status: SemanticIndexStatus,
 }
 
 struct Actor {
@@ -376,12 +391,15 @@ struct Actor {
     options: EngineOptions,
     settings: Settings,
     pending: HashMap<String, PendingItem>,
+    pending_payload: usize,
+    pending_metadata: usize,
     vectors: crate::semantic_store::PendingVectors,
     // Latest returned cursor and commit generation. Source commits can move
     // unscanned RAM content into disk rows, including updates to old rowids.
     semantic_scan: Option<(crate::semantic::IndexCursor, u64, String)>,
     source_generation: u64,
     status_work: Option<SemanticStatusWork>,
+    status_cache: Option<SemanticStatusCache>,
     queries: Arc<Queries>,
     query_guard: Option<(u64, u64)>,
     deleted: HashSet<String>,
@@ -420,13 +438,40 @@ fn organizer_hash(value: &impl serde::Serialize) -> String {
         Sha256::digest(serde_json::to_vec(value).expect("serializable organizer identity"))
     )
 }
+#[cfg(test)]
+thread_local! { static COUNTED_ITEMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 fn item_bytes(item: &StoredItem) -> usize {
+    #[cfg(test)]
+    COUNTED_ITEMS.with(|n| n.set(n.get() + 1));
     item.text.len().saturating_add(
         item.representations
             .iter()
             .map(|r| r.data.len())
             .sum::<usize>(),
     )
+}
+// Explicit metadata/headroom accounting, separate from the payload budget.
+// This bounds retained inputs; neither budget is a process RSS measurement.
+fn tag_bytes(tags: &Vec<String>) -> usize {
+    tags.capacity() * std::mem::size_of::<String>()
+        + tags.iter().map(String::capacity).sum::<usize>()
+}
+fn pending_metadata_bytes(item: &StoredItem) -> usize {
+    let s = &item.summary;
+    512usize
+        + s.id.capacity() * 2
+        + s.title.capacity()
+        + s.subtitle.capacity()
+        + s.alias.capacity()
+        + tag_bytes(&s.tags)
+        + item.target.as_ref().map_or(0, String::capacity)
+        + item.open_with.as_ref().map_or(0, String::capacity)
+        + item.representations.capacity() * std::mem::size_of::<Representation>()
+        + item
+            .representations
+            .iter()
+            .map(|r| r.format.capacity())
+            .sum::<usize>()
 }
 fn content_id(snapshot: &ClipboardSnapshot) -> String {
     let mut hash = Sha256::new();
@@ -1774,23 +1819,47 @@ impl Actor {
                 .semantic_revision
                 .fetch_add(1, Ordering::AcqRel);
         }
+        let mut projected_metadata = self.pending_metadata;
+        let mut projected_entries = self.pending.len();
+        for (id, alias, tags, item) in &saved {
+            let existing = self.pending.get(id);
+            let source = existing
+                .map(|p| &p.item)
+                .or(item.as_ref())
+                .ok_or("整理来源不存在")?;
+            if existing.is_none() {
+                projected_metadata += pending_metadata_bytes(source);
+                projected_entries += 1;
+            }
+            projected_metadata = projected_metadata
+                - source.summary.alias.capacity()
+                - tag_bytes(&source.summary.tags)
+                + alias.capacity()
+                + tag_bytes(tags);
+        }
+        if projected_metadata > MAX_PENDING_METADATA_BYTES || projected_entries > MAX_PENDING_ITEMS
+        {
+            return Err("整理元数据超出待保存缓存上限".into());
+        }
         for (id, alias, tags, item) in saved {
             if let Some(p) = self.pending.get_mut(&id) {
+                self.pending_metadata -= pending_metadata_bytes(&p.item);
                 p.item.summary.alias = alias;
                 p.item.summary.tags = tags;
+                self.pending_metadata += pending_metadata_bytes(&p.item);
                 if p.mutation != Mutation::Content {
                     p.mutation = Mutation::SearchMetadata;
                 }
             } else if let Some(mut item) = item {
                 item.summary.alias = alias;
                 item.summary.tags = tags;
-                self.pending.insert(
+                self.insert_pending(
                     id,
                     PendingItem {
                         item,
                         mutation: Mutation::SearchMetadata,
                     },
-                );
+                )?;
             }
         }
         for (path, alias, tags) in paths {
@@ -1902,7 +1971,41 @@ impl Actor {
         }
     }
     fn pending_bytes(&self) -> usize {
-        self.pending.values().map(|p| item_bytes(&p.item)).sum()
+        self.pending_payload
+    }
+    fn insert_pending(&mut self, id: String, pending: PendingItem) -> Result<(), String> {
+        let bytes = item_bytes(&pending.item);
+        let metadata = pending_metadata_bytes(&pending.item);
+        if metadata > MAX_PENDING_METADATA_BYTES {
+            return Err("条目元数据超过待保存缓存上限".into());
+        }
+        let old = self.pending.get(&id);
+        let payload_after = self.pending_payload - old.map_or(0, |p| item_bytes(&p.item)) + bytes;
+        let metadata_after =
+            self.pending_metadata - old.map_or(0, |p| pending_metadata_bytes(&p.item)) + metadata;
+        let entries_after = self.pending.len() + usize::from(old.is_none());
+        if (payload_after > self.options.max_pending_bytes
+            || metadata_after > MAX_PENDING_METADATA_BYTES
+            || entries_after > MAX_PENDING_ITEMS)
+            && self.dirty()
+            && !self.pressure_flush()
+        {
+            return Err("待保存缓存已满，保存失败，本次修改未接纳".into());
+        }
+
+        self.pending_payload += bytes;
+        self.pending_metadata += metadata;
+        if let Some(old) = self.pending.insert(id, pending) {
+            self.pending_payload -= item_bytes(&old.item);
+            self.pending_metadata -= pending_metadata_bytes(&old.item);
+        }
+        Ok(())
+    }
+    fn remove_pending(&mut self, id: &str) {
+        if let Some(old) = self.pending.remove(id) {
+            self.pending_payload -= item_bytes(&old.item);
+            self.pending_metadata -= pending_metadata_bytes(&old.item);
+        }
     }
     fn lookup(&self, id: &str, blobs: bool) -> Result<Option<StoredItem>, String> {
         if self.deleted.contains(id) {
@@ -1937,12 +2040,54 @@ impl Actor {
         }
         self.flush()
     }
+    fn write_account_vault(
+        &mut self,
+        expected_revision: u64,
+        envelope: &[u8],
+    ) -> Result<u64, String> {
+        self.repo
+            .write_account_vault(expected_revision, envelope)
+            .map(|(revision, wrote)| {
+                if wrote {
+                    self.after_write();
+                }
+                revision
+            })
+    }
+    fn after_write(&mut self) {
+        self.checkpoint_at
+            .get_or_insert(Instant::now() + Duration::from_secs(300));
+        if self.repo.wal_backlog_bytes() >= 16 * 1024 * 1024 {
+            let pressure = Instant::now() + Duration::from_secs(30);
+            self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(pressure));
+        }
+        if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024
+            && self
+                .emergency_checkpoint_retry
+                .is_none_or(|when| Instant::now() >= when)
+        {
+            let complete = self.repo.checkpoint();
+            if !complete {
+                // A long reader may prevent PASSIVE progress. Do not spin
+                // a checkpoint for every tiny subsequent dirty batch.
+                let retry = Instant::now() + Duration::from_secs(1);
+                self.emergency_checkpoint_retry = Some(retry);
+                self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(retry));
+            } else {
+                self.emergency_checkpoint_retry = None;
+                self.checkpoint_at = None;
+            }
+        }
+    }
     fn flush(&mut self) -> bool {
         if !self.dirty() {
             return true;
         }
         let now = now_ms();
-        let semantic_status_changed = !self.pending.is_empty()
+        let semantic_status_changed = self
+            .pending
+            .values()
+            .any(|p| p.mutation != Mutation::Metadata)
             || !self.deleted.is_empty()
             || self.settings_dirty
             || !self.vectors.items.is_empty();
@@ -1964,13 +2109,15 @@ impl Actor {
                 if self
                     .pending
                     .values()
-                    .any(|p| p.mutation == Mutation::Content)
+                    .any(|p| p.mutation != Mutation::Metadata)
                     || !self.deleted.is_empty()
                     || effects.sources_removed
                 {
                     self.source_generation += 1;
                 }
                 self.pending.clear();
+                self.pending_payload = 0;
+                self.pending_metadata = 0;
                 self.vectors = crate::semantic_store::PendingVectors::default();
                 self.deleted.clear();
                 self.settings_dirty = false;
@@ -1978,29 +2125,7 @@ impl Actor {
                 self.commits += 1;
                 self.retry_delay_ms = 1_000;
                 self.retry_not_before = None;
-                self.checkpoint_at
-                    .get_or_insert(Instant::now() + Duration::from_secs(300));
-                if self.repo.wal_backlog_bytes() >= 16 * 1024 * 1024 {
-                    let pressure = Instant::now() + Duration::from_secs(30);
-                    self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(pressure));
-                }
-                if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024
-                    && self
-                        .emergency_checkpoint_retry
-                        .is_none_or(|when| Instant::now() >= when)
-                {
-                    let complete = self.repo.checkpoint();
-                    if !complete {
-                        // A long reader may prevent PASSIVE progress. Do not spin
-                        // a checkpoint for every tiny subsequent dirty batch.
-                        let retry = Instant::now() + Duration::from_secs(1);
-                        self.emergency_checkpoint_retry = Some(retry);
-                        self.checkpoint_at = Some(self.checkpoint_at.unwrap().min(retry));
-                    } else {
-                        self.emergency_checkpoint_retry = None;
-                        self.checkpoint_at = None;
-                    }
-                }
+                self.after_write();
                 self.emit(Event::Saved(SaveStats {
                     semantic_status_changed,
                     pending_items: 0,
@@ -2056,23 +2181,17 @@ impl Actor {
                 .pending
                 .get(&id)
                 .map_or(Mutation::Metadata, |p| p.mutation);
-            self.pending.insert(
+            self.insert_pending(
                 id.clone(),
                 PendingItem {
                     item: old,
                     mutation,
                 },
-            );
+            )?;
             self.organizer_enqueue(crate::organizer::Source::SavedItem { id: id.clone() })?;
             self.mark_dirty();
             self.emit(Event::Changed);
             return Ok(());
-        }
-        if self.pending_bytes().saturating_add(bytes) > self.options.max_pending_bytes
-            && self.dirty()
-            && !self.pressure_flush()
-        {
-            return Err("待保存缓存已满，保存失败，本条未记录".into());
         }
         let old = self.lookup(&id, false)?;
         let mut summary = old.map(|i| i.summary).unwrap_or_else(|| ItemSummary {
@@ -2103,25 +2222,38 @@ impl Actor {
             use_count: 0,
         });
         summary.last_used_ms = summary.last_used_ms.max(snapshot.captured_at_ms);
+        let pending = PendingItem {
+            item: StoredItem {
+                summary,
+                text: snapshot.text,
+                representations: snapshot.representations,
+                target: None,
+                open_with: None,
+            },
+            mutation: Mutation::Content,
+        };
+        let metadata = pending_metadata_bytes(&pending.item);
+        if metadata > MAX_PENDING_METADATA_BYTES {
+            return Err("剪贴板元数据超过待保存缓存上限，未记录".into());
+        }
+        if (self.pending_bytes().saturating_add(bytes) > self.options.max_pending_bytes
+            || self.pending.len() >= MAX_PENDING_ITEMS
+            || self.pending_metadata.saturating_add(metadata) > MAX_PENDING_METADATA_BYTES)
+            && self.dirty()
+            && !self.pressure_flush()
+        {
+            return Err("待保存缓存已满，保存失败，本条未记录".into());
+        }
+        self.insert_pending(id.clone(), pending)?;
         self.source_generation += 1;
         self.deleted.remove(&id);
-        self.pending.insert(
-            id.clone(),
-            PendingItem {
-                item: StoredItem {
-                    summary,
-                    text: snapshot.text,
-                    representations: snapshot.representations,
-                    target: None,
-                    open_with: None,
-                },
-                mutation: Mutation::Content,
-            },
-        );
         self.organizer_enqueue(crate::organizer::Source::SavedItem { id })?;
         self.mark_dirty();
         self.emit(Event::Changed);
-        if self.pending_bytes() >= self.options.max_pending_bytes {
+        if self.pending_bytes() >= self.options.max_pending_bytes
+            || self.pending.len() >= MAX_PENDING_ITEMS
+            || self.pending_metadata >= MAX_PENDING_METADATA_BYTES
+        {
             self.pressure_flush();
         }
         Ok(())
@@ -2134,9 +2266,12 @@ impl Actor {
     ) -> Result<Vec<ItemSummary>, String> {
         self.query_checkpoint()?;
         let needle = search::normalize(query.text.trim());
-        let saved = self
-            .repo
-            .summaries_in_period(query, from_ms, until_ms, || self.query_checkpoint())?;
+        let mut excerpts = HashMap::new();
+        let saved =
+            self.repo
+                .summaries_in_period(query, from_ms, until_ms, &mut excerpts, || {
+                    self.query_checkpoint()
+                })?;
         let mut items: HashMap<String, ItemSummary> = saved
             .into_iter()
             .filter(|s| {
@@ -2165,21 +2300,34 @@ impl Actor {
             if p.mutation != Mutation::Content && items.contains_key(&p.item.summary.id) {
                 continue;
             }
-            let body;
-            let item = if p.mutation != Mutation::Content
-                && !search::matches_normalized(&p.item, &needle)
-            {
-                body = self.semantic_item(&p.item.summary.id)?;
-                let Some(body) = body.as_ref() else {
-                    continue;
-                };
-                body
-            } else {
-                &p.item
+            if !scope_matches(p.item.summary.kind, query.scope) {
+                continue;
+            }
+            let metadata = StoredItem {
+                summary: p.item.summary.clone(),
+                text: String::new(),
+                target: p.item.target.clone(),
+                open_with: None,
+                representations: vec![],
             };
-            if scope_matches(p.item.summary.kind, query.scope)
-                && search::matches_normalized(item, &needle)
-            {
+            let metadata_match = search::matches_normalized(&metadata, &needle);
+            let excerpt = if !metadata_match {
+                if p.mutation == Mutation::Content {
+                    search::body_excerpt(&p.item.text, &needle)
+                } else if let Some(body) = self.semantic_item(&p.item.summary.id)? {
+                    search::body_excerpt(&body.text, &needle)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if metadata_match || excerpt.is_some() {
+                if let Some(excerpt) = excerpt {
+                    excerpts.insert(p.item.summary.id.clone(), excerpt);
+                } else {
+                    excerpts.remove(&p.item.summary.id);
+                }
                 items.insert(p.item.summary.id.clone(), p.item.summary.clone());
             }
         }
@@ -2194,8 +2342,19 @@ impl Actor {
         items.truncate(50);
         for summary in items.iter_mut().filter(|_| !needle.is_empty()) {
             self.query_checkpoint()?;
-            if let Some(item) = self.semantic_item(&summary.id)? {
-                summary.subtitle = search::body_subtitle(&item, &needle);
+            if let Some(excerpt) = excerpts.get(&summary.id) {
+                summary.subtitle = search::subtitle_with_excerpt(&summary.subtitle, excerpt);
+            } else {
+                let preview = if let Some(p) = self
+                    .pending
+                    .get(&summary.id)
+                    .filter(|p| p.mutation == Mutation::Content)
+                {
+                    p.item.text.chars().take(152).collect()
+                } else {
+                    self.repo.body_preview(&summary.id)?
+                };
+                summary.subtitle = search::preview_subtitle(&summary.subtitle, &preview, &needle);
             }
         }
         Ok(items)
@@ -2308,7 +2467,13 @@ impl Actor {
             request_id,
             revision: self.queries.semantic_revision.load(Ordering::Acquire),
             source_generation: self.source_generation,
+            data_version: self
+                .repo
+                .connection
+                .query_row("PRAGMA data_version", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?,
             profile: crate::semantic::profile_id(&self.settings.embedding)?,
+            active_profile: crate::semantic_store::active(&self.repo.connection)?,
             scope: self.settings.embedding.index_scope,
             after_rowid: 0,
             disk_done: false,
@@ -2336,7 +2501,11 @@ impl Actor {
         item: StoredItem,
     ) -> Result<(), String> {
         if let Some(candidate) = crate::semantic::candidate(&item, work.scope) {
-            if self.needs_embedding(&work.profile, &candidate)? {
+            if self.needs_embedding_in_profile(
+                &work.profile,
+                &candidate,
+                work.active_profile.as_ref(),
+            )? {
                 work.needs_update = true;
             } else {
                 work.indexed += 1;
@@ -2364,12 +2533,32 @@ impl Actor {
             self.status_work = Some(work);
             return Ok(());
         }
+        if let Some(cache) = self.status_cache.as_ref().filter(|cache| {
+            cache.revision == work.revision
+                && cache.source_generation == work.source_generation
+                && cache.data_version == work.data_version
+                && cache.scope == work.scope
+                && cache.status.profile == work.profile
+        }) {
+            self.emit(Event::SemanticStatus {
+                request_id: work.request_id,
+                status: cache.status.clone(),
+            });
+            return Ok(());
+        }
         if !work.disk_done {
             let mut visited = 0;
-            let (last, done) =
-                crate::semantic_store::page(&self.repo.connection, work.after_rowid, |item| {
+            let (last, done) = crate::semantic_store::page(
+                &self.repo.connection,
+                work.after_rowid,
+                work.scope,
+                |item| {
                     if !self.deleted.contains(&item.summary.id)
-                        && !self.pending.contains_key(&item.summary.id)
+                        && !self
+                            .pending
+                            .get(&item.summary.id)
+                            .is_some_and(|p| p.mutation != Mutation::Metadata)
+                        && let Some(item) = self.semantic_item(&item.summary.id)?
                     {
                         self.inspect_status_item(&mut work, item)?;
                     }
@@ -2377,11 +2566,17 @@ impl Actor {
                     // The callback has consumed this row, so retaining its rowid
                     // resumes without skipping or double-counting a source.
                     Ok(visited < 16 && !self.status_should_yield(&work))
-                })?;
+                },
+            )?;
             work.after_rowid = last;
             work.disk_done = done;
             if done {
-                work.pending_ids = self.pending.keys().cloned().collect();
+                work.pending_ids = self
+                    .pending
+                    .iter()
+                    .filter(|(_, p)| p.mutation != Mutation::Metadata)
+                    .map(|(id, _)| id.clone())
+                    .collect();
             }
         } else {
             for _ in 0..16 {
@@ -2391,19 +2586,32 @@ impl Actor {
                 let Some(id) = work.pending_ids.pop() else {
                     break;
                 };
-                if let Some(item) = self.semantic_item(&id)? {
+                if self
+                    .pending
+                    .get(&id)
+                    .is_some_and(|p| crate::semantic::eligible(&p.item.summary, work.scope))
+                    && let Some(item) = self.semantic_item(&id)?
+                {
                     self.inspect_status_item(&mut work, item)?;
                 }
             }
         }
         if work.disk_done && work.pending_ids.is_empty() && !self.status_should_yield(&work) {
+            let status = SemanticIndexStatus {
+                profile: work.profile,
+                indexed: work.indexed,
+                needs_update: work.needs_update,
+            };
+            self.status_cache = Some(SemanticStatusCache {
+                revision: work.revision,
+                source_generation: work.source_generation,
+                data_version: work.data_version,
+                scope: work.scope,
+                status: status.clone(),
+            });
             self.emit(Event::SemanticStatus {
                 request_id: work.request_id,
-                status: SemanticIndexStatus {
-                    profile: work.profile,
-                    indexed: work.indexed,
-                    needs_update: work.needs_update,
-                },
+                status,
             });
         } else {
             self.status_work = Some(work);
@@ -2430,8 +2638,7 @@ impl Actor {
         } else {
             Mutation::SearchMetadata
         };
-        self.pending
-            .insert(input.id, PendingItem { item, mutation });
+        self.insert_pending(input.id, PendingItem { item, mutation })?;
         self.organizer_reconcile()?;
         self.source_generation += 1;
         self.mark_dirty();
@@ -2465,23 +2672,32 @@ impl Actor {
                 };
                 item.text = saved.text;
             }
+            #[cfg(test)]
+            crate::semantic_store::BODY_BYTES.with(|n| n.set(n.get() + item.text.len()));
             return Ok(Some(item));
         }
-        self.repo.load(id, false)
+        let item = self.repo.load(id, false)?;
+        #[cfg(test)]
+        crate::semantic_store::BODY_BYTES
+            .with(|n| n.set(n.get() + item.as_ref().map_or(0, |i| i.text.len())));
+        Ok(item)
     }
-    fn needs_embedding(
+    fn needs_embedding_in_profile(
         &self,
         profile: &str,
         candidate: &crate::semantic::EmbeddingCandidate,
+        active: Option<&(String, usize)>,
     ) -> Result<bool, String> {
         if self.vectors.profile == profile
             && let Some(vector) = self.vectors.items.get(&candidate.id)
         {
             return Ok(vector.text_hash != candidate.text_hash);
         }
-        Ok(!crate::semantic_store::indexed(
+        if active.is_none_or(|(p, _)| p != profile) {
+            return Ok(true);
+        }
+        Ok(!crate::semantic_store::indexed_in_active_profile(
             &self.repo.connection,
-            profile,
             &candidate.id,
             &candidate.text_hash,
         )?)
@@ -2492,6 +2708,7 @@ impl Actor {
         mut cursor: crate::semantic::IndexCursor,
     ) -> Result<(), String> {
         let profile = self.semantic_profile()?;
+        let active_profile = crate::semantic_store::active(&self.repo.connection)?;
         let continuation = self
             .semantic_scan
             .as_ref()
@@ -2511,22 +2728,27 @@ impl Actor {
             let (last, done) = crate::semantic_store::page(
                 &self.repo.connection,
                 cursor.after_rowid,
-                |mut item| {
+                self.settings.embedding.index_scope,
+                |item| {
                     // Pending content is scanned once in the memory stage instead.
                     if self.deleted.contains(&item.summary.id)
                         || self
                             .pending
                             .get(&item.summary.id)
-                            .is_some_and(|p| p.mutation == Mutation::Content)
+                            .is_some_and(|p| p.mutation != Mutation::Metadata)
                     {
                         return Ok(true);
                     }
-                    if let Some(p) = self.pending.get(&item.summary.id) {
-                        item.summary = p.item.summary.clone()
-                    }
+                    let Some(item) = self.semantic_item(&item.summary.id)? else {
+                        return Ok(true);
+                    };
                     if let Some(candidate) =
                         crate::semantic::candidate(&item, self.settings.embedding.index_scope)
-                        && self.needs_embedding(&profile, &candidate)?
+                        && self.needs_embedding_in_profile(
+                            &profile,
+                            &candidate,
+                            active_profile.as_ref(),
+                        )?
                     {
                         candidates.push(candidate)
                     }
@@ -2551,7 +2773,11 @@ impl Actor {
             .pending
             .iter()
             .filter(|(id, p)| {
-                p.mutation == Mutation::Content
+                p.mutation != Mutation::Metadata
+                    && crate::semantic::eligible(
+                        &p.item.summary,
+                        self.settings.embedding.index_scope,
+                    )
                     && cursor
                         .pending_after_id
                         .as_ref()
@@ -2568,7 +2794,7 @@ impl Actor {
             if let Some(item) = self.semantic_item(&id)?
                 && let Some(candidate) =
                     crate::semantic::candidate(&item, self.settings.embedding.index_scope)
-                && self.needs_embedding(&profile, &candidate)?
+                && self.needs_embedding_in_profile(&profile, &candidate, active_profile.as_ref())?
             {
                 candidates.push(candidate);
                 if candidates.len() == 16 {
@@ -2913,9 +3139,7 @@ impl Actor {
             last_used_ms: old.as_ref().map_or(now, |i| i.summary.last_used_ms),
             use_count: old.as_ref().map_or(0, |i| i.summary.use_count),
         };
-        self.source_generation += 1;
-        self.deleted.remove(&id);
-        self.pending.insert(
+        self.insert_pending(
             id.clone(),
             PendingItem {
                 item: StoredItem {
@@ -2927,7 +3151,9 @@ impl Actor {
                 },
                 mutation: Mutation::Content,
             },
-        );
+        )?;
+        self.source_generation += 1;
+        self.deleted.remove(&id);
         self.organizer_reconcile()?;
         self.organizer_enqueue(crate::organizer::Source::SavedItem { id })?;
         self.mark_dirty();
@@ -2952,8 +3178,12 @@ impl Actor {
             .pending
             .get(&id)
             .map_or(Mutation::Metadata, |p| p.mutation);
-        self.pending
-            .insert(id.clone(), PendingItem { item, mutation });
+        let mutation = if pinned.is_some() && mutation == Mutation::Metadata {
+            Mutation::Eligibility
+        } else {
+            mutation
+        };
+        self.insert_pending(id.clone(), PendingItem { item, mutation })?;
         self.mark_dirty();
         self.emit(Event::Changed);
         if pinned.is_some() {
@@ -2965,6 +3195,27 @@ impl Actor {
         }
         Ok(())
     }
+    fn maintain_wal(&mut self) {
+        // No SQLite transaction is held between commands, even when RAM is
+        // dirty. Service due maintenance here so continuous input cannot starve it.
+        if self
+            .checkpoint_at
+            .is_some_and(|when| when <= Instant::now())
+        {
+            let complete = self.repo.checkpoint();
+            if !complete {
+                let seconds = if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024 {
+                    1
+                } else {
+                    5
+                };
+                self.checkpoint_at = Some(Instant::now() + Duration::from_secs(seconds));
+            } else {
+                self.checkpoint_at = None;
+                self.emergency_checkpoint_retry = None;
+            }
+        }
+    }
     fn run(&mut self, commands: Receiver<QueuedCommand>) -> bool {
         loop {
             // recv_timeout returns queued commands even with a zero timeout; explicitly
@@ -2975,25 +3226,7 @@ impl Actor {
             {
                 self.flush();
             }
-            // No SQLite transaction is held between commands, even when RAM is
-            // dirty. Service due maintenance here so continuous input cannot starve it.
-            if self
-                .checkpoint_at
-                .is_some_and(|when| when <= Instant::now())
-            {
-                let complete = self.repo.checkpoint();
-                if !complete {
-                    let seconds = if self.repo.wal_backlog_bytes() >= 64 * 1024 * 1024 {
-                        1
-                    } else {
-                        5
-                    };
-                    self.checkpoint_at = Some(Instant::now() + Duration::from_secs(seconds));
-                } else {
-                    self.checkpoint_at = None;
-                    self.emergency_checkpoint_retry = None;
-                }
-            }
+            self.maintain_wal();
             let next = match (self.deadline, self.checkpoint_at) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -3093,7 +3326,7 @@ impl Actor {
                     expected_revision,
                     envelope,
                 } => {
-                    let result = self.repo.write_account_vault(expected_revision, &envelope);
+                    let result = self.write_account_vault(expected_revision, &envelope);
                     self.emit(Event::AccountVaultWritten { request_id, result });
                     Ok(())
                 }
@@ -3458,7 +3691,7 @@ impl Actor {
                             continue;
                         }
                     };
-                    self.pending.remove(&id);
+                    self.remove_pending(&id);
                     self.repo
                         .organizer
                         .forget(&crate::organizer::Source::SavedItem { id: id.clone() });
@@ -3576,32 +3809,34 @@ mod status_scheduling_tests {
         for i in 0..180 {
             let id = format!("resident-{i}");
             let target = format!("C:/{}", "𐐀".repeat(1021));
-            actor.pending.insert(
-                id.clone(),
-                PendingItem {
-                    mutation: Mutation::Content,
-                    item: StoredItem {
-                        summary: ItemSummary {
-                            id: id.clone(),
-                            kind: ItemKind::Folder,
-                            title: "𐐀".repeat(256),
-                            subtitle: target.clone(),
-                            alias: "𐐀".repeat(256),
-                            tags: (0..32)
-                                .map(|n| format!("{n:02}{}", "𐐀".repeat(62)))
-                                .collect(),
-                            pinned: false,
-                            created_at_ms: now_ms(),
-                            last_used_ms: now_ms(),
-                            use_count: 0,
+            actor
+                .insert_pending(
+                    id.clone(),
+                    PendingItem {
+                        mutation: Mutation::Content,
+                        item: StoredItem {
+                            summary: ItemSummary {
+                                id: id.clone(),
+                                kind: ItemKind::Folder,
+                                title: "𐐀".repeat(256),
+                                subtitle: target.clone(),
+                                alias: "𐐀".repeat(256),
+                                tags: (0..32)
+                                    .map(|n| format!("{n:02}{}", "𐐀".repeat(62)))
+                                    .collect(),
+                                pinned: false,
+                                created_at_ms: now_ms(),
+                                last_used_ms: now_ms(),
+                                use_count: 0,
+                            },
+                            text: String::new(),
+                            representations: vec![],
+                            target: Some(target),
+                            open_with: None,
                         },
-                        text: String::new(),
-                        representations: vec![],
-                        target: Some(target),
-                        open_with: None,
                     },
-                },
-            );
+                )
+                .unwrap();
             actor.organizer_enqueue(Source::SavedItem { id }).unwrap();
         }
         assert!(actor.repo.organizer.saturated);
@@ -3685,9 +3920,12 @@ mod status_scheduling_tests {
             options: EngineOptions::new(":memory:".into()),
             settings,
             pending: HashMap::new(),
+            pending_payload: 0,
+            pending_metadata: 0,
             vectors: crate::semantic_store::PendingVectors::default(),
             semantic_scan: None,
             status_work: None,
+            status_cache: None,
             source_generation: 0,
             queries: Arc::new(Queries::default()),
             query_guard: None,
@@ -3986,5 +4224,624 @@ mod status_scheduling_tests {
                 .iter()
                 .any(|e| matches!(e, Event::SemanticStatus { .. } | Event::Error { .. }))
         );
+    }
+    #[test]
+    fn task3_fixed_scope_does_not_materialize_unpinned_bodies() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 80, false, true);
+        actor
+            .repo
+            .connection
+            .execute("UPDATE items SET text=?1", ["合成未固定正文".repeat(16384)])
+            .unwrap();
+        actor.settings.embedding.index_scope = crate::semantic::IndexScope::PinnedAndFavorites;
+        crate::semantic_store::BODY_BYTES.with(|n| n.set(0));
+        let start = Instant::now();
+        actor.semantic_status(100).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        let bytes = crate::semantic_store::BODY_BYTES.with(|n| n.get());
+        println!(
+            "fixed scope: logical materialized body bytes={bytes}, elapsed={:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 0 && !status.needs_update)
+        );
+        assert_eq!(
+            bytes, 0,
+            "out-of-scope bodies must be filtered before materialization"
+        );
+    }
+    #[test]
+    fn task3_metadata_top50_has_bounded_excerpt_work() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 50, false, true);
+        actor
+            .repo
+            .connection
+            .execute(
+                "UPDATE items SET text=?1",
+                ["状态来源 合成正文".repeat(16384)],
+            )
+            .unwrap();
+        search::NORMALIZED_BYTES.with(|n| n.set(0));
+        crate::repository::FULL_BODY_READS.with(|n| n.set((0, 0)));
+        crate::repository::PREVIEW_BYTES.with(|n| n.set(0));
+        let start = Instant::now();
+        let rows = actor
+            .collect_search(
+                &SearchQuery {
+                    request_id: 100,
+                    text: "状态来源".into(),
+                    scope: Scope::All,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let bytes = search::NORMALIZED_BYTES.with(|n| n.get());
+        let full = crate::repository::FULL_BODY_READS.with(|n| n.get());
+        let preview = crate::repository::PREVIEW_BYTES.with(|n| n.get());
+        println!(
+            "metadata Top50: normalized bytes={bytes}, full body reads={full:?}, preview bytes={preview}, elapsed={:?}",
+            start.elapsed()
+        );
+        assert_eq!(full, (0, 0));
+        assert!(preview <= 50 * 152 * 4);
+        assert_eq!(rows.len(), 50);
+        assert!(rows.iter().all(|r| r.subtitle.contains("合成正文")));
+        assert!(
+            bytes < 512 * 1024,
+            "preview work scales with complete bodies: {bytes}"
+        );
+    }
+    #[test]
+    fn task3_used_and_duplicate_capture_keep_partial_status_progress() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 64, true, true);
+        actor.semantic_status(101).unwrap();
+        actor.status_step().unwrap();
+        let before = actor.status_work.as_ref().unwrap().indexed;
+        let id: String = actor
+            .repo
+            .connection
+            .query_row("SELECT id FROM items LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        actor.queries.note_reliable(&Command::Used(id.clone()));
+        actor.modify(id, None).unwrap();
+        let capture = ClipboardSnapshot {
+            text: "状态来源 1".into(),
+            representations: vec![],
+            source_app: "fixture".into(),
+            captured_at_ms: now_ms(),
+        };
+        actor
+            .queries
+            .note_reliable(&Command::Capture(capture.clone()));
+        actor.capture(capture).unwrap();
+        assert!(actor.flush());
+        actor.status_step().unwrap();
+        assert_eq!(actor.status_work.as_ref().unwrap().indexed, before + 16);
+    }
+    #[test]
+    fn task3_pending_capture_accounting_is_linear() {
+        for count in [128, 512] {
+            let (mut actor, _) = actor_fixture();
+            COUNTED_ITEMS.with(|n| n.set(0));
+            let start = Instant::now();
+            for i in 0..count {
+                let text = format!("{i:04}{}", "x".repeat(65536 / count - 4));
+                actor
+                    .capture(ClipboardSnapshot {
+                        text,
+                        representations: vec![],
+                        source_app: "fixture".into(),
+                        captured_at_ms: now_ms(),
+                    })
+                    .unwrap();
+            }
+            assert_eq!(actor.pending_bytes(), 65536);
+            let visits = COUNTED_ITEMS.with(|n| n.get());
+            println!(
+                "pending entries={count}, payload counter visits={visits}, elapsed={:?}",
+                start.elapsed()
+            );
+            assert!(
+                visits <= count * 4,
+                "cumulative accounting must be linear: {visits}"
+            );
+        }
+    }
+
+    fn synthetic_envelope(size: usize) -> Vec<u8> {
+        let mut envelope = b"QPVAULT\0".to_vec();
+        for value in [1u32, 2, 19, 65536, 3, 1, 32] {
+            envelope.extend(value.to_le_bytes());
+        }
+        envelope.extend([0; 40]);
+        envelope.extend((size as u32).to_le_bytes());
+        envelope.extend(vec![0; size]);
+        envelope
+    }
+    #[test]
+    fn task3_vault_only_write_rearms_wal_after_completed_history_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("vault-maintenance.sqlite");
+        let (mut actor, events) = actor_fixture();
+        actor.repo = Repository::open(&path).unwrap();
+        seed_sources(&mut actor, &events, 1, false, true);
+        assert!(actor.repo.checkpoint());
+        actor.checkpoint_at = None;
+        let (sender, received) = mpsc::channel();
+        queue(
+            &sender,
+            &actor.queries,
+            Command::WriteAccountVault {
+                request_id: 101,
+                expected_revision: 0,
+                envelope: synthetic_envelope(1024),
+            },
+        );
+        queue(&sender, &actor.queries, Command::Shutdown);
+        assert!(actor.run(received));
+        assert!(
+            events
+                .try_iter()
+                .any(|e| matches!(e, Event::AccountVaultWritten { result: Ok(1), .. }))
+        );
+        assert!(
+            actor.checkpoint_at.is_some(),
+            "a real vault transaction must arm maintenance even after an earlier checkpoint cleared it"
+        );
+        assert_eq!(
+            actor.repo.wal_backlog_bytes(),
+            0,
+            "normal exit checkpoints vault writes"
+        );
+        let db = rusqlite::Connection::open(path).unwrap();
+        assert_eq!(
+            db.query_row("SELECT revision FROM account_vault", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn task3_pending_metadata_cannot_bypass_headroom_when_empty() {
+        let (mut actor, _) = actor_fixture();
+        let result = actor.capture(ClipboardSnapshot {
+            text: "tiny payload".into(),
+            source_app: "x".repeat(4 * 1024 * 1024 + 1),
+            representations: vec![],
+            captured_at_ms: now_ms(),
+        });
+        assert!(result.is_err(), "unbounded source metadata was accepted");
+        assert!(actor.pending.is_empty());
+        assert_eq!(actor.pending_bytes(), 0);
+    }
+
+    #[test]
+    fn task3_tail_match_reuses_confirmation_without_second_body_read() {
+        let (mut actor, events) = actor_fixture();
+        let text = format!("合成标题\n{}İ尾部needle", "无".repeat(65536));
+        actor
+            .capture(ClipboardSnapshot {
+                text,
+                representations: vec![],
+                source_app: "fixture".into(),
+                captured_at_ms: now_ms(),
+            })
+            .unwrap();
+        assert!(actor.flush());
+        while events.try_recv().is_ok() {}
+        crate::repository::FULL_BODY_READS.with(|n| n.set((0, 0)));
+        let rows = actor
+            .collect_search(
+                &SearchQuery {
+                    text: "i\u{307}尾部needle".into(),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let reads = crate::repository::FULL_BODY_READS.with(|n| n.get());
+        println!("Unicode tail: full body reads={reads:?}");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].subtitle.contains("İ尾部needle"));
+        assert_eq!(reads.0, 1, "reuse the excerpt from literal confirmation");
+    }
+    #[test]
+    fn task3_status_reads_active_profile_once_for_entire_scan() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 64, true, true);
+        crate::semantic_store::PROFILE_READS.with(|n| n.set(0));
+        actor.semantic_status(105).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 64 && !status.needs_update)
+        );
+        assert_eq!(crate::semantic_store::PROFILE_READS.with(|n| n.get()), 1);
+    }
+    #[test]
+    fn task3_pending_entry_limit_survives_failed_flush_and_retry() {
+        let (mut actor, _) = actor_fixture();
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        for i in 0..4096 {
+            actor
+                .capture(ClipboardSnapshot {
+                    text: format!("{i:04}"),
+                    representations: vec![],
+                    source_app: "fixture".into(),
+                    captured_at_ms: now_ms(),
+                })
+                .unwrap();
+        }
+        assert_eq!(actor.pending.len(), 4096);
+        assert_eq!(actor.pending_bytes(), 16384);
+        assert!(
+            actor
+                .capture(ClipboardSnapshot {
+                    text: "next".into(),
+                    representations: vec![],
+                    source_app: "fixture".into(),
+                    captured_at_ms: now_ms()
+                })
+                .is_err()
+        );
+        assert_eq!(actor.pending_bytes(), 16384);
+        actor
+            .capture(ClipboardSnapshot {
+                text: "0001".into(),
+                representations: vec![],
+                source_app: "fixture".into(),
+                captured_at_ms: now_ms(),
+            })
+            .unwrap();
+        assert_eq!(
+            actor.pending_bytes(),
+            16384,
+            "dedupe must subtract its old retained value"
+        );
+        let id = content_id(&ClipboardSnapshot {
+            text: "0001".into(),
+            representations: vec![],
+            source_app: "fixture".into(),
+            captured_at_ms: now_ms(),
+        });
+        actor.remove_pending(&id);
+        assert_eq!(actor.pending_bytes(), 16380);
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=OFF")
+            .unwrap();
+        assert!(actor.flush());
+        assert_eq!(actor.pending_bytes(), 0);
+        assert_eq!(actor.pending_metadata, 0);
+    }
+
+    #[test]
+    fn task3_vault_pressure_replay_and_due_maintenance_leave_history_buffered() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("pressure.sqlite");
+        let (mut actor, events) = actor_fixture();
+        actor.repo = Repository::open(&path).unwrap();
+        seed_sources(&mut actor, &events, 1, false, false);
+        let mut envelope = synthetic_envelope(1024 * 1024);
+        for revision in 0..20 {
+            envelope[80..].fill(revision as u8);
+            assert_eq!(
+                actor.write_account_vault(revision, &envelope).unwrap(),
+                revision + 1
+            );
+        }
+        let backlog = actor.repo.wal_backlog_bytes();
+        println!(
+            "vault logical WAL backlog={backlog}, pending history={}",
+            actor.pending.len()
+        );
+        assert!(backlog >= 16 * 1024 * 1024);
+        assert!(actor.checkpoint_at.unwrap() <= Instant::now() + Duration::from_secs(30));
+        assert_eq!(
+            actor
+                .repo
+                .connection
+                .query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        actor.checkpoint_at = Some(Instant::now());
+        actor.maintain_wal();
+        assert_eq!(actor.repo.wal_backlog_bytes(), 0);
+        assert!(actor.checkpoint_at.is_none());
+        assert_eq!(actor.write_account_vault(19, &envelope).unwrap(), 20);
+        assert!(
+            actor.checkpoint_at.is_none(),
+            "read-only replay must not create maintenance work"
+        );
+        assert_eq!(actor.pending.len(), 1);
+        assert_eq!(actor.commits, 0);
+        assert_eq!(
+            actor
+                .repo
+                .connection
+                .query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(events.try_iter().all(|e| !matches!(e, Event::Saved(_))));
+    }
+    #[test]
+    fn task3_semantic_page_merges_failed_save_overlays_before_body_loading() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 4, false, true);
+        let mut ids: Vec<String> = actor
+            .repo
+            .connection
+            .prepare("SELECT id FROM items ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        actor.modify(ids[1].clone(), Some(true)).unwrap();
+        actor.modify(ids[2].clone(), Some(true)).unwrap();
+        actor.settings.embedding.index_scope = crate::semantic::IndexScope::PinnedAndFavorites;
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        actor.modify(ids[0].clone(), Some(true)).unwrap();
+        actor.modify(ids[1].clone(), Some(false)).unwrap();
+        actor.deleted.insert(ids[2].clone());
+        let capture = ClipboardSnapshot {
+            text: "new pending pinned".into(),
+            representations: vec![],
+            source_app: "fixture".into(),
+            captured_at_ms: now_ms(),
+        };
+        let new_id = content_id(&capture);
+        actor.capture(capture).unwrap();
+        actor.modify(new_id.clone(), Some(true)).unwrap();
+        while events.try_recv().is_ok() {}
+        let mut cursor = crate::semantic::IndexCursor::default();
+        let mut actual = Vec::new();
+        loop {
+            actor.prepare_semantic_index(201, cursor).unwrap();
+            let Event::SemanticBatch(batch) = events.recv().unwrap() else {
+                panic!("expected batch");
+            };
+            actual.extend(batch.candidates.into_iter().map(|c| c.id));
+            if batch.done {
+                break;
+            }
+            cursor = batch.cursor;
+        }
+        actual.sort();
+        let mut expected = vec![ids.remove(0), new_id];
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "saved pin/unpin/delete and new unsaved pin must be merged"
+        );
+        actor.semantic_status(202).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 0 && status.needs_update)
+        );
+    }
+
+    #[test]
+    fn task3_used_cannot_grow_metadata_past_headroom_during_save_failure() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 1, false, true);
+        let id: String = actor
+            .repo
+            .connection
+            .query_row("SELECT id FROM items", [], |r| r.get(0))
+            .unwrap();
+        // One retained metadata row fills the independent metadata headroom;
+        // subsequent Used of a different saved row must observe that pressure.
+        actor
+            .capture(ClipboardSnapshot {
+                text: "buffered".into(),
+                source_app: "x".repeat(4 * 1024 * 1024 - 660),
+                representations: vec![],
+                captured_at_ms: now_ms(),
+            })
+            .unwrap();
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        assert!(
+            actor.modify(id, None).is_err(),
+            "Used must not grow an already full pending metadata budget"
+        );
+        assert!(actor.pending_metadata <= 4 * 1024 * 1024);
+    }
+    #[test]
+    fn task3_eligibility_commit_restarts_cursor_before_pending_stage_is_lost() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 1, false, true);
+        actor.settings.embedding.index_scope = crate::semantic::IndexScope::PinnedAndFavorites;
+        let id: String = actor
+            .repo
+            .connection
+            .query_row("SELECT id FROM items", [], |r| r.get(0))
+            .unwrap();
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=ON")
+            .unwrap();
+        actor.modify(id.clone(), Some(true)).unwrap();
+        while events.try_recv().is_ok() {}
+        actor
+            .prepare_semantic_index(301, crate::semantic::IndexCursor::default())
+            .unwrap();
+        let Event::SemanticBatch(first) = events.recv().unwrap() else {
+            panic!("batch expected");
+        };
+        assert!(first.cursor.disk_done && first.candidates.is_empty());
+        actor
+            .repo
+            .connection
+            .execute_batch("PRAGMA query_only=OFF")
+            .unwrap();
+        assert!(actor.flush());
+        while events.try_recv().is_ok() {}
+        actor.prepare_semantic_index(302, first.cursor).unwrap();
+        let Event::SemanticBatch(second) = events.recv().unwrap() else {
+            panic!("batch expected");
+        };
+        assert_eq!(
+            second.candidates.len(),
+            1,
+            "flushed pin must not vanish between disk and pending stages"
+        );
+        assert_eq!(second.candidates[0].id, id);
+    }
+    #[test]
+    fn task3_completed_status_reuses_counts_after_used_and_duplicate_capture() {
+        let (mut actor, events) = actor_fixture();
+        seed_sources(&mut actor, &events, 32, true, true);
+        actor.semantic_status(401).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 32)
+        );
+        let capture = ClipboardSnapshot {
+            text: "状态来源 1".into(),
+            representations: vec![],
+            source_app: "fixture".into(),
+            captured_at_ms: now_ms(),
+        };
+        let id = content_id(&capture);
+        actor.queries.note_reliable(&Command::Used(id.clone()));
+        actor.modify(id, None).unwrap();
+        actor
+            .queries
+            .note_reliable(&Command::Capture(capture.clone()));
+        actor.capture(capture).unwrap();
+        assert!(actor.flush());
+        while events.try_recv().is_ok() {}
+        crate::semantic_store::BODY_BYTES.with(|n| n.set(0));
+        actor.semantic_status(402).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { request_id: 402, status } if status.indexed == 32 && !status.needs_update)
+        );
+        assert_eq!(
+            crate::semantic_store::BODY_BYTES.with(|n| n.get()),
+            0,
+            "a new request with unchanged derived inputs must reuse completed counts"
+        );
+        actor.settings.embedding.index_scope = crate::semantic::IndexScope::PinnedAndFavorites;
+        actor.semantic_status(403).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        assert!(
+            matches!(events.recv().unwrap(), Event::SemanticStatus { status, .. } if status.indexed == 0 && !status.needs_update)
+        );
+    }
+    fn completed_status(
+        actor: &mut Actor,
+        events: &Receiver<Event>,
+        request_id: u64,
+    ) -> SemanticIndexStatus {
+        while events.try_recv().is_ok() {}
+        actor.semantic_status(request_id).unwrap();
+        while actor.status_work.is_some() {
+            actor.status_step().unwrap();
+        }
+        match events.recv().unwrap() {
+            Event::SemanticStatus {
+                request_id: actual,
+                status,
+            } => {
+                assert_eq!(actual, request_id);
+                status
+            }
+            _ => panic!("status expected"),
+        }
+    }
+    #[test]
+    fn task3_status_cache_tracks_vectors_external_deletion_profile_and_canceled_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("status-cache.sqlite");
+        let (mut actor, events) = actor_fixture();
+        actor.repo = Repository::open(&path).unwrap();
+        seed_sources(&mut actor, &events, 1, false, false);
+        let vectors = ram_vectors(&actor);
+        assert!(actor.flush());
+        assert!(completed_status(&mut actor, &events, 501).needs_update);
+        let generation = actor.source_generation;
+        let profile = actor.semantic_profile().unwrap();
+        actor.queries.note_reliable(&Command::StoreEmbeddings {
+            request_id: 502,
+            profile: profile.clone(),
+            items: vectors.clone(),
+        });
+        actor.store_embeddings(502, profile, vectors).unwrap();
+        assert_eq!(
+            actor.source_generation, generation,
+            "vector-only changes must not move source cursors"
+        );
+        let status = completed_status(&mut actor, &events, 503);
+        assert_eq!(status.indexed, 1);
+        assert!(!status.needs_update);
+        assert!(actor.flush());
+        assert_eq!(actor.source_generation, generation);
+        assert_eq!(completed_status(&mut actor, &events, 504).indexed, 1);
+        // Preparing and abandoning a batch (UI cancellation has no actor mutation)
+        // does not change the derived data; its next status reuses the counts.
+        actor
+            .prepare_semantic_index(505, crate::semantic::IndexCursor::default())
+            .unwrap();
+        crate::semantic_store::BODY_BYTES.with(|n| n.set(0));
+        assert_eq!(completed_status(&mut actor, &events, 506).indexed, 1);
+        assert_eq!(crate::semantic_store::BODY_BYTES.with(|n| n.get()), 0);
+        let external = rusqlite::Connection::open(&path).unwrap();
+        external
+            .execute("DELETE FROM semantic_vectors", [])
+            .unwrap();
+        let status = completed_status(&mut actor, &events, 507);
+        assert_eq!(status.indexed, 0);
+        assert!(status.needs_update);
+        actor.settings.embedding.model = "changed-fixture".into();
+        let status = completed_status(&mut actor, &events, 508);
+        assert_eq!(status.profile, actor.semantic_profile().unwrap());
+        assert_eq!(status.indexed, 0);
+        assert!(status.needs_update);
+        let id: String = actor
+            .repo
+            .connection
+            .query_row("SELECT id FROM items", [], |r| r.get(0))
+            .unwrap();
+        actor.queries.note_reliable(&Command::Delete(id.clone()));
+        actor.deleted.insert(id);
+        let status = completed_status(&mut actor, &events, 509);
+        assert_eq!(status.indexed, 0);
+        assert!(!status.needs_update);
     }
 }

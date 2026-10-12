@@ -111,6 +111,10 @@ fn has_input_text(text: &str) -> bool {
         .any(|character| sendable_character(character) && !character.is_whitespace())
 }
 
+pub(crate) fn eligible(summary: &crate::model::ItemSummary, scope: IndexScope) -> bool {
+    summary.kind != ItemKind::Clipboard || scope == IndexScope::AllText || summary.pinned
+}
+
 pub fn candidate(item: &StoredItem, scope: IndexScope) -> Option<EmbeddingCandidate> {
     let clipboard = item.summary.kind == ItemKind::Clipboard;
     if clipboard

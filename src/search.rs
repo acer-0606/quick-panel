@@ -5,7 +5,12 @@ use std::collections::BTreeSet;
 /// Persisted FTS contents must be rebuilt when the token representation changes.
 pub const INDEX_VERSION: u32 = 4;
 
+#[cfg(test)]
+thread_local! { pub(crate) static NORMALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 pub(crate) fn normalize(text: &str) -> String {
+    #[cfg(test)]
+    NORMALIZED_BYTES.with(|n| n.set(n.get() + text.len()));
     text.chars()
         .flat_map(char::to_lowercase)
         .map(|ch| if ch == '\\' { '/' } else { ch })
@@ -256,33 +261,59 @@ pub fn phonetic_prefix_expression(query: &str) -> String {
     format!("\"{}\"", prefix_token(&normalize(query.trim()), 3))
 }
 
-/// Presentation-only excerpt. Original summaries and bodies remain untouched.
-pub(crate) fn body_subtitle(item: &StoredItem, needle: &str) -> String {
-    if needle.is_empty() {
-        return item.summary.subtitle.clone();
+/// Streaming Unicode lowercase matching: retain only the query and its scalar
+/// offsets. A lowercase expansion maps every generated scalar to its original
+/// byte offset, including a match beginning in the middle of that expansion.
+pub(crate) fn body_excerpt(text: &str, needle: &str) -> Option<String> {
+    let pattern: Vec<char> = needle.chars().collect();
+    if pattern.is_empty() {
+        return None;
     }
-    let normalized = normalize(&item.text);
-    let Some(position) = normalized.find(needle) else {
-        return item.summary.subtitle.clone();
-    };
-    let preceding = normalized[..position].chars().count();
-    // Lowercasing can expand a scalar (İ); map back to original scalar positions.
-    let mut normalized_chars = 0;
-    let start_match = item
-        .text
-        .chars()
-        .position(|c| {
-            let at = normalized_chars;
-            normalized_chars += c.to_lowercase().count();
-            at >= preceding
-        })
-        .unwrap_or(0);
-    let start = start_match.saturating_sub(32);
-    let excerpt: String = item
-        .text
-        .chars()
-        .skip(start)
-        .take(120)
+    let mut prefix = vec![0; pattern.len()];
+    for i in 1..pattern.len() {
+        let mut j = prefix[i - 1];
+        while j > 0 && pattern[i] != pattern[j] {
+            j = prefix[j - 1];
+        }
+        if pattern[i] == pattern[j] {
+            j += 1;
+        }
+        prefix[i] = j;
+    }
+    let mut offsets = std::collections::VecDeque::with_capacity(pattern.len());
+    let mut matched = 0;
+    for (offset, original) in text.char_indices() {
+        for character in original
+            .to_lowercase()
+            .map(|c| if c == '\\' { '/' } else { c })
+        {
+            if offsets.len() == pattern.len() {
+                offsets.pop_front();
+            }
+            offsets.push_back(offset);
+            while matched > 0 && character != pattern[matched] {
+                matched = prefix[matched - 1];
+            }
+            if character == pattern[matched] {
+                matched += 1;
+            }
+            if matched == pattern.len() {
+                let position = *offsets.front().unwrap();
+                let start = text[..position]
+                    .char_indices()
+                    .rev()
+                    .nth(31)
+                    .map_or(0, |(i, _)| i);
+                let excerpt = clean_excerpt(&text[start..], 120);
+                return Some(format!("{}{excerpt}", if start > 0 { "…" } else { "" }));
+            }
+        }
+    }
+    None
+}
+fn clean_excerpt(text: &str, limit: usize) -> String {
+    text.chars()
+        .take(limit)
         .map(|c| {
             if c.is_whitespace() || c.is_control() {
                 ' '
@@ -290,19 +321,17 @@ pub(crate) fn body_subtitle(item: &StoredItem, needle: &str) -> String {
                 c
             }
         })
-        .collect();
-    let source: String = item
-        .summary
-        .subtitle
-        .chars()
-        .take(80)
-        .map(|c| {
-            if c.is_whitespace() || c.is_control() {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    format!("{source} · {}{excerpt}", if start > 0 { "…" } else { "" })
+        .collect()
+}
+pub(crate) fn subtitle_with_excerpt(source: &str, excerpt: &str) -> String {
+    format!("{} · {excerpt}", clean_excerpt(source, 80))
+}
+pub(crate) fn preview_subtitle(source: &str, text: &str, needle: &str) -> String {
+    if text.is_empty() {
+        return source.into();
+    }
+    // Callers pass at most 152 original characters, including context after a
+    // possible match. Never scan a complete body just to display a metadata hit.
+    let excerpt = body_excerpt(text, needle).unwrap_or_else(|| clean_excerpt(text, 120));
+    subtitle_with_excerpt(source, &excerpt)
 }

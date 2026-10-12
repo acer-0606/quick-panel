@@ -44,11 +44,12 @@ impl Repository {
     pub(crate) fn read_account_vault(&self) -> Result<Option<VaultSnapshot>, String> {
         read(&self.connection)
     }
+    /// Return the durable revision and whether this call committed a write.
     pub(crate) fn write_account_vault(
         &mut self,
         expected: u64,
         envelope: &[u8],
-    ) -> Result<u64, String> {
+    ) -> Result<(u64, bool), String> {
         validate_envelope(envelope)?;
         let next = expected
             .checked_add(1)
@@ -56,7 +57,7 @@ impl Repository {
             .ok_or(STORE_ERROR)?;
         // Idempotent replay is read-only, including after a lost success receipt.
         if read(&self.connection)?.is_some_and(|s| s.revision == next && s.envelope == envelope) {
-            return Ok(next);
+            return Ok((next, false));
         }
         let tx = self
             .connection
@@ -67,7 +68,7 @@ impl Repository {
             .as_ref()
             .is_some_and(|s| s.revision == next && s.envelope == envelope)
         {
-            return Ok(next);
+            return Ok((next, false));
         }
         if previous.as_ref().map_or(0, |s| s.revision) != expected {
             return Err("账号保险箱已更改，请重新解锁".into());
@@ -75,7 +76,7 @@ impl Repository {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS account_vault (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL CHECK(revision>0), envelope BLOB NOT NULL CHECK(length(envelope)<=4194304))").map_err(|_|STORE_ERROR)?;
         tx.execute("INSERT INTO account_vault(id,revision,envelope) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,envelope=excluded.envelope",params![next as i64,envelope]).map_err(|_|STORE_ERROR)?;
         tx.commit().map_err(|_| STORE_ERROR)?;
-        Ok(next)
+        Ok((next, true))
     }
 }
 

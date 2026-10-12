@@ -134,7 +134,11 @@ pub(crate) fn embedding_bytes(item: &IndexedEmbedding) -> usize {
         .saturating_add(item.vector.capacity().saturating_mul(4))
         .saturating_add(192)
 }
+#[cfg(test)]
+thread_local! { pub(crate) static PROFILE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub(crate) fn active(db: &Connection) -> Result<Option<(String, usize)>, String> {
+    #[cfg(test)]
+    PROFILE_READS.with(|n| n.set(n.get() + 1));
     let exists: i64 = db
         .query_row(
             "SELECT count(*) FROM sqlite_master WHERE name='semantic_profile'",
@@ -153,15 +157,12 @@ pub(crate) fn active(db: &Connection) -> Result<Option<(String, usize)>, String>
     .optional()
     .map_err(|e| e.to_string())
 }
-pub(crate) fn indexed(
+/// Caller reuses the verified active profile for its current scan.
+pub(crate) fn indexed_in_active_profile(
     db: &Connection,
-    profile: &str,
     id: &str,
     hash: &str,
 ) -> Result<bool, String> {
-    if active(db)?.is_none_or(|(p, _)| p != profile) {
-        return Ok(false);
-    }
     db.query_row(
         "SELECT EXISTS(SELECT 1 FROM semantic_map m JOIN semantic_vectors v ON v.rowid=m.rowid WHERE m.item_id=?1 AND m.text_hash=?2)",
         params![id, hash],
@@ -169,15 +170,23 @@ pub(crate) fn indexed(
     )
     .map_err(|e| e.to_string())
 }
-/// Inspect at most 128 sources and hold only one full body at a time. The
-/// callback stops at 16 output candidates without loading subsequent bodies.
+#[cfg(test)]
+thread_local! { pub(crate) static BODY_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+/// Return at most 128 scope-eligible metadata rows. The actor merges pending
+/// eligibility/content/deletion before loading any body, then stops at its quota.
 pub(crate) fn page(
     db: &Connection,
     after: i64,
+    scope: crate::semantic::IndexScope,
     mut visit: impl FnMut(StoredItem) -> Result<bool, String>,
 ) -> Result<(i64, bool), String> {
-    let mut stmt=db.prepare("SELECT rowid,summary,text,target,open_with FROM items WHERE rowid>?1 ORDER BY rowid LIMIT 128").map_err(|e|e.to_string())?;
-    let mut rows = stmt.query([after]).map_err(|e| e.to_string())?;
+    let mut stmt=db.prepare("SELECT rowid,summary,target,open_with FROM items WHERE rowid>?1 AND (?2 OR kind<>0 OR pinned=1) ORDER BY rowid LIMIT 128").map_err(|e|e.to_string())?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            after,
+            scope == crate::semantic::IndexScope::AllText
+        ])
+        .map_err(|e| e.to_string())?;
     let mut last = after;
     let mut count = 0;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
@@ -186,9 +195,9 @@ pub(crate) fn page(
         let item = StoredItem {
             summary: serde_json::from_str(&row.get::<_, String>(1).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?,
-            text: row.get(2).map_err(|e| e.to_string())?,
-            target: row.get(3).map_err(|e| e.to_string())?,
-            open_with: row.get(4).map_err(|e| e.to_string())?,
+            text: String::new(),
+            target: row.get(2).map_err(|e| e.to_string())?,
+            open_with: row.get(3).map_err(|e| e.to_string())?,
             representations: vec![],
         };
         if !visit(item)? {
@@ -238,7 +247,10 @@ pub(crate) fn commit(
         remove(db, id)?;
     }
     for (id, change) in changes {
-        if change.mutation != crate::repository::Mutation::Metadata {
+        if !matches!(
+            change.mutation,
+            crate::repository::Mutation::Metadata | crate::repository::Mutation::Eligibility
+        ) {
             let mut source = change.item.clone();
             if change.mutation == crate::repository::Mutation::SearchMetadata {
                 source.text = db
