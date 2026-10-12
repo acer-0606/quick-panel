@@ -81,3 +81,22 @@ fn ordinary_windows_allocate_list_space_without_unnecessary_outer_scrolling() {
         600
     );
 }
+
+#[test]
+fn moving_a_clipped_panel_does_not_replace_manual_size_preference() {
+    let mut size = PanelSize::default();
+    size.remember(900, 700, 96);
+    let clipped = size.physical(96, 600, 500, false);
+    assert_eq!(clipped, (600, 500));
+    size.begin_move_or_size();
+    size.finish_move_or_size(clipped.0, clipped.1, 96);
+    assert_eq!(size.physical(96, 2000, 1200, false), (900, 700));
+    size.begin_move_or_size();
+    size.user_sizing();
+    size.finish_move_or_size(750, 550, 96);
+    assert_eq!(size.physical(96, 2000, 1200, false), (750, 550));
+    // A subsequent pure move cannot inherit the previous sizing intent.
+    size.begin_move_or_size();
+    size.finish_move_or_size(600, 500, 96);
+    assert_eq!(size.physical(96, 2000, 1200, false), (750, 550));
+}

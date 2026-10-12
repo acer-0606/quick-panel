@@ -3780,6 +3780,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
             Err(_) => {
                 match msg {
                     WM_DPICHANGED => host.defer(Deferred::Dpi(wp, *(lp.0 as *const RECT))),
+                    // Only remember intent, never retain WM_SIZING's stack RECT.
+                    WM_SIZING => host.defer(Deferred::Message(msg, wp, LPARAM(0))),
                     ENGINE_WAKE
                     | WORK_WAKE
                     | ORGANIZER_UI_WAKE
@@ -3790,6 +3792,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     | WM_ACTIVATE
                     | WM_SIZE
                     | WM_EXITSIZEMOVE
+                    | WM_ENTERSIZEMOVE
                     | WM_VSCROLL
                     | WM_MOUSEWHEEL
                     | super::scroll_layout::REVEAL
@@ -3817,6 +3820,26 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     };
     host.drain_effects();
     result.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wp, lp))
+}
+
+/// Move and DPI size messages cannot replace a manual size preference.
+/// WM_SIZING's transient RECT pointer is deliberately never read or deferred.
+unsafe fn panel_size_message(
+    size: &mut crate::ui_layout::PanelSize,
+    hwnd: HWND,
+    msg: u32,
+    dpi: u32,
+) {
+    match msg {
+        WM_ENTERSIZEMOVE => size.begin_move_or_size(),
+        WM_SIZING => size.user_sizing(),
+        WM_EXITSIZEMOVE => {
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            size.finish_move_or_size(rect.right - rect.left, rect.bottom - rect.top, dpi);
+        }
+        _ => {}
+    }
 }
 
 unsafe fn app_message(
@@ -3947,12 +3970,9 @@ unsafe fn app_message(
             app.hide();
             return Some(LRESULT(0));
         }
-        WM_EXITSIZEMOVE => {
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut rect);
-            app.panel_size
-                .remember(rect.right - rect.left, rect.bottom - rect.top, app.dpi);
-            return Some(LRESULT(0));
+        WM_ENTERSIZEMOVE | WM_SIZING | WM_EXITSIZEMOVE => {
+            panel_size_message(&mut app.panel_size, hwnd, msg, app.dpi);
+            return Some(LRESULT(if msg == WM_SIZING { 1 } else { 0 }));
         }
         WM_VSCROLL | WM_MOUSEWHEEL | super::scroll_layout::REVEAL => {
             app.scroll_layout.borrow_mut().message(hwnd, msg, wp, lp);
@@ -5149,5 +5169,86 @@ impl Host {
             }
         }
         self.effects_running.set(false);
+    }
+}
+
+#[cfg(test)]
+mod panel_size_tests {
+    use super::*;
+    unsafe extern "system" fn sizing_proc(
+        hwnd: HWND,
+        msg: u32,
+        wp: WPARAM,
+        lp: LPARAM,
+        _id: usize,
+        data: usize,
+    ) -> LRESULT {
+        if matches!(msg, WM_ENTERSIZEMOVE | WM_SIZING | WM_EXITSIZEMOVE) {
+            panel_size_message(
+                &mut (*(data as *const RefCell<crate::ui_layout::PanelSize>)).borrow_mut(),
+                hwnd,
+                msg,
+                96,
+            );
+            return LRESULT(if msg == WM_SIZING { 1 } else { 0 });
+        }
+        DefSubclassProc(hwnd, msg, wp, lp)
+    }
+    #[test]
+    fn native_move_size_messages_preserve_clipped_preference_and_accept_real_sizing() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("合成尺寸fixture"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                900,
+                700,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let size = Box::new(RefCell::new(crate::ui_layout::PanelSize::default()));
+            size.borrow_mut().remember(900, 700, 96);
+            SetWindowSubclass(
+                hwnd,
+                Some(sizing_proc),
+                0x188,
+                (&*size as *const RefCell<crate::ui_layout::PanelSize>) as usize,
+            )
+            .unwrap();
+            let (w, h) = size.borrow().physical(96, 600, 500, false);
+            MoveWindow(hwnd, 0, 0, w, h, false).unwrap();
+            SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+            MoveWindow(hwnd, 30, 40, w, h, false).unwrap();
+            SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+            assert_eq!(size.borrow().physical(96, 2000, 1200, false), (900, 700));
+            SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+            let mut proposed = RECT {
+                left: 30,
+                top: 40,
+                right: 780,
+                bottom: 590,
+            };
+            SendMessageW(
+                hwnd,
+                WM_SIZING,
+                Some(WPARAM(WMSZ_BOTTOMRIGHT as usize)),
+                Some(LPARAM((&mut proposed as *mut RECT) as isize)),
+            );
+            MoveWindow(hwnd, 30, 40, 750, 550, false).unwrap();
+            SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+            assert_eq!(size.borrow().physical(96, 2000, 1200, false), (750, 550));
+            // A programmatic size and subsequent move must not reuse old WM_SIZING.
+            MoveWindow(hwnd, 30, 40, 600, 500, false).unwrap();
+            SendMessageW(hwnd, WM_ENTERSIZEMOVE, None, None);
+            SendMessageW(hwnd, WM_EXITSIZEMOVE, None, None);
+            assert_eq!(size.borrow().physical(96, 2000, 1200, false), (750, 550));
+            let _ = DestroyWindow(hwnd);
+        }
     }
 }

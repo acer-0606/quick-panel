@@ -2180,6 +2180,41 @@ use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 mod tests {
     use super::*;
     use windows::Win32::UI::Controls::*;
+    unsafe fn pump_tab(root: HWND, source: HWND, reverse: bool) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            GetKeyboardState, SetKeyboardState, VK_SHIFT, VK_TAB,
+        };
+        struct RestoreKeyboard([u8; 256]);
+        impl Drop for RestoreKeyboard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = SetKeyboardState(&self.0);
+                }
+            }
+        }
+        unsafe {
+            let mut original = [0u8; 256];
+            GetKeyboardState(&mut original).unwrap();
+            let _restore = RestoreKeyboard(original);
+            let mut keys = original;
+            keys[VK_SHIFT.0 as usize] = if reverse { 0x80 } else { 0 };
+            SetKeyboardState(&keys).unwrap();
+            PostMessageW(
+                Some(source),
+                WM_KEYDOWN,
+                WPARAM(VK_TAB.0 as usize),
+                LPARAM(1),
+            )
+            .unwrap();
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                if !IsDialogMessageW(root, &msg).as_bool() {
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+    }
     #[test]
     fn native_leaf_button_focus_reveals_without_testing_and_stable_result_keeps_selection() {
         unsafe {
@@ -2351,7 +2386,48 @@ mod tests {
             }
             relayout_form(&*form, root, 96);
             let _ = ShowWindow(root, SW_SHOW);
-            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(test));
+            let last_switch = form.borrow().edits[4];
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(last_switch));
+            scroll_form(&*form, 0);
+            pump_tab(root, last_switch, false);
+            assert_eq!(
+                windows::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
+                test
+            );
+            assert!(form.borrow().scroll_y > 0);
+            scroll_form(&*form, i32::MAX);
+            let bottom_scroll = form.borrow().scroll_y;
+            pump_tab(root, test, true);
+            assert!(form.borrow().scroll_y < bottom_scroll);
+            assert_eq!(
+                windows::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
+                last_switch
+            );
+            let mut switch_rect = RECT::default();
+            GetWindowRect(last_switch, &mut switch_rect).unwrap();
+            let mut switch_points = [
+                POINT {
+                    x: switch_rect.left,
+                    y: switch_rect.top,
+                },
+                POINT {
+                    x: switch_rect.right,
+                    y: switch_rect.bottom,
+                },
+            ];
+            windows::Win32::Graphics::Gdi::MapWindowPoints(
+                None,
+                Some(viewport),
+                &mut switch_points,
+            );
+            let mut viewport_rect = RECT::default();
+            GetClientRect(viewport, &mut viewport_rect).unwrap();
+            assert!(switch_points[0].y >= 0 && switch_points[1].y <= viewport_rect.bottom);
+            pump_tab(root, last_switch, false);
+            assert_eq!(
+                windows::Win32::UI::Input::KeyboardAndMouse::GetFocus(),
+                test
+            );
             assert!(form.borrow().scroll_y > 0);
             let mut r = RECT::default();
             GetWindowRect(test, &mut r).unwrap();

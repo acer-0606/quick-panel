@@ -240,6 +240,7 @@ pub fn clamp_window(rect: Rect, work: Rect) -> Rect {
 #[derive(Default, Debug)]
 pub struct PanelSize {
     logical: Option<(i32, i32)>,
+    user_sizing: bool,
 }
 impl PanelSize {
     pub fn remember(&mut self, width: i32, height: i32, dpi: u32) {
@@ -247,6 +248,19 @@ impl PanelSize {
             width * 96 / dpi.max(96) as i32,
             height * 96 / dpi.max(96) as i32,
         ));
+    }
+    pub fn begin_move_or_size(&mut self) {
+        self.user_sizing = false;
+    }
+    pub fn user_sizing(&mut self) {
+        self.user_sizing = true;
+    }
+    /// Only WM_SIZING records user intent; DPI and programmatic WM_SIZE do not.
+    pub fn finish_move_or_size(&mut self, width: i32, height: i32, dpi: u32) {
+        let sized = std::mem::take(&mut self.user_sizing);
+        if sized && width > 0 && height > 0 {
+            self.remember(width, height, dpi);
+        }
     }
     pub fn physical(
         &self,
