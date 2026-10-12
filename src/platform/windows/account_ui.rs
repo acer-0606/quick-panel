@@ -2076,7 +2076,12 @@ mod tests {
                 });
             }
             assert!(Instant::now() < deadline, "synthetic runtime timeout");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            // UIA's Win32 provider sends synchronous messages to the owner thread.
+            // Wake for each message instead of delaying every RPC by a fixed sleep.
+            // The timeout still polls background results when no UI messages arrive.
+            unsafe {
+                MsgWaitForMultipleObjectsEx(None, 5, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            }
         }
     }
     fn unlocked_runtime(fixture: &Synthetic) -> Runtime {
