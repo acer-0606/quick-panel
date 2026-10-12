@@ -318,3 +318,36 @@ fn index_terminal_allows_one_profile_bound_followup_then_revokes_permission() {
         );
     }
 }
+
+#[test]
+fn explicit_provider_replaces_adopted_session_but_main_button_cancels() {
+    use quick_panel::smart_search::{SmartEntry, SmartTransition, entry_transition};
+    for old in [SmartSearchMode::Claude, SmartSearchMode::Semantic] {
+        let desired = if old == SmartSearchMode::Claude {
+            SmartSearchMode::Semantic
+        } else {
+            SmartSearchMode::Claude
+        };
+        assert_eq!(
+            entry_transition(SmartEntry::Explicit(Some(desired)), true),
+            SmartTransition::Start {
+                cancel_previous: true,
+                preferred: Some(desired)
+            }
+        );
+        assert_eq!(
+            entry_transition(SmartEntry::Toggle, true),
+            SmartTransition::Cancel
+        );
+        let mut v = view();
+        v.preferred = desired;
+        assert_eq!(
+            choose(&v, Some(&status(3))),
+            if desired == SmartSearchMode::Claude {
+                SmartAction::Claude
+            } else {
+                SmartAction::Semantic
+            }
+        );
+    }
+}

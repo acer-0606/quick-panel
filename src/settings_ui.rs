@@ -331,12 +331,31 @@ pub enum Page {
     Memory,
     Review,
 }
+/// Explicit native Review return preserves the Memory frame and feedback source.
+#[derive(Clone, Debug, Default)]
+pub enum ReviewExit {
+    #[default]
+    Closed,
+    Memory(Option<(String, crate::harness_tools::FeedbackTarget)>),
+}
 /// A navigation frame carries its selected group and the entire source chain.
 #[derive(Default)]
 pub struct Navigation {
     frames: Vec<Page>,
 }
 impl Navigation {
+    pub fn review_exit(
+        &mut self,
+        exit: &ReviewExit,
+        memory: &mut crate::organizer_ui::MemoryUiState,
+    ) -> bool {
+        if matches!(exit, ReviewExit::Memory(_)) {
+            self.open_with_memory(Page::Memory, memory);
+            true
+        } else {
+            false
+        }
+    }
     pub fn open_with_memory(
         &mut self,
         page: Page,

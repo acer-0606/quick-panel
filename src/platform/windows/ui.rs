@@ -476,6 +476,8 @@ struct App {
     organizer_outbox: Rc<RefCell<(Option<Command>, Option<Command>)>>,
     organizer_page_open: bool,
     settings_navigation: crate::settings_ui::Navigation,
+    memory_target: Option<(String, crate::harness_tools::FeedbackTarget)>,
+    memory_sources: Vec<Option<(String, crate::harness_tools::FeedbackTarget)>>,
     settings_notice: String,
     harness_memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
     runtime_health: Arc<std::sync::Mutex<String>>,
@@ -490,6 +492,8 @@ struct App {
     smart_button: HWND,
     index_label: HWND,
     buttons: Vec<HWND>,
+    scroll_layout: RefCell<super::scroll_layout::ScrollLayout>,
+    panel_size: crate::ui_layout::PanelSize,
     font: HFONT,
     colors: Rc<theme::Colors>,
     engine: Option<Engine>,
@@ -608,6 +612,8 @@ pub fn run() -> Result<(), String> {
             organizer_outbox: Rc::new(RefCell::new((None, None))),
             organizer_page_open: false,
             settings_navigation: Default::default(),
+            memory_target: None,
+            memory_sources: Vec::new(),
             settings_notice: String::new(),
             harness_memory: Rc::new(RefCell::new(Default::default())),
             runtime_health: Arc::new(std::sync::Mutex::new("启动测试不调用模型".into())),
@@ -622,6 +628,8 @@ pub fn run() -> Result<(), String> {
             smart_button: HWND::default(),
             index_label: HWND::default(),
             buttons: Vec::new(),
+            scroll_layout: RefCell::new(super::scroll_layout::ScrollLayout::default()),
+            panel_size: crate::ui_layout::PanelSize::default(),
             font: HFONT::default(),
             colors: Rc::new(theme::Colors::new(Theme::System)),
             engine: None,
@@ -695,7 +703,7 @@ pub fn run() -> Result<(), String> {
             WS_EX_TOOLWINDOW,
             class,
             w!("快捷面板"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             680,
@@ -1030,7 +1038,11 @@ impl App {
         }
     }
     unsafe fn show_harness_memory(&mut self) {
+        let entering = self.settings_navigation.current() != Some(crate::settings_ui::Page::Memory);
         self.open_settings_page(crate::settings_ui::Page::Memory);
+        if entering {
+            self.memory_target = None;
+        }
         self.memory_snapshot();
         self.effects.push_back(UiEffect::HarnessMemory {
             owner: self.hwnd,
@@ -1186,26 +1198,35 @@ impl App {
         let _ = SetFocus(Some(self.index_label));
     }
     unsafe fn begin_smart(&mut self, preferred: Option<SmartSearchMode>) {
+        self.start_smart(crate::smart_search::SmartEntry::Explicit(preferred));
+    }
+    unsafe fn start_smart(&mut self, entry: crate::smart_search::SmartEntry) {
         if !self.state.visible
             || self.state.modal_open
             || self.state.lifecycle != Lifecycle::Running
         {
             return;
         }
-        if self.smart_preflight.busy()
+        let active = self.smart_preflight.busy()
             || self.ai_gate.busy()
             || self.ai_plan.is_some()
             || self.semantic_query.busy()
-            || self.semantic_query.adopted()
-        {
+            || self.semantic_query.adopted();
+        let transition = crate::smart_search::entry_transition(entry, active);
+        if active {
             self.cancel_preflight();
             self.cancel_semantic();
             self.cancel_ai();
             self.search();
             self.smart_button_label();
-            self.status("已取消智能查找，恢复本地检索");
-            return;
+            if transition == crate::smart_search::SmartTransition::Cancel {
+                self.status("已取消智能查找，恢复本地检索");
+                return;
+            }
         }
+        let crate::smart_search::SmartTransition::Start { preferred, .. } = transition else {
+            return;
+        };
         self.smart_mode = preferred;
         let view = self.smart_view();
         if !view.needs_index_status() {
@@ -1911,97 +1932,36 @@ impl App {
         }
         let mut r = RECT::default();
         let _ = GetClientRect(self.hwnd, &mut r);
-        let w = r.right;
-        let h = r.bottom;
-        let edge = self.s(18);
-        let preview_width = if self.preview_open { self.s(250) } else { 0 };
-        let list_width = w - 2 * edge - preview_width;
-        let mov = |hwnd: HWND, x, y, width, height| {
-            let _ = MoveWindow(hwnd, x, y, width, height, true);
-        };
-        mov(
-            self.edit,
-            edge,
-            self.s(18),
-            (w - self.s(240)).max(self.s(80)),
-            self.s(36),
-        );
-        mov(
-            self.smart_button,
-            w - self.s(212),
-            self.s(18),
-            self.s(106),
-            self.s(36),
-        );
-        mov(
-            self.buttons[0],
-            w - self.s(98),
-            self.s(18),
-            self.s(80),
-            self.s(36),
-        );
-        for i in 0..4 {
-            mov(
-                self.buttons[3 + i],
-                edge + self.s(i as i32 * 95),
-                self.s(66),
-                self.s(89),
-                self.s(30),
-            );
+        if r.right <= 0 || r.bottom <= 0 {
+            return;
         }
-        mov(
+        let controls = vec![
+            self.edit,
+            self.smart_button,
+            self.buttons[0],
+            self.buttons[3],
+            self.buttons[4],
+            self.buttons[5],
+            self.buttons[6],
             self.buttons[2],
-            w - self.s(80),
-            self.s(66),
-            self.s(62),
-            self.s(30),
-        );
-        let index_height = if self.settings.embedding.enabled {
-            self.s(30)
-        } else {
-            0
-        };
-        mov(self.index_label, edge, self.s(102), list_width, self.s(26));
-        let organizer_height = if self.settings.organizer.enabled {
-            self.s(30)
-        } else {
-            0
-        };
-        mov(
+            self.index_label,
             self.organizer_label,
-            edge,
-            self.s(102) + index_height,
-            list_width,
-            self.s(26),
-        );
-        mov(
             self.list,
-            edge,
-            self.s(110) + index_height + organizer_height,
-            list_width,
-            h - self.s(165) - index_height - organizer_height,
-        );
-        mov(
             self.footer,
-            edge,
-            h - self.s(42),
-            w - self.s(120),
-            self.s(30),
-        );
-        mov(
             self.buttons[1],
-            w - self.s(94),
-            h - self.s(44),
-            self.s(76),
-            self.s(30),
-        );
-        mov(
             self.preview,
-            w - preview_width,
-            self.s(114),
-            preview_width - edge,
-            h - self.s(180),
+        ];
+        let geometry = crate::ui_layout::panel_layout(
+            r.right,
+            r.bottom,
+            self.dpi,
+            self.settings.embedding.enabled,
+            self.settings.organizer.enabled,
+            self.preview_open,
         );
+        self.scroll_layout
+            .borrow_mut()
+            .reflow(self.hwnd, controls, geometry, self.dpi);
     }
     unsafe fn status(&self, message: &str) {
         let message = if self.settings.capture_paused {
@@ -2104,10 +2064,12 @@ impl App {
         let mut r = RECT::default();
         let _ = GetWindowRect(self.hwnd, &mut r);
         let work = info.rcWork;
-        let width = self
-            .s(if self.preview_open { 930 } else { 680 })
-            .min(work.right - work.left);
-        let height = self.s(480).min(work.bottom - work.top);
+        let (width, height) = self.panel_size.physical(
+            self.dpi,
+            work.right - work.left,
+            work.bottom - work.top,
+            self.preview_open,
+        );
         let _ = SetWindowPos(
             self.hwnd,
             Some(HWND_TOP),
@@ -3314,14 +3276,22 @@ impl App {
         Ok(())
     }
     fn open_settings_page(&mut self, page: crate::settings_ui::Page) {
+        if self.settings_navigation.current() != Some(page) {
+            self.memory_sources.push(self.memory_target.clone());
+        }
         self.settings_navigation
             .open_with_memory(page, &mut self.harness_memory.borrow_mut());
     }
     fn close_settings_page(&mut self) {
+        if self.settings_navigation.current().is_some() {
+            self.memory_target = self.memory_sources.pop().flatten();
+        }
         self.settings_navigation
             .close_with_memory(&mut self.harness_memory.borrow_mut());
     }
     fn clear_settings_pages(&mut self) {
+        self.memory_sources.clear();
+        self.memory_target = None;
         self.settings_navigation
             .clear_with_memory(&mut self.harness_memory.borrow_mut());
     }
@@ -3669,7 +3639,7 @@ impl App {
             AI_SETTINGS => self.ai_settings(),
             ORGANIZER_SETTINGS => self.organizer_settings(),
             ORGANIZER_REVIEW => self.review_organizer(),
-            SMART_FIND => self.begin_smart(None),
+            SMART_FIND => self.start_smart(crate::smart_search::SmartEntry::Toggle),
             INDEX_STATUS if self.semantic_index.active() => self.cancel_index(),
             INDEX_STATUS
                 if self.semantic_index.outcome() == crate::semantic_ui::IndexOutcome::Failed =>
@@ -3819,6 +3789,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
                     | WM_CLOSE
                     | WM_ACTIVATE
                     | WM_SIZE
+                    | WM_EXITSIZEMOVE
+                    | WM_VSCROLL
+                    | WM_MOUSEWHEEL
+                    | super::scroll_layout::REVEAL
                     | WM_SETTINGCHANGE
                     | WM_COMMAND
                     | WM_THEMECHANGED
@@ -3973,6 +3947,17 @@ unsafe fn app_message(
             app.hide();
             return Some(LRESULT(0));
         }
+        WM_EXITSIZEMOVE => {
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut rect);
+            app.panel_size
+                .remember(rect.right - rect.left, rect.bottom - rect.top, app.dpi);
+            return Some(LRESULT(0));
+        }
+        WM_VSCROLL | WM_MOUSEWHEEL | super::scroll_layout::REVEAL => {
+            app.scroll_layout.borrow_mut().message(hwnd, msg, wp, lp);
+            return Some(LRESULT(0));
+        }
         WM_SIZE => {
             app.layout();
             return Some(LRESULT(0));
@@ -3980,7 +3965,7 @@ unsafe fn app_message(
         WM_DPICHANGED => {
             app.accounts.borrow_mut().revoke();
             app.dpi = (wp.0 & 0xffff) as u32;
-            let rect = &*(lp.0 as *const RECT);
+            let rect = super::scroll_layout::clamp_rect(*(lp.0 as *const RECT));
             let _ = SetWindowPos(
                 hwnd,
                 None,
@@ -4116,10 +4101,7 @@ unsafe fn render_message(
     match msg {
         WM_GETMINMAXINFO => {
             let info = &mut *(lp.0 as *mut MINMAXINFO);
-            info.ptMinTrackSize = POINT {
-                x: render.s(480),
-                y: render.s(340),
-            };
+            info.ptMinTrackSize = super::scroll_layout::min_track(hwnd, render.dpi, 472, 340);
             return Some(LRESULT(0));
         }
         WM_DRAWITEM => {
@@ -4700,25 +4682,27 @@ impl Host {
                         memory.snapshot.memory_enabled = app.settings.organizer.memory_enabled;
                         memory.revision += 1;
                     }
-                    let settings_requested = super::harness_memory_ui::show(
-                        owner,
-                        state,
-                        Rc::new(move |command| {
-                            outbox.borrow_mut().0 = Some(command);
-                            let _ = PostMessageW(
-                                Some(HWND(address as *mut _)),
-                                ORGANIZER_UI_WAKE,
-                                WPARAM(0),
-                                LPARAM(0),
-                            );
-                        }),
-                        appearance,
-                    );
+                    let target = self.app.borrow().memory_target.clone();
+                    let submit: Rc<dyn Fn(Command)> = Rc::new(move |command| {
+                        outbox.borrow_mut().0 = Some(command);
+                        let _ = PostMessageW(
+                            Some(HWND(address as *mut _)),
+                            ORGANIZER_UI_WAKE,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    });
+                    let settings_requested = if let Some(target) = target {
+                        super::harness_memory_ui::feedback(owner, state, submit, appearance, target)
+                    } else {
+                        super::harness_memory_ui::show(owner, state, submit, appearance)
+                    };
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     if settings_requested {
                         app.organizer_settings();
                     } else {
+                        app.memory_target = None;
                         app.close_settings_page();
                         app.resume_settings_navigation();
                     }
@@ -4740,10 +4724,9 @@ impl Host {
                         m.snapshot.memory_enabled = app.settings.organizer.memory_enabled;
                         m.revision += 1;
                     }
-                    let settings_requested = organizer_ui::show(
+                    let exit = organizer_ui::show(
                         owner,
                         state,
-                        memory,
                         Rc::new(move |command| {
                             let detail = matches!(command, Command::OrganizerDetail { .. });
                             let mut slot = outbox.borrow_mut();
@@ -4766,8 +4749,20 @@ impl Host {
                     let mut app = self.app.borrow_mut();
                     app.state.modal_open = false;
                     app.organizer_page_open = false;
-                    if settings_requested {
-                        app.organizer_settings();
+                    let entered = {
+                        if matches!(exit, crate::settings_ui::ReviewExit::Memory(_)) {
+                            let source = app.memory_target.clone();
+                            app.memory_sources.push(source);
+                        }
+                        let memory = app.harness_memory.clone();
+                        app.settings_navigation
+                            .review_exit(&exit, &mut memory.borrow_mut())
+                    };
+                    if entered {
+                        if let crate::settings_ui::ReviewExit::Memory(target) = exit {
+                            app.memory_target = target;
+                        }
+                        app.show_harness_memory();
                     } else {
                         app.close_settings_page();
                         app.resume_settings_navigation();

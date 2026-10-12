@@ -1301,6 +1301,7 @@ struct WindowState {
     colors: theme::Colors,
     font: HFONT,
     suggested: Option<RECT>,
+    scroll_layout: Rc<RefCell<super::scroll_layout::ScrollLayout>>,
 }
 impl Drop for WindowState {
     fn drop(&mut self) {
@@ -1320,7 +1321,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<WindowState>;
         if !ptr.is_null() {
+            if matches!(
+                msg,
+                WM_VSCROLL | WM_MOUSEWHEEL | super::scroll_layout::REVEAL
+            ) {
+                let scroll = (*ptr).borrow().scroll_layout.clone();
+                scroll.borrow_mut().message(hwnd, msg, wp, lp);
+                return LRESULT(0);
+            }
             match msg {
+                WM_GETMINMAXINFO => {
+                    let info = &mut *(lp.0 as *mut MINMAXINFO);
+                    info.ptMinTrackSize =
+                        super::scroll_layout::min_track(hwnd, (*ptr).borrow().dpi, 480, 380);
+                    return LRESULT(0);
+                }
                 WM_ACTIVATE if (wp.0 & 0xffff) == WA_INACTIVE as usize => {
                     (*ptr).borrow_mut().action = 6;
                     return LRESULT(0);
@@ -1337,7 +1352,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         s.changed = true;
                     } else if id == 11 && code == LBN_SELCHANGE {
                         s.action = 11;
-                    } else if (1..=5).contains(&id) {
+                    } else if (1..=5).contains(&id) && code == BN_CLICKED {
                         s.action = id;
                     }
                     return LRESULT(0);
@@ -1425,12 +1440,13 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
             colors: theme::Colors::new(appearance),
             font: theme::font(dpi),
             suggested: None,
+            scroll_layout: Rc::new(RefCell::new(Default::default())),
         }));
         let Ok(hwnd) = CreateWindowExW(
             WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT,
             class,
             w!("账号保险箱"),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VSCROLL,
             info.rcWork.left + (info.rcWork.right - info.rcWork.left - width) / 2,
             info.rcWork.top + (info.rcWork.bottom - info.rcWork.top - height) / 2,
             width,
@@ -1518,6 +1534,7 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
             };
             if resize {
                 if let Some(r) = suggested {
+                    let r = super::scroll_layout::clamp_rect(r);
                     runtime.borrow_mut().revoke();
                     let _ = SetWindowPos(
                         hwnd,
@@ -1545,30 +1562,11 @@ pub unsafe fn show(owner: HWND, runtime: Rc<RefCell<Runtime>>, fill_mode: bool) 
                 }
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
-                let scale = |x| x * dpi as i32 / 96;
-                let pad = scale(12);
-                let w = (rect.right - 2 * pad).max(1);
-                let row = scale(32);
-                let footer = rect.bottom - scale(90);
-                let header_height = scale(28);
-                let status_y = pad + header_height + scale(4);
-                let status_height =
-                    scale(66).min((footer - status_y - row * 2 - pad * 3).max(scale(20)));
-                let search_y = status_y + status_height + scale(6);
-                let y = search_y + row + scale(4);
-                for (control, x, y, w, h) in [
-                    (header, pad, pad, w, header_height),
-                    (status, pad, status_y, w, status_height),
-                    (search, pad, search_y, w, row),
-                    (list, pad, y, w, (footer - y - pad).max(1)),
-                    (more, pad, footer, w / 2 - pad, row),
-                    (unlock, pad + w / 2, footer, w / 3, row),
-                    (lock, pad + w * 5 / 6, footer, w / 6, row),
-                    (once, pad, footer + row + pad, w / 2 - pad, row),
-                    (remember, pad + w / 2, footer + row + pad, w / 2, row),
-                ] {
-                    let _ = MoveWindow(control, x, y, w, h, true);
-                }
+                let geometry = crate::ui_layout::account_layout(rect.right, rect.bottom, dpi);
+                let scroll = state.borrow().scroll_layout.clone();
+                scroll
+                    .borrow_mut()
+                    .reflow(hwnd, controls.to_vec(), geometry, dpi);
             }
             let changed = state.borrow().changed || revision != runtime.borrow().revision;
             if changed {

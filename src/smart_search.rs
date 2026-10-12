@@ -26,6 +26,31 @@ pub enum SmartAction {
     ConfigureClaude,
     ConfigureSemantic,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmartEntry {
+    Toggle,
+    Explicit(Option<SmartSearchMode>),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmartTransition {
+    Cancel,
+    Start {
+        cancel_previous: bool,
+        preferred: Option<SmartSearchMode>,
+    },
+}
+pub fn entry_transition(entry: SmartEntry, active: bool) -> SmartTransition {
+    if active && entry == SmartEntry::Toggle {
+        return SmartTransition::Cancel;
+    }
+    SmartTransition::Start {
+        cancel_previous: active,
+        preferred: match entry {
+            SmartEntry::Toggle => None,
+            SmartEntry::Explicit(mode) => mode,
+        },
+    }
+}
 pub fn choose(view: &SmartView, status: Option<&SemanticIndexStatus>) -> SmartAction {
     let indexed = view.embedding_enabled
         && status.is_some_and(|s| s.profile == view.profile && s.indexed > 0);

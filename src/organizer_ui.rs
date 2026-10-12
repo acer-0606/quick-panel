@@ -731,6 +731,12 @@ pub fn memory_request_id() -> u64 {
     h.finish().max(1)
 }
 impl MemoryUiState {
+    pub fn selection_enabled(&self) -> bool {
+        !self.saving && !self.pending_save
+    }
+    pub fn action_identity_current(&self, selected: Option<u64>, shown: Option<u64>) -> bool {
+        self.selection_enabled() && selected.is_some() && selected == shown
+    }
     pub fn clear_current_navigation_draft(&mut self) {
         self.navigation_draft = None;
     }

@@ -1518,3 +1518,31 @@ fn nested_memory_save_and_navigation_teardown_never_consume_another_frame_draft(
     assert!(state.navigation_draft_for(None).is_none());
     assert!(!state.receipt(771, Ok(()), false));
 }
+
+#[test]
+fn unchanged_human_save_locks_selection_and_receipt_rechecks_action_identity() {
+    use quick_panel::{harness_tools::*, model::Command};
+    let mut state = MemoryUiState::default();
+    let input = MemoryEdit {
+        id: Some(101),
+        scope: MemoryScope::Global,
+        text: "合成规则A".into(),
+        enabled: true,
+        confirmed: true,
+    };
+    state
+        .submit(Command::HarnessMemoryEdit {
+            request_id: 44,
+            input,
+        })
+        .unwrap();
+    assert!(!state.selection_enabled());
+    assert!(!state.action_identity_current(Some(102), Some(101)));
+    assert!(state.receipt(44, Ok(()), true));
+    assert!(!state.selection_enabled());
+    assert!(state.retry().is_some());
+    assert!(state.receipt(44, Ok(()), false));
+    assert!(state.selection_enabled());
+    assert!(!state.action_identity_current(Some(102), Some(101)));
+    assert!(state.action_identity_current(Some(101), Some(101)));
+}

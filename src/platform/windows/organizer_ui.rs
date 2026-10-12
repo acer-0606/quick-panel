@@ -49,8 +49,8 @@ struct View {
     rendering: bool,
     done: bool,
     enabled: bool,
-    memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
-    open_settings: bool,
+    exit: crate::settings_ui::ReviewExit,
+    scroll_layout: Rc<RefCell<super::scroll_layout::ScrollLayout>>,
     feedback_rows: Vec<(String, crate::harness_tools::FeedbackTarget)>,
 }
 impl Drop for View {
@@ -408,37 +408,13 @@ unsafe fn layout(hwnd: HWND, ptr: *const RefCell<View>) {
     }
     let mut r = RECT::default();
     let _ = GetClientRect(hwnd, &mut r);
-    let s = |n: i32| n * dpi as i32 / 96;
-    let margin = s(14);
-    let width = (r.right - 2 * margin).max(s(120));
-    let bottom = r.bottom - margin;
-    let field_h = s(26);
-    let footer_h = s(32);
-    let alias_y = bottom - footer_h - s(120);
-    let detail_y = s(66) + ((alias_y - s(66)) / 2).max(s(24));
-    let positions = [
-        (margin, s(10), width, s(46)),
-        (margin, s(62), width, (detail_y - s(70)).max(s(30))),
-        (
-            margin,
-            detail_y,
-            width,
-            (alias_y - detail_y - s(8)).max(s(30)),
-        ),
-        (margin, alias_y, s(66), field_h),
-        (margin + s(70), alias_y, width - s(70), field_h),
-        (margin, alias_y + s(34), s(66), field_h),
-        (margin + s(70), alias_y + s(34), width - s(70), field_h),
-        (margin, bottom - footer_h, s(112), footer_h),
-        (margin + s(122), bottom - footer_h, s(112), footer_h),
-        (margin + s(244), bottom - footer_h, s(84), footer_h),
-        (r.right - margin - s(84), bottom - footer_h, s(84), footer_h),
-        (margin, bottom - footer_h - s(38), s(148), footer_h),
-        (margin + s(158), bottom - footer_h - s(38), s(148), footer_h),
-    ];
-    for (control, (x, y, w, h)) in controls.into_iter().zip(positions) {
-        let _ = MoveWindow(control, x, y, w.max(1), h.max(1), true);
+    if r.right <= 0 || r.bottom <= 0 {
+        return;
     }
+    let geometry = crate::ui_layout::review_layout(r.right, r.bottom, dpi);
+    let width = geometry.rects[1].width;
+    let scroll = (*ptr).borrow().scroll_layout.clone();
+    scroll.borrow_mut().reflow(hwnd, controls, geometry, dpi);
     let list = (*ptr).borrow().list;
     for (column, fraction) in [(0, 40), (1, 32), (2, 28)] {
         SendMessageW(
@@ -456,6 +432,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     }
     let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<View>;
     if !ptr.is_null() {
+        if matches!(
+            msg,
+            WM_VSCROLL | WM_MOUSEWHEEL | super::scroll_layout::REVEAL
+        ) {
+            let scroll = (*ptr).borrow().scroll_layout.clone();
+            scroll.borrow_mut().message(hwnd, msg, wp, lp);
+            return LRESULT(0);
+        }
         match msg {
             WM_TIMER => {
                 render(ptr);
@@ -487,25 +471,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         state.borrow_mut().edit_for(source, version, a, t);
                     }
                 }
-                if id == 5 || id == 6 {
-                    let (memory, submit, appearance, state) = {
-                        let v = (*ptr).borrow();
-                        (
-                            v.memory.clone(),
-                            v.submit.clone(),
-                            v.appearance,
-                            v.state.clone(),
-                        )
-                    };
-                    if id == 6 {
-                        let settings =
-                            super::harness_memory_ui::show(hwnd, memory, submit, appearance);
-                        if settings {
-                            let mut v = (*ptr).borrow_mut();
-                            v.open_settings = true;
-                            v.done = true;
-                        }
-                    } else {
+                if (id == 5 || id == 6) && notification == BN_CLICKED {
+                    let target = if id == 5 {
                         let list = (*ptr).borrow().list;
                         let index = SendMessageW(
                             list,
@@ -514,30 +481,27 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                             Some(LPARAM(LVNI_SELECTED as isize)),
                         )
                         .0;
-                        let target = if index >= 0 {
+                        if index >= 0 {
                             (*ptr).borrow().feedback_rows.get(index as usize).cloned()
                         } else {
                             None
-                        };
-                        if let Some(target) = target {
-                            let settings = super::harness_memory_ui::feedback(
-                                hwnd, memory, submit, appearance, target,
-                            );
-                            if settings {
-                                let mut v = (*ptr).borrow_mut();
-                                v.open_settings = true;
-                                v.done = true;
-                            }
-                        } else {
-                            let mut s = state.borrow_mut();
-                            s.message = "请先选中一条已完成建议或需处理内容".into();
-                            s.revision += 1;
                         }
+                    } else {
+                        None
+                    };
+                    if id == 6 || target.is_some() {
+                        let mut v = (*ptr).borrow_mut();
+                        v.exit = crate::settings_ui::ReviewExit::Memory(target);
+                        v.done = true;
+                    } else {
+                        let state = (*ptr).borrow().state.clone();
+                        let mut s = state.borrow_mut();
+                        s.message = "请先选中一条已完成建议或需处理内容".into();
+                        s.revision += 1;
                     }
-                    render(ptr);
                     return LRESULT(0);
                 }
-                if [1, 2, 3, 4].contains(&id) {
+                if [1, 2, 3, 4].contains(&id) && notification == BN_CLICKED {
                     if id == 4 {
                         (*ptr).borrow_mut().done = true;
                     } else {
@@ -605,18 +569,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             WM_GETMINMAXINFO => {
                 let info = &mut *(lp.0 as *mut MINMAXINFO);
                 let dpi = (*ptr).borrow().dpi;
-                let mut monitor = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                let _ = GetMonitorInfoW(
-                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                    &mut monitor,
-                );
-                info.ptMinTrackSize = POINT {
-                    x: (620 * dpi as i32 / 96).min(monitor.rcWork.right - monitor.rcWork.left - 24),
-                    y: (420 * dpi as i32 / 96).min(monitor.rcWork.bottom - monitor.rcWork.top - 24),
-                };
+                info.ptMinTrackSize = super::scroll_layout::min_track(hwnd, dpi, 620, 420);
                 return LRESULT(0);
             }
             WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
@@ -654,7 +607,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     std::mem::replace(&mut v.font, font)
                 };
                 let _ = DeleteObject(old.into());
-                let r = &*(lp.0 as *const RECT);
+                let r = super::scroll_layout::clamp_rect(*(lp.0 as *const RECT));
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -692,20 +645,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
 pub unsafe fn show(
     owner: HWND,
     state: Rc<RefCell<ReviewState>>,
-    memory: Rc<RefCell<crate::organizer_ui::MemoryUiState>>,
     submit: Rc<dyn Fn(Command)>,
     appearance: Theme,
     enabled: bool,
-) -> bool {
+) -> crate::settings_ui::ReviewExit {
     let common = INITCOMMONCONTROLSEX {
         dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
         dwICC: ICC_LISTVIEW_CLASSES,
     };
     if !InitCommonControlsEx(&common).as_bool() {
-        return false;
+        return crate::settings_ui::ReviewExit::Closed;
     }
     let Ok(instance) = GetModuleHandleW(None) else {
-        return false;
+        return crate::settings_ui::ReviewExit::Closed;
     };
     let class = w!("QuickPanelOrganizerReview");
     let wc = WNDCLASSW {
@@ -751,15 +703,15 @@ pub unsafe fn show(
         rendering: true,
         done: false,
         enabled,
-        memory,
-        open_settings: false,
+        exit: crate::settings_ui::ReviewExit::Closed,
+        scroll_layout: Rc::new(RefCell::new(Default::default())),
         feedback_rows: vec![],
     }));
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         class,
         w!("整理建议"),
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_VSCROLL,
         work.left + (work.right - work.left - width) / 2,
         work.top + (work.bottom - work.top - height) / 2,
         width,
@@ -769,7 +721,7 @@ pub unsafe fn show(
         Some(instance.into()),
         Some((&*view as *const RefCell<View>).cast()),
     ) else {
-        return false;
+        return crate::settings_ui::ReviewExit::Closed;
     };
     let font = view.borrow().font;
     let dark = view.borrow().colors.dark;
@@ -934,5 +886,99 @@ pub unsafe fn show(
     if let Some(code) = quit {
         PostQuitMessage(code);
     }
-    view.borrow().open_settings
+    view.borrow().exit.clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_memory_entry_returns_a_navigation_frame_instead_of_nesting_a_modal() {
+        unsafe {
+            let view = Box::new(RefCell::new(View {
+                list_refresh: Default::default(),
+                editor_refresh: Default::default(),
+                state: Rc::new(RefCell::new(Default::default())),
+                submit: Rc::new(|_| {}),
+                controls: vec![],
+                list: HWND::default(),
+                status: HWND::default(),
+                detail: HWND::default(),
+                alias: HWND::default(),
+                tags: HWND::default(),
+                apply: HWND::default(),
+                dismiss: HWND::default(),
+                retry: HWND::default(),
+                colors: theme::Colors::new(Theme::System),
+                appearance: Theme::System,
+                font: theme::font(96),
+                dpi: 96,
+                revision: 0,
+                rendering: false,
+                done: false,
+                enabled: true,
+                exit: Default::default(),
+                scroll_layout: Rc::new(RefCell::new(Default::default())),
+                feedback_rows: vec![],
+            }));
+            let class = w!("QuickPanelReviewEntryFixture");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(proc),
+                hInstance: GetModuleHandleW(None).unwrap().into(),
+                lpszClassName: class,
+                ..Default::default()
+            });
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class,
+                w!("合成建议fixture"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                500,
+                300,
+                None,
+                None,
+                None,
+                Some((&*view as *const RefCell<View>).cast()),
+            )
+            .unwrap();
+            SendMessageW(
+                hwnd,
+                WM_COMMAND,
+                Some(WPARAM(6 | ((BN_SETFOCUS as usize) << 16))),
+                None,
+            );
+            assert!(!view.borrow().done);
+            SendMessageW(hwnd, WM_COMMAND, Some(WPARAM(6)), None);
+            let exit = view.borrow().exit.clone();
+            assert!(view.borrow().done);
+            let mut nav = crate::settings_ui::Navigation::default();
+            let mut memory = crate::organizer_ui::MemoryUiState::default();
+            nav.open_with_memory(crate::settings_ui::Page::Review, &mut memory);
+            assert!(nav.review_exit(&exit, &mut memory));
+            memory.navigation_draft = Some(crate::organizer_ui::MemoryNavigationDraft {
+                target: None,
+                record: None,
+                raw_input: "合成返回草稿".into(),
+                scope_choice: 2,
+                enabled: true,
+                confirmed: true,
+            });
+            nav.open_with_memory(
+                crate::settings_ui::Page::Hub(crate::settings_ui::Group::Organizer),
+                &mut memory,
+            );
+            assert_eq!(nav.back_label(), "返回记忆");
+            assert_eq!(
+                nav.close_with_memory(&mut memory),
+                Some(crate::settings_ui::Page::Memory)
+            );
+            assert_eq!(
+                memory.navigation_draft.as_ref().unwrap().raw_input,
+                "合成返回草稿"
+            );
+            let _ = DestroyWindow(hwnd);
+        }
+    }
 }

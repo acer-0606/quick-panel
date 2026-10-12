@@ -56,7 +56,22 @@ unsafe fn selected(ptr: *const RefCell<View>) {
         let v = (*ptr).borrow();
         (v.controls.clone(), v.state.clone(), v.target.is_some())
     };
-    if target || state.borrow().saving || state.borrow().pending_save {
+    if target {
+        return;
+    }
+    if !state.borrow().selection_enabled() {
+        let selected_id = (*ptr).borrow().shown.as_ref().map(|m| m.id);
+        let index = (*ptr)
+            .borrow()
+            .records
+            .iter()
+            .position(|m| Some(m.id) == selected_id);
+        SendMessageW(
+            controls[1],
+            LB_SETCURSEL,
+            Some(WPARAM(index.unwrap_or(usize::MAX))),
+            None,
+        );
         return;
     }
     let index = SendMessageW(controls[1], LB_GETCURSEL, None, None).0;
@@ -187,6 +202,22 @@ unsafe fn render(ptr: *const RefCell<View>) {
         (*ptr).borrow_mut().records = snapshot.records.clone();
     }
     let available = !feedback || snapshot.feedback_available();
+    let selectable = !feedback && state.borrow().selection_enabled();
+    let _ = EnableWindow(controls[1], selectable);
+    if !feedback {
+        let id = (*ptr).borrow().shown.as_ref().map(|m| m.id);
+        let index = (*ptr)
+            .borrow()
+            .records
+            .iter()
+            .position(|m| Some(m.id) == id);
+        SendMessageW(
+            controls[1],
+            LB_SETCURSEL,
+            Some(WPARAM(index.unwrap_or(usize::MAX))),
+            None,
+        );
+    }
     for c in &controls[3..8] {
         let _ = EnableWindow(*c, !saving && !pending_save && available);
     }
@@ -249,13 +280,35 @@ unsafe fn action(ptr: *const RefCell<View>, id: usize) {
     if target.is_some() && !state.borrow().snapshot.feedback_available() {
         return;
     }
+    if target.is_none() {
+        let index = SendMessageW(controls[1], LB_GETCURSEL, None, None).0;
+        let selected_id = if index >= 0 {
+            (*ptr).borrow().records.get(index as usize).map(|m| m.id)
+        } else {
+            None
+        };
+        if !state
+            .borrow()
+            .action_identity_current(selected_id, shown.as_ref().map(|m| m.id))
+        {
+            selected(ptr);
+            state.borrow_mut().message = "选择已变化，请核对当前规则后再操作".into();
+            state.borrow_mut().revision += 1;
+            return;
+        }
+    }
     let command = if route == MemoryFooterAction::Delete {
         let Some(record) = shown else {
             return;
         };
+        let confirmation = wide(&format!(
+            "删除这条整理记忆？\r\n{}\r\n{}",
+            record.text,
+            crate::organizer_ui::memory_scope_label(&record.scope, &state.borrow().snapshot)
+        ));
         if MessageBoxW(
             Some(controls[9]),
-            w!("删除这条整理记忆？"),
+            PCWSTR(confirmation.as_ptr()),
             w!("删除记忆"),
             MB_YESNO | MB_ICONQUESTION,
         ) != IDYES
@@ -620,7 +673,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     || (id == 3 && wp.0 >> 16 == EN_CHANGE as usize)
                 {
                     scope_preview(ptr);
-                } else if (7..=10).contains(&id) {
+                } else if (7..=10).contains(&id) && wp.0 >> 16 == BN_CLICKED as usize {
                     action(ptr, id);
                 }
                 render(ptr);
@@ -640,21 +693,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             }
             WM_GETMINMAXINFO => {
                 let dpi = (*ptr).borrow().dpi as i32;
-                let mut monitor = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                let _ = GetMonitorInfoW(
-                    MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                    &mut monitor,
-                );
                 let info = &mut *(lp.0 as *mut MINMAXINFO);
-                info.ptMinTrackSize = POINT {
-                    x: (320 * dpi / 96)
-                        .min((monitor.rcWork.right - monitor.rcWork.left - 24).max(1)),
-                    y: (280 * dpi / 96)
-                        .min((monitor.rcWork.bottom - monitor.rcWork.top - 24).max(1)),
-                };
+                info.ptMinTrackSize = super::scroll_layout::min_track(hwnd, dpi as u32, 320, 280);
                 return LRESULT(0);
             }
             WM_CLOSE => {
@@ -693,7 +733,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     std::mem::replace(&mut v.font, font)
                 };
                 let _ = DeleteObject(old.into());
-                let r = &*(lp.0 as *const RECT);
+                let r = super::scroll_layout::clamp_rect(*(lp.0 as *const RECT));
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -1130,4 +1170,161 @@ unsafe fn show_form(
         PostQuitMessage(code);
     }
     view.borrow().open_settings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    #[test]
+    fn native_unchanged_human_save_restores_selection_and_rejects_wrong_target_actions() {
+        unsafe {
+            let root = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("合成记忆fixture"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                600,
+                500,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let state = Rc::new(RefCell::new(MemoryUiState::default()));
+            let records = (101..=102)
+                .map(|id| MemoryRecord {
+                    id,
+                    scope: MemoryScope::Global,
+                    kind: MemoryKind::Rule,
+                    origin: MemoryOrigin::Human,
+                    proposed_by_ai: false,
+                    text: format!("合成规则{id}"),
+                    alias: None,
+                    tags: vec![],
+                    evidence_ids: vec![],
+                    confirmed: true,
+                    enabled: true,
+                    created_at_ms: 0,
+                })
+                .collect::<Vec<_>>();
+            state.borrow_mut().snapshot.records = records.clone();
+            let sent = Rc::new(RefCell::new(Vec::new()));
+            let output = sent.clone();
+            let mut controls = Vec::new();
+            for id in 0..11 {
+                let class = match id {
+                    1 => w!("LISTBOX"),
+                    4 => w!("COMBOBOX"),
+                    5..=10 => w!("BUTTON"),
+                    _ => w!("EDIT"),
+                };
+                controls.push(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        class,
+                        w!(""),
+                        WS_CHILD
+                            | WS_VISIBLE
+                            | if (5..=6).contains(&id) {
+                                WINDOW_STYLE(BS_AUTOCHECKBOX as u32)
+                            } else {
+                                WINDOW_STYLE::default()
+                            },
+                        0,
+                        0,
+                        200,
+                        30,
+                        Some(root),
+                        Some(HMENU(id as *mut _)),
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+            for label in ["A", "B"] {
+                let label = wide(label);
+                SendMessageW(
+                    controls[1],
+                    LB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                );
+            }
+            for label in ["内容", "目录", "全局"] {
+                let label = wide(label);
+                SendMessageW(
+                    controls[4],
+                    CB_ADDSTRING,
+                    None,
+                    Some(LPARAM(label.as_ptr() as isize)),
+                );
+            }
+            let view = RefCell::new(View {
+                state: state.clone(),
+                submit: Rc::new(move |c| output.borrow_mut().push(c)),
+                target: None,
+                shown: None,
+                records: records.clone(),
+                availability: Some((false, false, false)),
+                controls: controls.clone(),
+                colors: theme::Colors::new(Theme::System),
+                appearance: Theme::System,
+                font: theme::font(96),
+                dpi: 96,
+                done: false,
+                open_settings: false,
+                revision: u64::MAX,
+                viewport: root,
+                scroll_y: 0,
+                geometry: None,
+                input_policy: Default::default(),
+            });
+            SendMessageW(controls[1], LB_SETCURSEL, Some(WPARAM(0)), None);
+            selected(&view);
+            action(&view, 7);
+            render(&view);
+            let Command::HarnessMemoryEdit { request_id, input } = sent.borrow()[0].clone() else {
+                panic!("edit expected")
+            };
+            assert_eq!(input.id, Some(101));
+            assert_eq!(input.text, records[0].text);
+            assert!(!IsWindowEnabled(controls[1]).as_bool());
+            SendMessageW(controls[1], LB_SETCURSEL, Some(WPARAM(1)), None);
+            selected(&view);
+            assert_eq!(SendMessageW(controls[1], LB_GETCURSEL, None, None).0, 0);
+            state.borrow_mut().snapshot.version += 1;
+            state.borrow_mut().receipt(request_id, Ok(()), true);
+            render(&view);
+            assert!(!IsWindowEnabled(controls[1]).as_bool());
+            SendMessageW(controls[1], LB_SETCURSEL, Some(WPARAM(1)), None);
+            selected(&view);
+            assert_eq!(SendMessageW(controls[1], LB_GETCURSEL, None, None).0, 0);
+            assert!(state.borrow_mut().retry().is_some());
+            state.borrow_mut().receipt(request_id, Ok(()), false);
+            render(&view);
+            assert!(IsWindowEnabled(controls[1]).as_bool());
+            // A synthetic stale notification bypasses the disabled-list protection;
+            // both destructive and edit actions still check actual native identity.
+            SendMessageW(controls[1], LB_SETCURSEL, Some(WPARAM(1)), None);
+            action(&view, 9);
+            assert_eq!(sent.borrow().len(), 1);
+            assert_eq!(view.borrow().shown.as_ref().unwrap().id, 102);
+            SendMessageW(controls[1], LB_SETCURSEL, Some(WPARAM(0)), None);
+            action(&view, 7);
+            assert_eq!(sent.borrow().len(), 1);
+            assert_eq!(view.borrow().shown.as_ref().unwrap().id, 101);
+            action(&view, 7);
+            let Command::HarnessMemoryEdit { input, .. } = sent.borrow()[1].clone() else {
+                panic!("edit expected")
+            };
+            assert_eq!(input.id, Some(101));
+            let _ = DestroyWindow(root);
+            let _ = DeleteObject(view.borrow().font.into());
+        }
+    }
 }

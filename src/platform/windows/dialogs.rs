@@ -30,6 +30,16 @@ pub unsafe fn text(hwnd: HWND) -> String {
         String::from_utf16_lossy(&b[..n.max(0) as usize])
     }
 }
+pub unsafe fn set_text_if_changed(hwnd: HWND, value: &str) -> bool {
+    unsafe {
+        if text(hwnd) == value {
+            return false;
+        }
+        let value = wide(value);
+        let _ = SetWindowTextW(hwnd, PCWSTR(value.as_ptr()));
+        true
+    }
+}
 pub unsafe fn pick(owner: HWND, folder: bool) -> Result<Option<String>, String> {
     unsafe {
         let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
@@ -360,34 +370,33 @@ unsafe extern "system" fn viewport_proc(
 ) -> LRESULT {
     unsafe {
         let ptr = data as *const RefCell<Form>;
-        if msg == WM_COMMAND {
-            let owner = GetParent(hwnd).unwrap_or_default();
-            let notification = (wp.0 >> 16) as u32;
-            if [EN_SETFOCUS, CBN_SETFOCUS, BN_SETFOCUS].contains(&notification) {
-                let edit = HWND(lp.0 as *mut _);
-                let mut rect = RECT::default();
-                let _ = GetWindowRect(edit, &mut rect);
-                let mut points = [
-                    POINT {
-                        x: rect.left,
-                        y: rect.top,
-                    },
-                    POINT {
-                        x: rect.right,
-                        y: rect.bottom,
-                    },
-                ];
-                windows::Win32::Graphics::Gdi::MapWindowPoints(None, Some(hwnd), &mut points);
-                let mut viewport = RECT::default();
-                let _ = GetClientRect(hwnd, &mut viewport);
-                let old = (*ptr).borrow().scroll_y;
-                if points[0].y < 0 {
-                    scroll_form(ptr, old + points[0].y);
-                } else if points[1].y > viewport.bottom {
-                    scroll_form(ptr, old + points[1].y - viewport.bottom);
-                }
+        if msg == super::scroll_layout::REVEAL {
+            let edit = HWND(lp.0 as *mut _);
+            let mut rect = RECT::default();
+            let _ = GetWindowRect(edit, &mut rect);
+            let mut points = [
+                POINT {
+                    x: rect.left,
+                    y: rect.top,
+                },
+                POINT {
+                    x: rect.right,
+                    y: rect.bottom,
+                },
+            ];
+            windows::Win32::Graphics::Gdi::MapWindowPoints(None, Some(hwnd), &mut points);
+            let mut viewport = RECT::default();
+            let _ = GetClientRect(hwnd, &mut viewport);
+            let old = (*ptr).borrow().scroll_y;
+            if points[0].y < 0 {
+                scroll_form(ptr, old + points[0].y);
+            } else if points[1].y > viewport.bottom {
+                scroll_form(ptr, old + points[1].y - viewport.bottom);
             }
-            return SendMessageW(owner, msg, Some(wp), Some(lp));
+            return LRESULT(0);
+        }
+        if msg == WM_COMMAND {
+            return SendMessageW(GetParent(hwnd).unwrap_or_default(), msg, Some(wp), Some(lp));
         }
         if msg == WM_VSCROLL || msg == WM_MOUSEWHEEL {
             let (position, dpi) = {
@@ -472,9 +481,8 @@ unsafe fn render_status(ptr: *const RefCell<Form>) {
         }
     }
     if let Some(output) = output {
-        let message = wide(&message);
         unsafe {
-            let _ = SetWindowTextW(output, PCWSTR(message.as_ptr()));
+            set_text_if_changed(output, &message);
         }
     }
 }
@@ -784,7 +792,10 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<Form>;
         if !ptr.is_null() {
             match msg {
-                WM_COMMAND if (wp.0 & 0xffff) == 1 || (wp.0 & 0xffff) == 2 => {
+                WM_COMMAND
+                    if ((wp.0 & 0xffff) == 1 || (wp.0 & 0xffff) == 2)
+                        && wp.0 >> 16 == BN_CLICKED as usize =>
+                {
                     let accept = (wp.0 & 0xffff) == 1;
                     if accept && (*ptr).borrow().test_gate.busy() {
                         return LRESULT(0);
@@ -797,11 +808,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     cancel_test(ptr);
                     return LRESULT(0);
                 }
-                WM_COMMAND if (wp.0 & 0xffff) == TEST_BUTTON => {
+                WM_COMMAND
+                    if (wp.0 & 0xffff) == TEST_BUTTON && wp.0 >> 16 == BN_CLICKED as usize =>
+                {
                     begin_test(ptr, false);
                     return LRESULT(0);
                 }
-                WM_COMMAND if (wp.0 & 0xffff) == MODEL_BUTTON => {
+                WM_COMMAND
+                    if (wp.0 & 0xffff) == MODEL_BUTTON && wp.0 >> 16 == BN_CLICKED as usize =>
+                {
                     begin_test(ptr, true);
                     return LRESULT(0);
                 }
@@ -865,23 +880,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 }
                 WM_DPICHANGED => {
                     let dpi = (wp.0 & 0xffff) as u32;
-                    let rect = &*(lp.0 as *const RECT);
-                    let mut monitor = MONITORINFO {
-                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                        ..Default::default()
-                    };
-                    let _ = GetMonitorInfoW(
-                        MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
-                        &mut monitor,
-                    );
-                    let work = monitor.rcWork;
-                    let width = (rect.right - rect.left).min(work.right - work.left);
-                    let height = (rect.bottom - rect.top).min(work.bottom - work.top);
+                    let rect = super::scroll_layout::clamp_rect(*(lp.0 as *const RECT));
+                    let width = rect.right - rect.left;
+                    let height = rect.bottom - rect.top;
                     let _ = SetWindowPos(
                         hwnd,
                         None,
-                        rect.left.clamp(work.left, work.right - width),
-                        rect.top.clamp(work.top, work.bottom - height),
+                        rect.left,
+                        rect.top,
                         width,
                         height,
                         SWP_NOZORDER | SWP_NOACTIVATE,
@@ -1964,6 +1970,11 @@ unsafe fn form_fields_async(
                 state.borrow_mut().cancel_button = Some(b);
             }
         }
+        for c in &state.borrow().controls {
+            if GetParent(*c).ok() == Some(viewport) {
+                super::scroll_layout::attach_focus(*c);
+            }
+        }
         relayout_form(
             &*state,
             hwnd,
@@ -2164,3 +2175,241 @@ unsafe fn form_fields_async(
 }
 use windows::Win32::Graphics::Gdi::{COLOR_WINDOW, DeleteObject, HBRUSH, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Controls::*;
+    #[test]
+    fn native_leaf_button_focus_reveals_without_testing_and_stable_result_keeps_selection() {
+        unsafe {
+            use crate::settings_ui::{EditorField, EditorFieldKind, EditorSpec};
+            let spec = EditorSpec {
+                fields: vec![
+                    EditorField {
+                        label: "合成字段".into(),
+                        kind: EditorFieldKind::Line
+                    };
+                    5
+                ],
+                note: None,
+                test_label: Some("测试".into()),
+                models: true,
+            };
+            let form = Box::new(RefCell::new(Form {
+                passwords: vec![],
+                edits: vec![],
+                controls: vec![],
+                colors: theme::Colors::new(Theme::System),
+                appearance: Theme::System,
+                font: theme::font(96),
+                dpi: 96,
+                done: false,
+                accepted: false,
+                test: None,
+                validation: Validation::None,
+                status: FormStatus::default(),
+                labels: vec![],
+                health_requested: false,
+                test_gate: Default::default(),
+                test_button: None,
+                test_result: None,
+                error_result: None,
+                save_button: None,
+                model_button: None,
+                models: vec![],
+                choices: vec![],
+                switches: vec![],
+                viewport: HWND::default(),
+                scroll_y: 0,
+                content_height: 0,
+                layout_spec: spec,
+                layout: None,
+                note: None,
+                cancel_button: None,
+            }));
+            let class = w!("QuickPanelLeafFixture");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(proc),
+                hInstance: GetModuleHandleW(None).unwrap().into(),
+                lpszClassName: class,
+                ..Default::default()
+            });
+            let root = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                class,
+                w!("合成设置fixture"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                480,
+                300,
+                None,
+                None,
+                None,
+                Some((&*form as *const RefCell<Form>).cast()),
+            )
+            .unwrap();
+            form.borrow_mut().test = Some(TestForm::Organizer {
+                ai: Default::default(),
+                path_enabled: false,
+                owner: root.0 as usize,
+                health: Arc::new(std::sync::Mutex::new(String::new())),
+            });
+            let viewport = CreateWindowExW(
+                WS_EX_CONTROLPARENT,
+                w!("STATIC"),
+                w!(""),
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                0,
+                0,
+                460,
+                100,
+                Some(root),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            form.borrow_mut().viewport = viewport;
+            SetWindowSubclass(
+                viewport,
+                Some(viewport_proc),
+                1,
+                (&*form as *const RefCell<Form>) as usize,
+            )
+            .unwrap();
+            let create = |parent, class, label, id, style| {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    class,
+                    label,
+                    WS_CHILD | WS_VISIBLE | style,
+                    0,
+                    0,
+                    300,
+                    30,
+                    Some(parent),
+                    Some(HMENU(id as *mut _)),
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            for _ in 0..5 {
+                let label = create(
+                    viewport,
+                    w!("STATIC"),
+                    w!("合成字段"),
+                    0,
+                    WINDOW_STYLE::default(),
+                );
+                let edit = create(
+                    viewport,
+                    w!("BUTTON"),
+                    w!("合成开关"),
+                    0,
+                    WS_TABSTOP | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
+                );
+                form.borrow_mut().controls.extend([label, edit]);
+                form.borrow_mut().edits.push(edit);
+            }
+            let test = create(
+                viewport,
+                w!("BUTTON"),
+                w!("测试连接"),
+                TEST_BUTTON,
+                WS_TABSTOP,
+            );
+            let models = create(
+                viewport,
+                w!("BUTTON"),
+                w!("获取模型"),
+                MODEL_BUTTON,
+                WS_TABSTOP,
+            );
+            let result = create(
+                viewport,
+                w!("EDIT"),
+                w!(""),
+                0,
+                WS_TABSTOP
+                    | WS_VSCROLL
+                    | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+            );
+            {
+                let mut f = form.borrow_mut();
+                f.controls.extend([test, models, result]);
+                f.test_button = Some(test);
+                f.model_button = Some(models);
+                f.test_result = Some(result);
+                f.save_button = Some(create(root, w!("BUTTON"), w!("保存"), 1, WS_TABSTOP));
+                f.cancel_button = Some(create(root, w!("BUTTON"), w!("取消"), 2, WS_TABSTOP));
+            }
+            for c in &form.borrow().controls {
+                super::super::scroll_layout::attach_focus(*c);
+            }
+            relayout_form(&*form, root, 96);
+            let _ = ShowWindow(root, SW_SHOW);
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(test));
+            assert!(form.borrow().scroll_y > 0);
+            let mut r = RECT::default();
+            GetWindowRect(test, &mut r).unwrap();
+            let mut points = [
+                POINT {
+                    x: r.left,
+                    y: r.top,
+                },
+                POINT {
+                    x: r.right,
+                    y: r.bottom,
+                },
+            ];
+            windows::Win32::Graphics::Gdi::MapWindowPoints(None, Some(viewport), &mut points);
+            let mut v = RECT::default();
+            GetClientRect(viewport, &mut v).unwrap();
+            assert!(points[0].y >= 0 && points[1].y <= v.bottom);
+            // Notification messages must never take the ID-only test/model paths.
+            SendMessageW(
+                root,
+                WM_COMMAND,
+                Some(WPARAM(TEST_BUTTON | (BN_SETFOCUS as usize) << 16)),
+                Some(LPARAM(test.0 as isize)),
+            );
+            SendMessageW(
+                root,
+                WM_COMMAND,
+                Some(WPARAM(MODEL_BUTTON | (BN_SETFOCUS as usize) << 16)),
+                Some(LPARAM(models.0 as isize)),
+            );
+            assert!(!form.borrow().health_requested);
+            assert!(!form.borrow().test_gate.busy());
+            assert!(!form.borrow().done);
+            form.borrow_mut()
+                .status
+                .runtime_health((0..40).map(|i| format!("合成结果第{i}行\r\n")).collect());
+            render_status(&*form);
+            SendMessageW(result, EM_SETSEL, Some(WPARAM(4)), Some(LPARAM(14)));
+            SendMessageW(result, EM_LINESCROLL, Some(WPARAM(0)), Some(LPARAM(10)));
+            let top = SendMessageW(result, EM_GETFIRSTVISIBLELINE, None, None).0;
+            for _ in 0..15 {
+                render_status(&*form);
+            }
+            let mut start = 0u32;
+            let mut end = 0u32;
+            SendMessageW(
+                result,
+                EM_GETSEL,
+                Some(WPARAM((&mut start as *mut u32) as usize)),
+                Some(LPARAM((&mut end as *mut u32) as isize)),
+            );
+            assert_eq!((start, end), (4, 14));
+            assert_eq!(
+                SendMessageW(result, EM_GETFIRSTVISIBLELINE, None, None).0,
+                top
+            );
+            let _ = DestroyWindow(root);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(form.borrow().font.into());
+        }
+    }
+}

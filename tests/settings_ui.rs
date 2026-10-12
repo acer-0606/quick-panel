@@ -452,3 +452,34 @@ fn native_error_reader_is_keyboard_reachable_multiline_scrollable_and_not_recrea
     assert!(footer.open.y + footer.open.height <= 480);
     assert!(footer.close.y + footer.close.height <= 480);
 }
+
+#[test]
+fn native_review_return_registers_memory_before_opening_settings_and_restores_its_draft() {
+    use quick_panel::{organizer_ui::*, settings_ui::*};
+    let mut navigation = Navigation::default();
+    let mut memory = MemoryUiState::default();
+    navigation.open_with_memory(Page::Review, &mut memory);
+    assert!(navigation.review_exit(&ReviewExit::Memory(None), &mut memory));
+    memory.navigation_draft = Some(MemoryNavigationDraft {
+        target: None,
+        record: None,
+        raw_input: "合成草稿".into(),
+        scope_choice: 2,
+        enabled: true,
+        confirmed: true,
+    });
+    navigation.open_with_memory(Page::Hub(Group::Organizer), &mut memory);
+    assert_eq!(navigation.back_label(), "返回记忆");
+    assert_eq!(
+        navigation.close_with_memory(&mut memory),
+        Some(Page::Memory)
+    );
+    assert_eq!(
+        memory.navigation_draft.as_ref().unwrap().raw_input,
+        "合成草稿"
+    );
+    assert_eq!(
+        navigation.close_with_memory(&mut memory),
+        Some(Page::Review)
+    );
+}
